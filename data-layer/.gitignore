@@ -1,0 +1,11 @@
+# 库的物理落盘（数据本身，不入库）
+data/
+
+# vendor 参照物（吸收完即删，见 docs/plan §9）
+# vendor/
+
+__pycache__/
+*.pyc
+.venv/
+.python-version
+.DS_Store

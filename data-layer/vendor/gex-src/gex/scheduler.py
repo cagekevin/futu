@@ -1,0 +1,693 @@
+"""Boucle d'ingestion : pull flux toutes les N secondes, snapshot complet
+toutes les M secondes, pendant les heures de marché ET.
+
+L'état courant (dernière chaîne enrichie + synthèse par sous-jacent) est
+gardé en mémoire dans `STATE`, protégé par un lock — le dashboard Dash lit
+cet état, la persistance Parquet assure l'historique.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, time, timedelta
+
+import pandas as pd
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from . import backup, flowtape, idxopt, metrics, rates, report, roll, store
+from .config import SETTINGS, UNDERLYINGS
+from .ingest import ChainSnapshot, fetch_chain, fetch_index_spot
+from .metrics import ET, SummaryMetrics
+from . import futopt
+from .rtquote import PUBLIC_QUOTES, QUOTES, credentials_present
+from .tickcapture import CAPTURE
+
+log = logging.getLogger(__name__)
+
+MARKET_OPEN = time(9, 30)
+MARKET_CLOSE = time(16, 15)
+
+
+def market_is_open(now_et: datetime | None = None) -> bool:
+    now_et = now_et or datetime.now(ET)
+    if now_et.weekday() >= 5:
+        return False
+    return MARKET_OPEN <= now_et.time() <= MARKET_CLOSE
+
+
+@dataclass
+class UnderlyingState:
+    snapshot: ChainSnapshot | None = None
+    enriched: pd.DataFrame | None = None
+    summary: SummaryMetrics | None = None
+    last_feed_ts: datetime | None = None
+
+
+@dataclass
+class GlobalState:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    per_symbol: dict[str, UnderlyingState] = field(default_factory=dict)
+    last_error: str | None = None
+
+    def get(self, symbol: str) -> UnderlyingState:
+        return self.per_symbol.setdefault(symbol, UnderlyingState())
+
+
+STATE = GlobalState()
+
+
+def _fetch(symbol: str, u) -> ChainSnapshot:
+    """Tire la chaîne depuis la source configurée sur le sous-jacent.
+
+    `source == "futu"`  -> Futu OpenD, temps réel (`gex/futu_source.py`)
+    tout le reste       -> CDN public CBOE, délayé ~15 min (comportement d'origine)
+
+    Les deux renvoient le **même** `ChainSnapshot` : `metrics.enrich` et
+    `metrics.summarize` ne voient aucune différence.
+    """
+    if u.source == "futu":
+        from . import futu_source
+
+        return futu_source.fetch_chain(symbol)
+    return fetch_chain(symbol, u.cboe_symbol)
+
+
+def pull_symbol(symbol: str, persist_snapshot: bool) -> None:
+    u = UNDERLYINGS[symbol]
+    snap = _fetch(symbol, u)
+    enriched = metrics.enrich(snap)
+    summary = metrics.summarize(snap, enriched, with_basis=u.future is not None)
+    now = datetime.now(ET)
+
+    st = STATE.get(symbol)
+    with STATE.lock:
+        prev = st.enriched
+        prev_feed_ts = st.last_feed_ts
+
+    # Flux delta : uniquement sur les cibles analysées, et seulement si le feed
+    # a réellement avancé depuis le dernier pull (sinon Δvolume = bruit nul).
+    # Sur un constituant, seuls comptent ses murs et son spot.
+    if (u.role == "target" and prev is not None
+            and prev_feed_ts != snap.feed_timestamp):
+        flow = metrics.flow_delta(prev, enriched, snap.spot)
+        flow["timestamp"] = snap.feed_timestamp
+        store.append_daily("flows", symbol, flow, now)
+
+    if persist_snapshot:
+        store.save_snapshot(symbol, enriched, now)
+        store.append_history(summary.as_row())
+
+    with STATE.lock:
+        st.snapshot = snap
+        st.enriched = enriched
+        st.summary = summary
+        st.last_feed_ts = snap.feed_timestamp
+        STATE.last_error = None
+    log.info(
+        "%s pull ok — spot=%.2f netGEX=%.2f Bn zeroG=%s basis=%s",
+        symbol, snap.spot, summary.net_gex / 1e9,
+        f"{summary.zero_gamma:.0f}" if summary.zero_gamma else "n/a",
+        f"{summary.basis:+.1f}" if summary.basis is not None else "n/a",
+    )
+
+
+class _Cadence:
+    """Déclenche une action toutes les N itérations de la boucle de pull.
+
+    `interval_s` est ramené au nombre d'itérations correspondant : la boucle
+    tourne à `flow_interval_s`, tout le reste s'exprime en multiples.
+    """
+
+    def __init__(self, interval_s: int | None = None) -> None:
+        self.count = 0
+        interval_s = SETTINGS.snapshot_interval_s if interval_s is None else interval_s
+        self.every = max(1, interval_s // SETTINGS.flow_interval_s)
+
+    def tick(self) -> bool:
+        due = self.count % self.every == 0
+        self.count += 1
+        return due
+
+
+_CADENCE = _Cadence()
+# Les constituants suivent leur propre horloge : leurs murs reposent sur l'open
+# interest, publié une fois par jour, donc les puller au rythme des cibles
+# n'apporterait rien et quadruplerait la charge.
+_CONSTITUENT_CADENCE = _Cadence(SETTINGS.constituent_interval_s)
+_CONSTITUENT_SNAPSHOT = _Cadence(SETTINGS.constituent_snapshot_interval_s)
+
+
+def pull_vix() -> None:
+    """VIX comme donnée de confluence (get_market_context, MCP) : pas un
+    sous-jacent analysé, juste un spot horodaté — cf. store.append_index_spot.
+    Cadence alignée sur les constituants (~10 min), un signal de fond n'a pas
+    besoin d'une résolution à la minute."""
+    try:
+        spot, ts = fetch_index_spot("_VIX")
+        store.append_index_spot("vix", {"timestamp": ts, "vix": spot})
+    except Exception:  # noqa: BLE001 — un échec VIX ne doit rien casser d'autre
+        log.exception("Échec pull VIX")
+
+
+def pull_all(force: bool = False) -> None:
+    if SETTINGS.market_hours_only and not market_is_open() and not force:
+        return
+    persist = _CADENCE.tick()
+    due = _CONSTITUENT_CADENCE.tick()
+    persist_constituent = _CONSTITUENT_SNAPSHOT.tick()
+    if due or force:
+        pull_vix()
+    for key, u in UNDERLYINGS.items():
+        if not u.enabled:
+            continue
+        if u.role == "context":
+            # pas une chaîne d'options — pullé séparément (pull_vix), listé
+            # dans UNDERLYINGS uniquement pour l'abonnement dxFeed live
+            continue
+        if u.source == "futopt":
+            # collecte native séparée (pull_native_options) : une chaîne
+            # coûte ~90 s, incompatible avec cette boucle à 60 s
+            continue
+        is_constituent = u.role == "constituent"
+        if is_constituent and not (due or force):
+            continue
+        try:
+            pull_symbol(key, persist_snapshot=(persist_constituent if is_constituent
+                                               else persist))
+        except Exception as e:  # noqa: BLE001 — la boucle doit survivre
+            log.exception("Échec pull %s", key)
+            with STATE.lock:
+                STATE.last_error = f"{key}: {e}"
+
+
+def push_data_repo() -> None:
+    """Commit + push quotidien du repo data/ (historique + flux) après la
+    clôture — backup hors-machine des données non reconstituables."""
+    import subprocess
+
+    repo = SETTINGS.data_dir
+    if not SETTINGS.auto_push_data or not (repo / ".git").exists():
+        return
+    day = datetime.now(ET).strftime("%Y-%m-%d")
+    try:
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        diff = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--quiet"])
+        if diff.returncode == 0:
+            return  # rien de nouveau
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", f"data {day}"],
+                       check=True, capture_output=True)
+        has_remote = subprocess.run(["git", "-C", str(repo), "remote"],
+                                    capture_output=True, text=True).stdout.strip()
+        if has_remote:
+            subprocess.run(["git", "-C", str(repo), "push"], check=True,
+                           capture_output=True, timeout=120)
+            log.info("Repo data poussé (%s)", day)
+        else:
+            log.info("Repo data commité localement (%s, pas de remote)", day)
+    except Exception:
+        log.exception("Échec du push du repo data — données locales intactes")
+
+
+def build_native_summary(code: str, df: pd.DataFrame,
+                         now_et: datetime | None = None) -> tuple[ChainSnapshot, SummaryMetrics]:
+    """(ChainSnapshot, SummaryMetrics) à partir d'une chaîne native (futopt).
+
+    Fonction pure : ne touche ni STATE ni le disque, donc testable sans
+    connexion. `df` doit porter les colonnes de sortie de
+    `futopt.enrich_native` (strike, type, expiry, gex, open_interest, volume,
+    spot…) — mêmes colonnes que `metrics.enrich`, d'où la réutilisation directe
+    des fonctions de `metrics` plutôt qu'une resynthèse spécifique.
+
+    `source="dxfeed"` sur la ligne d'historique : ces données viennent du
+    courtier (open interest et IV CME), non redistribuables — même
+    traitement que les bougies de prix (cf. gex/rtquote.py).
+    """
+    now_et = now_et or datetime.now(ET)
+    spot = float(df["spot"].iloc[0])
+    ratios = metrics.put_call_ratios(df)
+    today = now_et.date()
+    snap = ChainSnapshot(
+        symbol=code, spot=spot,
+        # naïf en ET, comme le feed CBOE : build_cards fait un .replace(tzinfo=ET)
+        feed_timestamp=now_et.replace(tzinfo=None),
+        fetched_at=datetime.now(UTC), options=df,
+    )
+    summary = SummaryMetrics(
+        timestamp=snap.feed_timestamp, symbol=code, spot=spot,
+        net_gex=float(df["gex"].sum()),
+        zero_gamma=metrics.zero_gamma(df, spot),
+        pc_oi=ratios["pc_oi"], pc_volume=ratios["pc_volume"],
+        net_gex_0dte=float(df.loc[metrics.bucket_mask(df, "0DTE", today), "gex"].sum()),
+        # `futopt.enrich_native` calcule bien une colonne "dex" par contrat,
+        # mais elle n'était pas sommée ici : le champ retombait donc sur sa
+        # valeur par défaut (0.0) et NQ/ES affichaient un DEX net nul depuis
+        # toujours — un zéro qui ressemblait à une mesure alors que c'était un
+        # trou (constaté le 2026-07-29).
+        net_dex=float(df["dex"].sum()),
+        # pas de "basis" : ce sont déjà des options sur LE future, pas un
+        # indice à convertir vers un contrat qui lui serait associé
+        basis=None, source="dxfeed",
+    )
+    return snap, summary
+
+
+NATIVE_CACHE_FRESH_S = 300  # cf. pull_native_options : redémarrer perd STATE,
+# pas le disque — inutile de rejouer ~90-280 s de collecte dxFeed pour une
+# donnée qui a moins de 5 min.
+
+
+def _seed_native_state(code: str, df: pd.DataFrame, ts: datetime) -> SummaryMetrics:
+    """Construit (ChainSnapshot, SummaryMetrics) depuis `df`/`ts` et peuple
+    STATE — factorisé entre le chemin cache et le chemin collecte live."""
+    snap, summary = build_native_summary(code, df, ts)
+    st = STATE.get(code)
+    with STATE.lock:
+        st.snapshot = snap
+        st.enriched = df
+        st.summary = summary
+        st.last_feed_ts = snap.feed_timestamp
+    return summary
+
+
+def pull_native_options() -> None:
+    """Chaînes d'options natives NQ et ES — FENÊTRE LARGE (14 j calendaires,
+    cf. futopt.DEFAULT_MAX_DAYS) : construit, met à jour STATE, et persiste
+    (snapshot + historique). Sans identifiants courtier, ne fait rien.
+
+    Coûte du temps (~90-280 s par sous-jacent, dominé par le rythme de
+    livraison du serveur, pas par notre code) : APScheduler l'exécute dans
+    son propre thread. Cadence volontairement RARE (1-2 fois/jour, cf.
+    start_scheduler) depuis le 2026-09-23 : c'est `pull_native_options_fast`
+    qui tient STATE à jour entre-temps avec une fenêtre resserrée au 0DTE/1DTE
+    — cette fonction-ci ne sert plus qu'à rafraîchir périodiquement le
+    contexte lointain (ex. mur d'OPEX mensuel) et à archiver l'historique.
+
+    Avant de payer ce coût, on regarde si un snapshot persisté a moins de
+    `NATIVE_CACHE_FRESH_S` : un redémarrage du process perd STATE (mémoire
+    pure) mais pas le disque — sans ce court-circuit, chaque redémarrage
+    (déploiement, crash) rejouait une collecte complète même si la dernière
+    date d'il y a deux minutes.
+
+    Limite connue : ne calcule pas de flux delta (`flow_delta` suppose une
+    colonne `contract` façon CBOE, absente ici) — les onglets Flux et Gamma
+    échangé restent vides pour NQ/ES natifs. Le reste (niveaux, profil,
+    heatmap, positionnement) fonctionne, ces fonctions ne demandant que les
+    colonnes déjà produites par `futopt.enrich_native`.
+    """
+    if not credentials_present():
+        return
+    for code in ("NQ", "ES"):
+        cached = store.load_latest_snapshot(code)
+        if cached is not None:
+            df_cached, ts = cached
+            age_s = (datetime.now(ET) - ts.replace(tzinfo=ET)).total_seconds()
+            if 0 <= age_s < NATIVE_CACHE_FRESH_S:
+                _seed_native_state(code, df_cached, ts.replace(tzinfo=ET))
+                log.info("%s (natif) : cache de %.0f s, collecte live sautée",
+                         code, age_s)
+                continue
+        try:
+            df = futopt.build_native_chain(code)
+            if df is None or df.empty:
+                continue
+            now = datetime.now(ET)
+            store.save_snapshot(code, df, now)
+            summary = _seed_native_state(code, df, now)
+            store.append_history(summary.as_row())
+            log.info("%s (natif) pull ok — spot=%.2f netGEX=%.2f Bn zeroG=%s",
+                     code, summary.spot, summary.net_gex / 1e9,
+                     f"{summary.zero_gamma:.0f}" if summary.zero_gamma else "n/a")
+        except Exception:  # noqa: BLE001 — un échec ne doit rien casser d'autre
+            log.exception("%s : échec de la collecte native", code)
+
+
+def pull_native_options_fast() -> None:
+    """Chaînes d'options natives NQ et ES — FENÊTRE RESSERRÉE (0DTE/1DTE,
+    `futopt.FAST_TRADING_DAYS` jours de BOURSE) : moins de contrats à
+    souscrire que la fenêtre large, donc une salve dxFeed nettement plus
+    courte — voir la note du 2026-09-23 dans `futopt.FAST_TRADING_DAYS` pour
+    l'incident qui motive ce découpage (NQ/ES affichaient encore, à 16h14, le
+    régime d'avant une accélération de marché survenue ~40 min plus tôt,
+    faute d'avoir été rafraîchis depuis le dernier pull à fenêtre large).
+
+    Met à jour STATE (donc le digest et les niveaux affichés) mais ne
+    PERSISTE rien sur disque : à une cadence de quelques minutes, écrire un
+    snapshot par cycle ferait grossir le dépôt sans utilité (NQ est
+    VERSIONNÉ dans data/.gitignore) — `pull_native_options` reste la seule
+    source archivée, à sa cadence basse.
+
+    Effet de bord accepté : entre deux passages de `pull_native_options`,
+    les vues NQ/ES qui lisent STATE (niveaux, murs, heatmap) ne voient plus
+    que la fenêtre 0DTE/1DTE — un mur d'OPEX mensuel au-delà de cette fenêtre
+    n'apparaît que juste après le pull large, pas en continu.
+    """
+    if not credentials_present():
+        return
+    for code in ("NQ", "ES"):
+        try:
+            df = futopt.build_native_chain(code, trading_days=futopt.FAST_TRADING_DAYS)
+            if df is None or df.empty:
+                continue
+            now = datetime.now(ET)
+            summary = _seed_native_state(code, df, now)
+            log.info("%s (natif, rapide) pull ok — spot=%.2f netGEX=%.2f Bn",
+                     code, summary.spot, summary.net_gex / 1e9)
+        except Exception:  # noqa: BLE001 — un échec ne doit rien casser d'autre
+            log.exception("%s : échec de la collecte native rapide", code)
+
+
+def native_index_key(symbol: str) -> str:
+    """Clé de stockage des chaînes d'indice natives.
+
+    Volontairement DISTINCTE du symbole CBOE : les deux sources coexistent
+    sur disque sans jamais se mélanger. Le natif porte les niveaux (il n'a
+    pas les 15 min de retard), CBOE continue de tourner à 60 s pour le flux
+    delta — qui a besoin d'une clé `contract` stable entre deux pulls et
+    d'une cadence qu'une collecte native (~20 s par chaîne) ne peut pas
+    tenir. L'interface, elle, n'expose qu'un seul symbole.
+    """
+    return f"{symbol}_RT"
+
+
+def pull_native_index() -> None:
+    """Chaînes d'options d'indice natives (SPX, NDX) — sans compte, ne fait rien.
+
+    Bien plus rapide que les chaînes sur future (~20 s contre ~90 s) depuis
+    l'arrêt anticipé sur complétude, d'où une cadence plus serrée : le retard
+    de 15 min de CBOE est précisément ce qu'on cherche à supprimer, le
+    rafraîchir toutes les 15 min n'aurait aucun sens.
+    """
+    if not credentials_present():
+        return
+    for symbol in idxopt.NATIVE_INDEX:
+        try:
+            df = idxopt.build_native_chain(symbol)
+            if df is None or df.empty:
+                continue
+            now = datetime.now(ET)
+            key = native_index_key(symbol)
+            store.save_snapshot(key, df, now)
+            summary = _seed_native_state(key, df, now)
+            store.append_history(summary.as_row())
+            log.info("%s (indice natif) pull ok — spot=%.2f netGEX=%.2f Bn zeroG=%s",
+                     symbol, summary.spot, summary.net_gex / 1e9,
+                     f"{summary.zero_gamma:.0f}" if summary.zero_gamma else "n/a")
+        except Exception:  # noqa: BLE001 — un échec ne doit rien casser d'autre
+            log.exception("%s : échec de la chaîne d'indice native", symbol)
+
+
+def _flush_bars(bars: list, source: str) -> None:
+    """Écrit sur disque les bougies 1 min achevées, quelle que soit la
+    source (compte courtier ou repli public délayé — cf. flush_prices)."""
+    if not bars:
+        return
+    by_symbol: dict[str, list[dict]] = {}
+    for symbol, bar in bars:
+        ts = datetime.fromtimestamp(bar.minute, tz=UTC).astimezone(ET).replace(tzinfo=None)
+        by_symbol.setdefault(symbol, []).append({
+            "timestamp": ts, "open": bar.open, "high": bar.high,
+            "low": bar.low, "close": bar.close, "ticks": bar.ticks,
+            "source": source,
+        })
+    for symbol, rows in by_symbol.items():
+        try:
+            store.append_prices(symbol, rows, rows[0]["timestamp"])
+        except Exception:  # noqa: BLE001 — une écriture ratée ne doit rien casser
+            log.exception("Échec écriture des prix %s", symbol)
+
+
+def flush_prices() -> None:
+    """Écrit sur disque les bougies 1 min achevées par le flux temps réel.
+
+    NQ/ES sont EXCLUS de `QUOTES.drain_bars()` : ce flux Quote/Trade est
+    CONFLATÉ côté dxFeed (quelques échantillons/minute), capable de rater la
+    vraie mèche ou la vraie clôture d'une minute — écart de 10 pts constaté le
+    2026-09-30 face au relevé Tradovate réel. `CAPTURE.drain_price_bars()`
+    construit leurs bougies depuis les VRAIES transactions (TimeAndSale, même
+    flux que l'absorption) : c'est désormais la seule source pour ces deux-là.
+    Les autres sous-jacents (SPX, NDX, SMH, NVDA…) n'ont pas de capture
+    tick-à-tick — limite connue, acceptée — et restent sur QUOTES.
+
+    Sans identifiants courtier, `QUOTES.drain_bars()` renvoie une liste vide
+    (la couche temps réel payante est inerte), mais `PUBLIC_QUOTES` — le
+    repli gratuit délayé sur NQ/ES (cf. rtquote.PublicDelayedQuotes) —
+    construit ses propres bougies de la même façon et doit être vidé lui
+    aussi : sans cette ligne, ses bougies s'accumulaient en mémoire sans
+    jamais être écrites, et le Heatmap retombait sur le repli grossier
+    (un point par pull, ~10 min) même là où un spot délayé existait déjà.
+
+    Provenance marquée à l'écriture : "dxfeed" (courtier, licence usage
+    personnel non redistribuable), "dxfeed_ticks" (idem, tick-accurate) ou
+    "dxfeed_public" (flux démo public, délayé ~15-20 min) — toutes exclues de
+    l'export par défaut (cf. gex/export.py, qui n'autorise que source ==
+    "cboe"), mais distinguées pour ne jamais laisser croire que l'une est
+    l'autre.
+    """
+    quotes_bars = [(s, b) for s, b in QUOTES.drain_bars() if s not in ("NQ", "ES")]
+    _flush_bars(quotes_bars, "dxfeed")
+    _flush_bars(PUBLIC_QUOTES.drain_bars(), "dxfeed_public")
+    _flush_bars(CAPTURE.drain_price_bars(), "dxfeed_ticks")
+
+
+def flush_tape() -> None:
+    """Écrit les barres d'order flow signé achevées (cf. gex/flowtape.py).
+
+    Même logique que `flush_prices` : le collecteur agrège en mémoire (~2,4 M
+    de prints par séance, hors de question de les persister un par un), seules
+    les barres d'une minute touchent le disque.
+    """
+    bars = flowtape.TAPE.drain_bars()
+    if not bars:
+        return
+    by_symbol: dict[str, list[dict]] = {}
+    for symbol, bar in bars:
+        ts = datetime.fromtimestamp(bar.minute, tz=UTC).astimezone(ET).replace(tzinfo=None)
+        by_symbol.setdefault(symbol, []).append(bar.as_row(symbol, ts))
+    for symbol, rows in by_symbol.items():
+        try:
+            store.append_tape(symbol, rows, rows[0]["timestamp"])
+        except Exception:  # noqa: BLE001 — une écriture ratée ne doit rien casser
+            log.exception("Échec écriture de l'order flow %s", symbol)
+
+
+def flush_optprints() -> None:
+    """Écrit les prints BRUTS d'options (cf. flowtape._record_raw), rangés par
+    sous-jacent et par heure d'échange en heure de New York. Même logique que
+    les autres flush : le collecteur agrège en mémoire, seul ce job touche le
+    disque (un fichier par heure, réécrit tant que l'heure est en cours)."""
+    rows = flowtape.TAPE.drain_raw()
+    if not rows:
+        return
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        et = datetime.fromtimestamp(r["ts"], tz=UTC).astimezone(ET)
+        groups.setdefault((r["symbol"], f"{et:%Y-%m-%d %H}"), []).append(r)
+    for (symbol, hour), lst in groups.items():
+        try:
+            store.append_optprints(symbol, lst, datetime.strptime(hour, "%Y-%m-%d %H"))
+        except Exception:  # noqa: BLE001 — une écriture ratée ne doit rien casser
+            log.exception("Échec écriture des prints bruts %s", symbol)
+
+
+def flush_ticks() -> None:
+    """Écrit sur disque le brut tick-par-tick accumulé par la capture continue
+    (cf. gex/tickcapture). Même logique que flush_prices/flush_tape : le
+    collecteur agrège en mémoire, seul le flush touche le disque — ici vers le
+    parquet JOURNALIER de chaque contrat, chaque tick rangé selon sa SÉANCE CME,
+    définie en HEURE DE NEW YORK : 18:00 ET (ouverture) -> 16:59 ET (clôture) du
+    lendemain, soit `date = (heure ET + 6h).date()`.
+
+    ⚠️ Surtout PAS un découpage à l'heure de Paris : Paris ne vaut ET+6 que
+    lorsque les deux zones sont en heure d'été en même temps. Pendant les ~3
+    semaines par an où les bascules US et UE sont décalées (mi-mars, fin
+    octobre), l'écart tombe à 5 h et le fichier commence à 19:00 ET au lieu de
+    18:00 — la séance est alors coupée au mauvais endroit. L'ET est la seule
+    référence stable, parce que c'est celle du marché lui-même."""
+    buf = CAPTURE.drain()
+    for symbol, per_contract in buf.items():
+        # 1. Regrouper par (séance, contrat) et cumuler le volume de CHAQUE
+        #    contrat — y compris celui qu'on n'écrira pas : c'est cette mesure
+        #    qui décidera du dominant de la séance suivante (cf. gex/roll).
+        by_day: dict[str, dict[str, list]] = {}
+        volumes: dict[str, dict[str, float]] = {}
+        for contract, rows in per_contract.items():
+            for r in rows:
+                # +6 h : 18:00 ET (ouverture) bascule sur minuit, donc la date
+                # obtenue EST celle de la séance, y compris la partie du soir.
+                sess = (datetime.fromtimestamp(r["ts"], tz=UTC).astimezone(ET)
+                        + timedelta(hours=6))
+                day = sess.strftime("%Y-%m-%d")
+                by_day.setdefault(day, {}).setdefault(contract, []).append((sess, r))
+                volumes.setdefault(day, {})[contract] = (
+                    volumes.setdefault(day, {}).get(contract, 0) + (r.get("volume") or 0))
+
+        for day, per_c in by_day.items():
+            try:
+                roll.record_volumes(symbol, day, volumes.get(day, {}))
+            except Exception:  # noqa: BLE001 — l'état de roll ne doit rien bloquer
+                log.exception("Capture tick : échec mémorisation des volumes %s", symbol)
+            # 2. N'écrire que le contrat dominant : la série sur disque reste
+            #    une série CONTINUE, comparable au jeu de référence. L'ordre
+            #    passé est celui du courtier ([actif, suivant]) : c'est lui qui
+            #    sert de repli tant qu'aucun volume de veille n'est connu.
+            contracts = [c for c in CAPTURE.contract_order(symbol) if c in per_c]
+            contracts += [c for c in per_c if c not in contracts]
+            keep = roll.dominant(symbol, day, contracts)
+            items = per_c.get(keep) or []
+            if not items:
+                continue
+            rows_day = [it[1] for it in items]
+            try:
+                store.append_ticks(symbol, rows_day, items[0][0])
+            except Exception:  # noqa: BLE001 — une écriture ratée ne doit rien casser
+                log.exception("Capture tick : échec écriture %s", symbol)
+
+
+def add_flush_jobs(sched: BackgroundScheduler) -> None:
+    """Jobs d'écriture disque des flux temps réel (bougies, tape, ticks). Portés
+    par le process qui possède les collecteurs : le dashboard en mode autonome,
+    ou le process capture quand il est séparé (cf. gex/capture.py)."""
+    # Vidange plus fréquente que la minute : une bougie n'est écrite qu'une
+    # fois close, ce décalage borne simplement la perte en cas d'arrêt brutal.
+    sched.add_job(flush_prices, "interval", seconds=30, max_instances=1, coalesce=True)
+    sched.add_job(flush_tape, "interval", seconds=30, max_instances=1, coalesce=True)
+    # Capture tick-par-tick CONTINUE (24/5) : le collecteur agrège en mémoire, ce
+    # job vide vers le parquet journalier de NQ/ES toutes les 60 s. Session dxLink
+    # dédiée, sans jamais toucher le flux spot du dashboard.
+    sched.add_job(flush_ticks, "interval", seconds=60, max_instances=1, coalesce=True)
+    # prints bruts d'options : la reconstruction à l'identique du tape
+    sched.add_job(flush_optprints, "interval", seconds=60, max_instances=1, coalesce=True)
+
+
+def discard_bars() -> None:
+    """Dashboard SANS capture embarquée : les bougies du flux spot sont écrites
+    par le process capture ; on vide seulement le tampon local pour qu'il ne
+    grossisse pas en mémoire."""
+    QUOTES.drain_bars()
+
+
+def resolve_scalp_signals(now: datetime | None = None) -> None:
+    """Tranche les signaux du bandeau /scalp assez vieux (cf. scalp.OUTCOME_DELAY_MIN) :
+    compare le prix actuel au prix de déclenchement, classe (continued/reversed/
+    flat, cf. scalp.classify_outcome). Étanche : une erreur ne doit rien casser
+    d'autre — c'est de la calibration, pas une donnée de marché."""
+    try:
+        import sys
+        from pathlib import Path
+
+        from . import scalp
+        from .api import _futures_last_price
+
+        root = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(root / "discord_bot"))
+        import journal
+
+        conn = journal.connect(SETTINGS.data_dir / "journal" / "journal.sqlite")
+        now = now or datetime.now(ET).astimezone()
+        cutoff = (now - timedelta(minutes=scalp.OUTCOME_DELAY_MIN)).isoformat()
+        for row in journal.unresolved_scalp_signals(conn, older_than_ts=cutoff):
+            px = _futures_last_price(row["symbol"])
+            if px is None:
+                continue
+            move = float(px) - row["spot"]
+            journal.resolve_scalp_signal(
+                conn, signal_id=row["id"], resolved_ts=now.isoformat(),
+                outcome_move_pts=move,
+                outcome=scalp.classify_outcome(row["symbol"], row["direction"], move))
+    except Exception:  # noqa: BLE001 — calibration, jamais bloquant pour le reste
+        log.exception("Résolution des signaux /scalp échouée")
+
+
+def start_scheduler(embedded_capture: bool = True) -> BackgroundScheduler:
+    """`embedded_capture=False` : la capture (ticks, tape, bougies) vit dans un
+    autre process, le dashboard n'écrit donc AUCUN de ces flux."""
+    sched = BackgroundScheduler(timezone="America/New_York")
+    sched.add_job(
+        pull_all,
+        "interval",
+        seconds=SETTINGS.flow_interval_s,
+        max_instances=1,
+        coalesce=True,
+    )
+    if embedded_capture:
+        add_flush_jobs(sched)
+    else:
+        sched.add_job(discard_bars, "interval", seconds=30, max_instances=1,
+                      coalesce=True)
+    # Options natives NQ/ES — fenêtre LARGE (14 j) : 2 fois/jour seulement
+    # depuis le 2026-09-23 (cf. pull_native_options), la fraîcheur intraday
+    # étant désormais du ressort de pull_native_options_fast ci-dessous.
+    # Horaires ET choisis pour couvrir l'ouverture (contexte de la séance) et
+    # le milieu d'après-midi (avant l'ajustement post-open) sans se substituer
+    # au rythme rapide.
+    sched.add_job(pull_native_options, "cron", day_of_week="mon-fri",
+                  hour="10,14", minute=0, max_instances=1, coalesce=True)
+    # Ouverture de la séance CME du dimanche soir (~18h ET = 00h Paris,
+    # cf. MARKET_OPEN/market_is_open ci-dessus pour la distinction avec les
+    # heures de marché CASH) : les 0DTE du lundi commencent à se négocier dès
+    # cet instant, pas seulement à l'ouverture cash de lundi matin (demande
+    # explicite de l'utilisateur, 2026-10-05). Sans ce déclenchement, aucun
+    # snapshot n'existait pour "aujourd'hui" avant 10h ET lundi — la Heatmap
+    # (alimentée par `store.save_snapshot`, écrit uniquement par
+    # `pull_native_options`, jamais par `pull_native_options_fast` qui ne
+    # persiste rien) restait bloquée sur le dernier snapshot du vendredi
+    # toute la soirée/nuit de dimanche, alors que le spot et le digest
+    # ailleurs sur le dashboard étaient déjà à jour (pull_native_options_fast,
+    # lui, tourne en continu sans restriction de jour). 30 min après
+    # l'ouverture : laisse le temps à la chaîne de se peupler.
+    sched.add_job(pull_native_options, "cron", day_of_week="sun",
+                  hour=18, minute=30, max_instances=1, coalesce=True)
+    # Options natives NQ/ES — fenêtre RESSERRÉE (0DTE/1DTE) : c'est elle qui
+    # tient le digest à jour en continu. Fenêtre courte -> salve dxFeed
+    # nettement plus rapide que les ~90-280 s de la fenêtre large, d'où une
+    # cadence bien plus serrée sans reproduire le coût qui justifiait 15 min.
+    sched.add_job(pull_native_options_fast, "interval", minutes=3,
+                  max_instances=1, coalesce=True)
+    # Chaînes d'indice natives : ~20 s par chaîne (contre ~90 s sur future),
+    # donc une cadence bien plus serrée — supprimer un retard de 15 min pour
+    # rafraîchir toutes les 15 min n'aurait aucun sens.
+    sched.add_job(pull_native_index, "interval", minutes=3,
+                  max_instances=1, coalesce=True)
+    sched.add_job(push_data_repo, "cron", day_of_week="mon-fri", hour=16, minute=20)
+    # 每日「期权结构地图」中文报告（cf. gex/report.py）。
+    #
+    # 16h25 ET —— 排在 push_data_repo(16h20) **之后**，这样 reports/gex/ 里
+    # 当天的报告也能被同一次 git push 带上（如果 data/ 以外的路径在同步范围内）。
+    #
+    # 为什么必须**每天**跑而不是手动生成一次：
+    #   报告里「结构迁移」那一节比的是**今天的距离 vs 上一交易日**。
+    #   单张图只能看，日频报告才攒得出时间序列 —— 「Flip 移了没」这个问题
+    #   只有时间序列能回答。
+    #
+    # 幂等：数据全部来自本地快照与 history/metrics.parquet，
+    # 对比项按日期去 history 里找，**不依赖「昨天生成过报告」**——
+    # 断几天再跑也不会烂。
+    sched.add_job(report.generate_daily, "cron", day_of_week="mon-fri",
+                  hour=16, minute=25, max_instances=1, coalesce=True)
+    # Sauvegarde distante après le push git : elle porte ce que GitHub refuse
+    # (archives Databento de plus de 100 Mo). Sans rclone configuré, l'appel
+    # journalise et se retire.
+    sched.add_job(backup.run, "cron", day_of_week="mon-fri", hour=16, minute=30)
+    # Taux sans risque : le SOFR de la veille est publié ~8h ET, on le récupère
+    # à 8h15 pour la journée (cf. gex/rates). Le week-end reprend le dernier
+    # ouvré, ce qui convient.
+    sched.add_job(rates.refresh, "cron", day_of_week="mon-fri", hour=8, minute=15)
+    # Résolution des signaux du bandeau /scalp (cf. gex/scalp.py, gex/app.py) :
+    # calibration a posteriori, pas une donnée de marché — 2 min suffit large.
+    sched.add_job(resolve_scalp_signals, "interval", minutes=2, max_instances=1,
+                  coalesce=True)
+    sched.start()
+    # Premier chargement du taux au démarrage (dans un thread : ne pas bloquer
+    # le lancement sur un appel réseau ; repli sur la constante si indisponible).
+    threading.Thread(target=rates.refresh, daemon=True).start()
+    # Premier pull immédiat (même hors marché : affiche le dernier état connu).
+    threading.Thread(target=pull_all, kwargs={"force": True}, daemon=True).start()
+    # Idem pour NQ/ES natifs : sans cet appel, ils resteraient invisibles dans
+    # l'interface jusqu'à la première exécution planifiée. La version rapide
+    # (fenêtre resserrée) suffit à amorcer STATE ; la large tourne aussi une
+    # fois pour ne pas attendre jusqu'à 10h/14h le contexte lointain.
+    threading.Thread(target=pull_native_options_fast, daemon=True).start()
+    threading.Thread(target=pull_native_options, daemon=True).start()
+    threading.Thread(target=pull_native_index, daemon=True).start()
+    return sched

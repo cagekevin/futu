@@ -1,0 +1,16 @@
+# trading-desk — 数据后端依赖
+# Python 3.12
+pandas>=3.0
+numpy>=2.0
+scipy>=1.14
+requests>=2.32
+pyarrow>=17.0
+
+# ── 可选：富途源（fetch/futu.py，走 OpenD）────────────────────────────────
+# 只有用富途源取数时才需要；不装则 fetch/ 其余源照常工作。
+futu-api>=10.0
+# ⚠️ protobuf 必须 < 5：5.x 删了 FieldDescriptor.label，futu-api 内部还在用，
+#    `get_stock_screen`（全市场快照，不吃历史额度）会直接报
+#    "'...FieldDescriptor' object has no attribute 'label'"。
+#    这是实测踩过的坑（见 docs/plan §8.2）。
+protobuf<5

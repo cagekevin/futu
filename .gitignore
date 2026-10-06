@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+build/
+
+# 环境与密钥
+.env
+.env.local
+*.local
+
+# 编辑器
+.idea/
+.vscode/
