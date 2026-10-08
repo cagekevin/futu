@@ -56,7 +56,9 @@ from panel.provide_reader import read_days, read_stocks  # noqa: E402
 from strategies.tugboat_breakout import (  # noqa: E402
     ENTER_MODES, REQUIRED_FACTORS, TugboatBreakout, TugboatExposure,
 )
-from trade_simulator import ExitPolicy, StaticExposure, simulate  # noqa: E402
+from trade_simulator import (  # noqa: E402
+    ExitPolicy, StaticExposure, reconcile, simulate,
+)
 
 #: 票池跳到 287 只那天 —— 比它更早的日子只有 16 只，构不成截面。
 DEFAULT_START = "2022-05-03"
@@ -172,12 +174,17 @@ def _dump_trades(result, path: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = _csv.writer(fh)
         w.writerow(["标的", "入场日", "入场价", "止损", "出场日", "出场价",
-                    "股数", "R倍数", "收益率", "出场原因", "持有天数"])
+                    "股数", "R倍数", "收益率", "出场原因", "持有天数",
+                    "是否部分止盈", "部分止盈价", "部分止盈股数"])
         for t in result.trades:
             w.writerow([t.symbol, t.entry_day, f"{t.entry_price:.4f}",
                         f"{t.initial_stop:.4f}", t.exit_day, f"{t.exit_price:.4f}",
                         f"{t.shares:.2f}", f"{t.r_multiple:.4f}",
-                        f"{t.return_pct:.6f}", t.exit_reason, t.hold_days])
+                        f"{t.return_pct:.6f}", t.exit_reason, t.hold_days,
+                        int(t.took_partial),
+                        "" if not np.isfinite(t.partial_price)
+                        else f"{t.partial_price:.4f}",
+                        f"{t.partial_shares:.2f}"])
     print(f"逐笔清单: {path}（{len(result.trades)} 笔）")
 
 
@@ -283,6 +290,20 @@ def main(argv: list[str] | None = None) -> int:
         account=account,
         exposure=exposure,
     )
+
+    # ★ **每次跑都自检** —— 记账错不会报错，只会让所有报告数字安静地错掉。
+    #   独立公式逐笔重算 R，不符就**直接退出**（不给你一份错数）。
+    chk = reconcile(result, backtest_config.COST_RATE)
+    if chk["bad"]:
+        print(f"\n⛔ 逐笔对账失败：{chk['bad']} / {chk['n']} 笔与独立重算不符"
+              f"（最大差 {chk['max_abs_diff']:.3e}）")
+        for line in chk["examples"]:
+            print("   ", line)
+        print("   ⇒ 记账有错，报告不可信 —— 已中止。")
+        return 2
+    print(f"自检   : {chk['n']} 笔逐笔对账通过（含 {chk['n_partial']} 笔部分止盈，"
+          f"最大差 {chk['max_abs_diff']:.1e}）")
+    print()
 
     spy_close = spy_panel.field("close")["SPY"].reindex(panel.dates)
     bench = (spy_close / spy_close.shift(1) - 1.0).to_numpy()[1:]

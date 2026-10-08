@@ -30,8 +30,9 @@ DEFAULT = ExposureSettings(max_positions=5, risk_fraction=0.01,
                            exit_policy=ExitPolicy(), stage="static")
 
 
-def _state(day_index=0, *, recent_r=(), recent_reasons=()) -> AccountState:
-    return AccountState(day_index=day_index, equity=1_000_000.0,
+def _state(day_index=0, *, day="d1", recent_r=(), recent_reasons=()) -> AccountState:
+    # ⚠️ 必须给 `day` —— 曝险策略**按日期字符串**查市场状态（不再按行序）。
+    return AccountState(day_index=day_index, day=day, equity=1_000_000.0,
                         initial_equity=1_000_000.0, open_positions=0,
                         n_closed=len(recent_r), total_r=float(sum(recent_r)),
                         recent_r=tuple(recent_r),
@@ -136,6 +137,28 @@ def test_no_downshift_when_sample_is_thin() -> bool:
 
 
 # ── 边界与契约 ───────────────────────────────────────────────────────────
+
+def test_market_state_is_looked_up_by_date_not_by_row_order() -> bool:
+    """★ **把市场状态倒序传进去，档位仍必须按日期取对。**
+
+    ⚠️ 曾经写成 `market_state.index[state.day_index]` —— 那隐含
+       "市场状态的行序 = 模拟的日序"这个**没有任何东西保证**的前提。
+       一旦调用方传进来的顺序不同，档位会**安静地错位**（不报错，只是全错）。
+
+    这里：`d1` 是极度亢奋（宽度 0.95）、`d2` 是疑似见底（宽度 0.05）。
+    **倒序**放进 DataFrame，再分别在 `d1` / `d2` 上问 —— 答案必须仍然对得上日期。
+    """
+    m = pd.DataFrame({"breadth": [0.05, 0.95], "index_dist_200ma": [0.0, 0.0]},
+                     index=["d2", "d1"])            # ★ 故意倒序
+    e = TugboatExposure()
+    e.attach_market_state(m)
+    a = e.settings(_state(day="d1"), DEFAULT)
+    b = e.settings(_state(day="d2"), DEFAULT)
+    ok = a.stage == STAGE_EUPHORIA and b.stage == STAGE_WASHOUT
+    print(f"{'[PASS]' if ok else '[FAIL]'} 市场状态**按日期**取（倒序传入也不串）"
+          f"（d1→{a.stage}，d2→{b.stage}）")
+    return ok
+
 
 def test_missing_market_state_falls_back_to_neutral() -> bool:
     """★ 没注入市场状态 ⇒ 取**中性**（不假装见底、也不假装亢奋）。"""

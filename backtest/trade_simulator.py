@@ -74,6 +74,7 @@ __all__ = [
     "StaticExposure",
     "Trade",
     "TradeStrategy",
+    "reconcile",
     "simulate",
 ]
 
@@ -170,6 +171,11 @@ class AccountState:
     """
 
     day_index: int
+    #: **当前日期字符串**。★ 曝险策略必须用它去查市场状态，
+    #: **不要**用 `day_index` 去 `market_state.index[i]` ——
+    #: 那隐含了"市场状态的行序与模拟的日序一致"这个**没有任何东西保证**的前提，
+    #: 一旦不一致，档位会**安静地错位**（不报错，只是全错）。
+    day: str
     equity: float
     initial_equity: float
     open_positions: int
@@ -258,6 +264,8 @@ class _Position:
     realized: float = 0.0       # 已实现盈亏（含成本前的毛利，成本单列）
     cost_paid: float = 0.0
     peak_r: float = 0.0         # 持有期内达到过的最大浮盈（R 计）—— 供"无进展"判定
+    partial_price: float = float("nan")   # 部分止盈那笔的成交价
+    partial_shares: float = 0.0            # 部分止盈卖掉的股数
     #: 最近一次**实际成交**的价格 —— 全出那条路径要用它记 `exit_price`。
     #: ⚠️ 用它而不是 `close`：部分止盈的成交价是 `max(止盈价, 开盘)`，
     #:    与当日收盘**不是一回事**（记错会让导出的逐笔清单**看起来对不上账**）。
@@ -283,8 +291,12 @@ class Trade:
     return_pct: float
     exit_reason: str
     hold_days: int
-    #: 是否**做过部分止盈** —— 供对账：`False` 的那些可以**逐笔精确重算** R。
+    #: 是否**做过部分止盈** —— 供对账。
     took_partial: bool = False
+    #: 部分止盈那笔的**成交价与股数**（`took_partial=False` 时无意义）。
+    #: 有了它，**带部分止盈的交易也能被逐笔重算**（否则对账只能覆盖一半的成交）。
+    partial_price: float = float("nan")
+    partial_shares: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -321,6 +333,57 @@ def _fingerprint(mapping: Mapping[str, Any]) -> str:
     payload = json.dumps({k: v for k, v in sorted(mapping.items())},
                          default=str, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def reconcile(result: SimulationResult, cost_rate: float) -> dict[str, Any]:
+    """★ **自检**：用**独立公式**把每一笔的 R 重算一遍，跟记录比。
+
+    ## 为什么把自检**放在模拟器旁边**
+
+    因为记账错**不会报错** —— 它只会让所有报告数字安静地错掉。
+    放在这里，调用方（如 `run_tugboat.py`）可以**每次跑都核一遍**，
+    而不是"等想起来再写个脚本查"。
+
+    独立公式（照定义写，**不复用模拟器内部的任何一步**）：
+
+    ```
+    没部分止盈： gross = (出场−入场)×股数
+                 cost  = (入场×股数 + 出场×股数) × 费率
+    有部分止盈： gross = (部分价−入场)×部分股数 + (出场−入场)×(股数−部分股数)
+                 cost  = (入场×股数 + 部分价×部分股数 + 出场×(股数−部分股数)) × 费率
+    R = (gross − cost) / (股数 × (入场 − 初始止损))
+    ```
+
+    返回 `{"n", "n_partial", "bad", "max_abs_diff", "examples"}`；
+    `bad == 0` 才算过。
+    """
+    bad = 0
+    worst = 0.0
+    examples: list[str] = []
+    n_partial = 0
+    for t in result.trades:
+        e, xp, sh, stop = (t.entry_price, t.exit_price, t.shares, t.initial_stop)
+        if sh <= 0 or not np.isfinite(e) or not np.isfinite(xp):
+            continue
+        if t.took_partial and np.isfinite(t.partial_price):
+            n_partial += 1
+            pp, ps = t.partial_price, t.partial_shares
+            rest = sh - ps
+            gross = (pp - e) * ps + (xp - e) * rest
+            cost = (e * sh + pp * ps + xp * rest) * cost_rate
+        else:
+            gross = (xp - e) * sh
+            cost = (e * sh + xp * sh) * cost_rate
+        expect = (gross - cost) / (sh * (e - stop))
+        diff = abs(expect - t.r_multiple)
+        worst = max(worst, diff)
+        if diff > 1e-9:
+            bad += 1
+            if len(examples) < 5:
+                examples.append(f"{t.symbol} {t.entry_day}: 记录 {t.r_multiple:.6f}"
+                                f" vs 重算 {expect:.6f}")
+    return {"n": len(result.trades), "n_partial": n_partial, "bad": bad,
+            "max_abs_diff": worst, "examples": examples}
 
 
 @dataclass
@@ -434,7 +497,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
         recent = trades[-RECENT_TRADES_WINDOW:]
         settings = exposure.settings(
             AccountState(
-                day_index=i, equity=equity_now,
+                day_index=i, day=day, equity=equity_now,
                 initial_equity=account.initial_equity,
                 open_positions=len(positions), n_closed=len(trades),
                 total_r=float(sum(t.r_multiple for t in trades)),
@@ -522,6 +585,8 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                     entry_price=p.entry_price, initial_stop=p.initial_stop,
                     exit_day=day, exit_price=float(px), shares=p.shares_initial,
                     took_partial=p.took_partial,
+                    partial_price=p.partial_price,
+                    partial_shares=p.partial_shares,
                     r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
                     return_pct=(p.realized - p.cost_paid)
                     / (p.shares_initial * p.entry_price),
@@ -546,6 +611,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                     p.shares_left -= sold
                     p.took_partial = True
                     p.last_fill = float(px)
+                    p.partial_price, p.partial_shares = float(px), sold
                     if ep.breakeven_after_partial:
                         p.stop = max(p.stop, p.entry_price)  # 止损上移到入场点
 
@@ -563,6 +629,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                     p.shares_left -= sold
                     p.took_partial = True
                     p.last_fill = float(cl)
+                    p.partial_price, p.partial_shares = float(cl), sold
                     if ep.breakeven_after_partial:
                         p.stop = max(p.stop, p.entry_price)
 
@@ -582,6 +649,8 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                     exit_day=day, exit_price=float(fill),
                     shares=p.shares_initial,
                     took_partial=p.took_partial,
+                    partial_price=p.partial_price,
+                    partial_shares=p.partial_shares,
                     r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
                     return_pct=(p.realized - p.cost_paid)
                     / (p.shares_initial * p.entry_price),
@@ -602,6 +671,8 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                     entry_price=p.entry_price, initial_stop=p.initial_stop,
                     exit_day=day, exit_price=float(cl), shares=p.shares_initial,
                     took_partial=p.took_partial,
+                    partial_price=p.partial_price,
+                    partial_shares=p.partial_shares,
                     r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
                     return_pct=(p.realized - p.cost_paid)
                     / (p.shares_initial * p.entry_price),
@@ -625,6 +696,8 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                         entry_price=p.entry_price, initial_stop=p.initial_stop,
                         exit_day=day, exit_price=float(cl), shares=p.shares_initial,
                     took_partial=p.took_partial,
+                    partial_price=p.partial_price,
+                    partial_shares=p.partial_shares,
                         r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
                         return_pct=(p.realized - p.cost_paid)
                         / (p.shares_initial * p.entry_price),
@@ -661,6 +734,8 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
             exit_day=dates[last], exit_price=float(cl),
             shares=p.shares_initial,
                     took_partial=p.took_partial,
+                    partial_price=p.partial_price,
+                    partial_shares=p.partial_shares,
             r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
             return_pct=(p.realized - p.cost_paid)
             / (p.shares_initial * p.entry_price),

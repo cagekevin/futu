@@ -93,14 +93,27 @@ def summarize(result, *, benchmark: Sequence[float] | None = None) -> dict[str, 
     if benchmark is not None and len(benchmark) == rets.size and rets.size > 2:
         b = np.asarray(benchmark, dtype=float)
         ok = np.isfinite(b) & np.isfinite(rets)
-        if ok.sum() > 2 and float(b[ok].var()) > 0:
-            beta = float(np.cov(rets[ok], b[ok])[0, 1] / b[ok].var())
-            corr = float(np.corrcoef(rets[ok], b[ok])[0, 1])
-            ir_raw = _sharpe(rets[ok])
-            ir_stripped = _sharpe(rets[ok] - beta * b[ok])
+        if ok.sum() > 2:
+            # ★ 分子分母**必须同一 ddof**（都用 0）。
+            #   曾经写成 `np.cov(x, y)[0,1] / y.var()` —— 前者默认 **ddof=1**、
+            #   后者默认 **ddof=0** ⇒ beta 被放大 `n/(n−1)` 倍。
+            #   n 大时看不出来（1,111 天只差 0.09%），但它是**安静的错**：
+            #   手算已知答案的序列上立刻现形（2.0 被算成 2.2857）。
+            rm, bm = float(rets[ok].mean()), float(b[ok].mean())
+            dx, dy = rets[ok] - rm, b[ok] - bm
+            var_b = float((dy * dy).mean())
+            var_r = float((dx * dx).mean())
+            cov = float((dx * dy).mean())
+            if var_b > 0 and var_r > 0:
+                beta = cov / var_b
+                corr = cov / float(np.sqrt(var_b * var_r))
+                ir_raw = _sharpe(rets[ok])
+                ir_stripped = _sharpe(rets[ok] - beta * b[ok])
             bench_total = float(np.prod(1.0 + b[ok]) - 1.0)
 
-    ann_factor = TRADING_DAYS / days if days else float("nan")
+    # ⚠️ 年化的天数是**收益区间数**（`days − 1`），不是**净值点数**（`days`）。
+    #    两者差 1：1,111 天时约 0.09% —— 小，但这是**定义**，不是近似。
+    ann_factor = TRADING_DAYS / (days - 1) if days > 1 else float("nan")
     return {
         "n_trades": len(result.trades),
         "n_days": days,

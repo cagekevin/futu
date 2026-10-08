@@ -462,46 +462,72 @@ def test_full_partial_through_target_closes_the_position() -> bool:
 
 # ── ⑪ ★ 对账：R 必须能从**记录字段独立重算**（最强的检查）──────────────
 
+def _reconcile(t, cost_rate: float) -> float:
+    """★ 用**独立公式**从记录的字段重算 R（**与模拟器内部实现无关**，照定义写）。
+
+    ```
+    没做过部分止盈：
+        gross = (出场价 − 入场价) × 股数
+        cost  = (入场价×股数 + 出场价×股数) × 费率        ← 进、出各收一次
+    做过部分止盈（两笔腿）：
+        gross = (部分价 − 入场价) × 部分股数
+              + (出场价 − 入场价) × (股数 − 部分股数)
+        cost  = (入场价×股数 + 部分价×部分股数
+                 + 出场价×(股数−部分股数)) × 费率
+    R = (gross − cost) / (股数 × (入场价 − 初始止损))
+    ```
+    """
+    e, xp, sh, stop = t.entry_price, t.exit_price, t.shares, t.initial_stop
+    if t.took_partial:
+        pp, ps = t.partial_price, t.partial_shares
+        rest = sh - ps
+        gross = (pp - e) * ps + (xp - e) * rest
+        cost = (e * sh + pp * ps + xp * rest) * cost_rate
+    else:
+        gross = (xp - e) * sh
+        cost = (e * sh + xp * sh) * cost_rate
+    return (gross - cost) / (sh * (e - stop))
+
+
 def test_trade_records_reconcile() -> bool:
-    """★ 没用过部分止盈的那些交易，`r_multiple` 必须能从 CSV 里的字段**独立算出来**。
-
-    独立公式（**与模拟器内部实现无关**，照定义写）：
-
-    ```
-    gross = (出场价 − 入场价) × 股数
-    cost  = (入场价 × 股数 + 出场价 × 股数) × 费率   ← 进、出各收一次
-    R     = (gross − cost) / (股数 × (入场价 − 初始止损))
-    ```
+    """★ **每一笔**的 `r_multiple` 都必须能从记录字段独立算出来（含部分止盈的）。
 
     ⇒ 这条不过，说明**记的账和算的账对不上** —— 那所有报告都别信。
     """
-    # 多标的 + 一路下跌 ⇒ 全部**止损出局**（不触发 3R ⇒ 全部可精确重算）
+    # ⚠️ `_make` 给**每个标的相同的 bar** ⇒ 一次跑只能出一种形态。
+    #    所以跑**两次**：一次只涨（出部分止盈），一次只跌（出纯止损）——
+    #    **两类成交都要被对账覆盖**，只测一类等于没测另一半的记账。
     syms = ("AAA", "BBB", "CCC", "DDD")
-    # ⚠️ 止损距取 **5%**（不是 1%）—— 否则单笔就占满 100% 名义，
-    #    曝险上限只让 1 笔进场，对账样本就只剩 1 笔。
-    bars = [(100, 101, 99, 100),                     # d1 信号（止损 = 95）
-            (100, 100, 94, 94),                      # d2 入场 @100，low 94 ⇒ 打止损
+    # 止损距取 **5%**（不是 1%）—— 否则单笔占满 100% 名义，曝险上限只放 1 笔进来。
+    rally = [(100, 101, 99, 100),     # d1 信号（止损 = 95）
+             (100, 108, 99, 107),     # d2 入场 @100；high 108 未到 3R(115)
+             (100, 120, 100, 118),    # d3 high 120 ≥ 115 ⇒ **部分止盈**（卖一半）
+             (118, 119, 94, 95),      # d4 low 94 ⇒ 打到（已上移到 100 的）止损
+             (95, 95, 94, 94)]
+    fall = [(100, 101, 99, 100),      # d1 信号
+            (100, 100, 94, 94),       # d2 入场 @100，low 94 ⇒ 直接打止损
             (94, 94, 93, 93), (93, 93, 93, 93)]
-    cand = [("d1", s, 95.0) for s in syms]
-    r = _run(bars, cand, symbols=syms,
-             exit_policy=ExitPolicy(use_ma_exit=False, target_r=3.0,
-                                    max_hold_days=5))
+    ep = ExitPolicy(use_ma_exit=False, target_r=3.0, partial_fraction=0.5,
+                    breakeven_after_partial=True, max_hold_days=5)
+    runs = [_run(rally, [("d1", s, 95.0) for s in syms], symbols=syms,
+                 exit_policy=ep),
+            _run(fall, [("d1", s, 95.0) for s in syms], symbols=syms,
+                 exit_policy=ep)]
+    trades = [t for r in runs for t in r.trades]
+    partials = sum(1 for t in trades if t.took_partial)
     checked = bad = 0
-    for t in r.trades:
-        if t.took_partial:
-            continue                                   # 有部分止盈 ⇒ 需要更多字段才能重算
-        gross = (t.exit_price - t.entry_price) * t.shares
-        cost = (t.entry_price * t.shares + t.exit_price * t.shares) * COST
-        denom = t.shares * (t.entry_price - t.initial_stop)
-        expect = (gross - cost) / denom
+    for t in trades:
+        expect = _reconcile(t, COST)
         checked += 1
         if abs(expect - t.r_multiple) > 1e-9:
             bad += 1
             print(f"   ✗ {t.symbol} {t.entry_day}: 记录 {t.r_multiple:.6f} "
                   f"vs 重算 {expect:.6f}")
-    ok = checked > 0 and bad == 0
-    print(f"{'[PASS]' if ok else '[FAIL]'} 逐笔对账：{checked} 笔可重算，"
-          f"不符 {bad} 笔")
+    # 两类**都必须出现**，否则这条测试有一半是空的
+    ok = (checked > 0 and bad == 0 and partials > 0
+          and partials < checked)
+    print(f"{'[PASS]' if ok else '[FAIL]'} 逐笔对账：{checked} 笔"
+          f"（{partials} 笔部分止盈 / {checked - partials} 笔纯止损），不符 {bad} 笔")
     return ok
 
 

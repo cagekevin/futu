@@ -140,6 +140,100 @@ def test_render_report_runs() -> bool:
     return ok
 
 
+# ── ★★ 公式审计：用**手算已知答案**的序列，逐条验 `trade_metrics` ─────────
+#
+# 为什么单独做这一组：**报告里每一个数字都出自这里**。
+# 公式错一个，前面所有结论都要重算 —— 而且**错得很安静**（不会报错，只会给错数）。
+
+def test_max_drawdown_matches_hand_computed() -> bool:
+    """净值 `100 → 120 → 90 → 130` ⇒ 最大回撤 = `90/120 − 1` = **−25%**。"""
+    m = tm.summarize(_result([1.0], equity=[100.0, 120.0, 90.0, 130.0]))
+    ok = abs(m["max_drawdown"] - (-0.25)) < 1e-12
+    print(f"{'[PASS]' if ok else '[FAIL]'} 最大回撤手算对得上（{m['max_drawdown']:.6f}）")
+    return ok
+
+
+def test_cagr_matches_compound_definition() -> bool:
+    """`100 → 121` 跨 **504 天**（= 2 个 252 天年）⇒ CAGR = `1.21^0.5 − 1` = **10%**。"""
+    eq = list(np.linspace(100.0, 121.0, 505))
+    m = tm.summarize(_result(list(np.zeros(504)), equity=eq))
+    ok = abs(m["cagr"] - 0.10) < 1e-9
+    print(f"{'[PASS]' if ok else '[FAIL]'} CAGR 按复利定义（{m['cagr']:.8f}，应 0.1）")
+    return ok
+
+
+def test_sharpe_matches_definition() -> bool:
+    """逐日收益 `+1% / −1%` 交替 ⇒ 均值 0 ⇒ **Sharpe = 0**（不是 n/a）。"""
+    rets = [0.01 if i % 2 else -0.01 for i in range(200)]
+    eq = list(1_000_000.0 * np.cumprod(np.concatenate([[1.0], 1.0 + np.array(rets)])))
+    m = tm.summarize(_result(list(np.zeros(200)), equity=eq))
+    ok = np.isfinite(m["sharpe"]) and abs(m["sharpe"]) < 1e-9
+    print(f"{'[PASS]' if ok else '[FAIL]'} 零均值收益 ⇒ Sharpe ≈ 0（{m['sharpe']:.3e}）")
+    return ok
+
+
+def test_beta_and_corr_are_exact_for_proportional_series() -> bool:
+    """`策略收益 = 2 × 基准收益` ⇒ **beta = 2、corr = 1**（精确）。"""
+    b = np.array([0.01, -0.02, 0.03, -0.01, 0.02, -0.015, 0.005, -0.025])
+    r = 2.0 * b
+    eq = list(1_000_000.0 * np.cumprod(np.concatenate([[1.0], 1.0 + r])))
+    m = tm.summarize(_result(list(np.zeros(len(r))), equity=eq), benchmark=list(b))
+    ok = abs(m["beta"] - 2.0) < 1e-9 and abs(m["corr"] - 1.0) < 1e-9
+    print(f"{'[PASS]' if ok else '[FAIL]'} beta / corr 精确（beta={m['beta']:.6f}, "
+          f"corr={m['corr']:.6f}）")
+    return ok
+
+
+def test_ir_stripped_removes_benchmark_exposure() -> bool:
+    """`策略 = beta × 基准 + alpha` ⇒ **剥离 beta 后应精确还原出 alpha 的 Sharpe**。
+
+    这是"剥离 beta"这件事**唯一有意义的定义**：剥离后剩下的就是 alpha。
+
+    ⚠️ **必须把 alpha 构造成与基准正交**（下面那两行）。
+       第一版我用的是**独立随机**的 alpha —— 但有限样本下 `cov(alpha, b) ≠ 0`，
+       样本 beta 自然会偏一点点，于是测试**假报失败**。
+       正交化之后样本 beta **精确**等于真值，这条测试才在检验"剥离"而不是在检验抽样噪声。
+    """
+    rng = np.random.default_rng(7)
+    b = rng.normal(0.0, 0.01, 500)
+    b = b - b.mean()
+    raw = rng.normal(0.0005, 0.005, 500)
+    # ★ 只去掉**沿 b 的分量**（正交化），**保留 alpha 自身的均值** ——
+    #   否则 alpha 均值被归零、剥离后的 Sharpe 恒为 0，这条测试就退化成"0 == 0"了。
+    alpha = raw - (raw @ b) / (b @ b) * b
+    beta_true = 1.4
+    r = beta_true * b + alpha
+    eq = list(1_000_000.0 * np.cumprod(np.concatenate([[1.0], 1.0 + r])))
+    m = tm.summarize(_result(list(np.zeros(500)), equity=eq), benchmark=list(b))
+    expect = float(alpha.mean() / alpha.std(ddof=1) * np.sqrt(252))
+    ok = abs(m["beta"] - beta_true) < 1e-9 and abs(m["ir_stripped"] - expect) < 1e-9
+    print(f"{'[PASS]' if ok else '[FAIL]'} 剥离 beta 后还原 alpha 的 Sharpe"
+          f"（beta={m['beta']:.6f}，IR剥离={m['ir_stripped']:.6f} vs 手算 {expect:.6f}）")
+    return ok
+
+
+def test_payoff_ratio_matches_definition() -> bool:
+    """`+3, +1, −1, −1` ⇒ 平均赚 2 / 平均亏 1 ⇒ **盈亏比 = 2**。"""
+    m = tm.summarize(_result([3.0, 1.0, -1.0, -1.0]))
+    ok = abs(m["payoff_ratio"] - 2.0) < 1e-12 and abs(m["win_rate"] - 0.5) < 1e-12
+    print(f"{'[PASS]' if ok else '[FAIL]'} 盈亏比 / 胜率手算对得上"
+          f"（{m['payoff_ratio']:.4f} / {m['win_rate']:.2f}）")
+    return ok
+
+
+def test_equity_starts_at_initial_capital() -> bool:
+    """★ `total_return` / `cagr` 的**基数是 `equity[0]`** ⇒ 它**必须等于初始资金**。
+
+    ⚠️ 这是一条**隐性假设**（`summarize` 不知道初始资金是多少，只能拿首格当基数）。
+       若哪天首格不是初始资金（例如第一天就开了仓），这两个数会**安静地偏掉**。
+    """
+    eq = [1_000_000.0] + [1_010_000.0] * 10
+    m = tm.summarize(_result(list(np.zeros(10)), equity=eq))
+    ok = abs(m["total_return"] - 0.01) < 1e-12
+    print(f"{'[PASS]' if ok else '[FAIL]'} 基数是首格净值（总收益 {m['total_return']:.6f}）")
+    return ok
+
+
 if __name__ == "__main__":
     import traceback
 

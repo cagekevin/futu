@@ -582,11 +582,15 @@ class TugboatExposure:
     # ── 判定用的三个小函数（都可单独测）────────────────────────────────
 
     def _day_of(self, state: AccountState) -> str | None:
-        if self.market_state is None:
-            return None
-        if state.day_index >= len(self.market_state.index):
-            return None
-        return str(self.market_state.index[state.day_index])
+        """★ 查市场状态一律用 **`state.day`（日期字符串）**。
+
+        ⚠️ 曾经写成 `self.market_state.index[state.day_index]` ——
+           那隐含"**市场状态的行序 = 模拟的日序**"这个**没有任何东西保证**的前提。
+           一旦调用方传进来的 `market_state` 顺序不同（比如按日期倒序、
+           或者缺了几天），档位会**安静地错位**：不报错、不抛异常，
+           只是**每天读到别人的宽度** ⇒ 四阶段全错。
+        """
+        return state.day if state.day else None
 
     def _state_of(self, day: str | None) -> tuple[float, float]:
         if day is None or self.market_state is None or day not in self.market_state.index:
