@@ -49,6 +49,7 @@ import pandas as pd  # noqa: E402
 
 import backtest_config  # noqa: E402
 import factor.implementations  # noqa: E402
+import random_control  # noqa: E402
 import trade_metrics  # noqa: E402
 import verdict  # noqa: E402
 from factor.factor_registry import run_factor  # noqa: E402
@@ -139,7 +140,20 @@ def _market_state(panel, spy_panel) -> pd.DataFrame:
     #    未上市/无数据的票会被算进"不在 50 日线上方" ⇒ **早期宽度被系统性低估**
     #    （更容易误判成"疑似见底"档）。第一版那句 `.replace(0, np.nan)` 是**死代码**。
     valid = close.notna() & close.rolling(50).mean().notna()
-    breadth = above.sum(axis=1) / valid.sum(axis=1).replace(0, np.nan)
+    valid_n = valid.sum(axis=1)
+    # ★★ **有效标的数太少 ⇒ 宽度没有意义，取 NaN（中性），不是 0。**
+    #
+    #   为什么必须挡：`close > close.rolling(50).mean()` 在**冷启动期**是
+    #   `NaN > NaN` = **`False`**（pandas 的语义，不是 NaN！）
+    #   ⇒ 前 ~49 天 `breadth` 恒为 **0.0** ⇒ 被当成**真实的"疑似见底"**。
+    #
+    #   实测（复审给的数）：报告里「①疑似见底 **113 天**」中
+    #   **49 天是冷启动假象** ⇒ **43% 是 bug**。
+    #   （本次无害 —— 候选最早 2023-03-06，前 49 天 0 个候选；
+    #    但**一旦拉长历史/扩大票池，每个窗口的头 49 天都会静默进档位 ①**。）
+    min_valid = max(30, int(0.3 * len(panel.symbols)))
+    breadth = (above.sum(axis=1) / valid_n.replace(0, np.nan)
+               ).where(valid_n >= min_valid)
 
     spy_close = spy_panel.field("close")["SPY"]
     dist = spy_close / spy_close.rolling(200).mean() - 1.0
@@ -313,7 +327,11 @@ def _yearly_table(result, spy_close) -> str:
         if len(idx) < 2:
             continue
         i0, i1 = idx[0], idx[-1]
-        strat = eq[i1] / eq[i0] - 1.0
+        # ★ **要算"这一年的收益"，基数应是"上一年最后一天的净值"**（复审 10.6）。
+        #   原来用 `eq[i0]`（= 本年第**一天收盘后**的净值）⇒
+        #   **每年都漏掉第一天的 P&L** ⇒ "逐年相加 ≠ 总收益"。
+        b0 = max(i0 - 1, 0)
+        strat = eq[i1] / eq[b0] - 1.0
         base = float("nan")
         if np.isfinite(spy[i0]) and np.isfinite(spy[i1]) and spy[i0] > 0:
             base = spy[i1] / spy[i0] - 1.0
@@ -333,14 +351,24 @@ def _hold_table(result) -> str:
     trades = result.trades
     rs = np.array([t.r_multiple for t in trades], dtype=float)
     holds = np.array([t.hold_days for t in trades], dtype=float)
-    out = [f"  {'持有':10s}{'笔数':>6s}{'胜率':>8s}{'平均R':>9s}{'总R':>9s}"]
-    for lo, hi, label in ((-1, 2, "≤2 天"), (2, 5, "3–5 天"), (5, 10, "6–10 天"),
+    out = [f"  {'持有':16s}{'笔数':>6s}{'胜率':>8s}{'平均R':>9s}{'总R':>9s}"]
+    # ★ **0 / 1 / 2 天必须拆开**（复审 10.7）：
+    #   `hold = 0` 是「**成交当日就止损**」（成交在开盘、止损在同一天），
+    #   和「第 2 天止损」是**两件不同的事**。混在一桶里，
+    #   "42% 在第 2 天就死"这个说法本身是**三个东西的混合**。
+    for lo, hi, label in ((-1, 0, "0 天（成交当日）"), (0, 1, "1 天"), (1, 2, "2 天"),
+                          (2, 5, "3–5 天"), (5, 10, "6–10 天"),
                           (10, 20, "11–20 天"), (20, 10 ** 9, ">20 天")):
         m = (holds > lo) & (holds <= hi)
         if not m.any():
             continue
-        out.append(f"  {label:10s}{int(m.sum()):>6d}{float((rs[m] > 0).mean()) * 100:>7.1f}%"
+        out.append(f"  {label:16s}{int(m.sum()):>6d}{float((rs[m] > 0).mean()) * 100:>7.1f}%"
                    f"{float(rs[m].mean()):>9.3f}{float(rs[m].sum()):>9.1f}")
+    early = holds <= 2
+    if early.any():
+        out.append(f"  {'（≤2 天 合计）':16s}{int(early.sum()):>6d}"
+                   f"{float((rs[early] > 0).mean()) * 100:>7.1f}%"
+                   f"{float(rs[early].mean()):>9.3f}{float(rs[early].sum()):>9.1f}")
     return "\n".join(out)
 
 
@@ -423,6 +451,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="★ 净值曲线 + 逐年表现 + R 倍数分布")
     ap.add_argument("--free-params", action="store_true",
                     help="★★ **验我自创的近似**（入场时点 / 止损位 / 6 个阈值）会不会翻掉结论")
+    ap.add_argument("--random", action="store_true",
+                    help="★ 随机对照（同日/同数量/同票池/同一套规则）+ **分辨力**"
+                         " + **持有期分布对照**")
+    ap.add_argument("--random-n", type=int, default=200,
+                    help="随机重抽次数（默认 200；n=20 时分辨力只有 ~11pp）")
     ap.add_argument("--vcp", action="store_true",
                     help="变体：只挑 VCP 那一个形态（§7.1 六要点）")
     ap.add_argument("--no-exposure", action="store_true",
@@ -592,6 +625,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.trades:
         _dump_trades(result, args.trades)
+
+    if args.random:
+        # ★ 随机对照 —— 唯一能隔离"选股贡献"的参照。
+        #   ⚠️ n 默认 **200**（不是 20）：n=20 时分位标准误 ≈11pp，
+        #      连"50 分位"都测不准，更别说"高于/低于随机"。
+        def _ep():
+            return {"ma": ma_exit, "policy": strategy.exit_policy}
+
+        ctl = random_control.run_control(
+            cand, panel, bars, simulate=simulate,
+            summarize=trade_metrics.summarize,
+            make_exit_policy=_ep, make_account=lambda: account,
+            exposure=exposure, benchmark=bench,
+            n_iter=args.random_n, seed=20261009, real_result=result)
+        print(random_control.render_control(ctl))
+        return 0
 
     if args.free_params:
         # ★★ **这个测试才有意义**：验"我自创的近似"会不会把结论翻掉。

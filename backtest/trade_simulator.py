@@ -371,9 +371,13 @@ def reconcile(result: SimulationResult, cost_rate: float) -> dict[str, Any]:
     worst = 0.0
     examples: list[str] = []
     n_partial = 0
+    skipped = 0
     for t in result.trades:
         e, xp, sh, stop = (t.entry_price, t.exit_price, t.shares, t.initial_stop)
         if sh <= 0 or not np.isfinite(e) or not np.isfinite(xp):
+            # ⚠️ **跳过要计数** —— 一个专门用来"不静默"的自检，
+            #    自己不能有一条静默路径。（复审 10.2）
+            skipped += 1
             continue
         if t.took_partial and np.isfinite(t.partial_price):
             n_partial += 1
@@ -393,18 +397,26 @@ def reconcile(result: SimulationResult, cost_rate: float) -> dict[str, Any]:
                 examples.append(f"{t.symbol} {t.entry_day}: 记录 {t.r_multiple:.6f}"
                                 f" vs 重算 {expect:.6f}")
     return {"n": len(result.trades), "n_partial": n_partial, "bad": bad,
-            "max_abs_diff": worst, "examples": examples}
+            "max_abs_diff": worst, "examples": examples, "skipped": skipped}
 
 
 @dataclass
 class _Order:
-    """一张活的入场单（市价只能当日成交；限价可挂 `valid_days` 天）。"""
+    """一张活的入场单（市价只能当日成交；限价可挂 `valid_days` 天）。
+
+    `counted`：**这张单是否已经被计入某个 skipped 计数**。
+    ⚠️ 为什么需要它（复审 10.3）：`skipped_no_slot` / `skipped_exposure` 原来写在
+       **日循环里**，而限价单被挡住后会**挂到有效期结束** ⇒ 同一张单会被**记 N 次**，
+       而 `skipped_expired` 是**按单**记的 ⇒ 报告里并排的三个数**口径不同**。
+       ⇒ 现在一律**按单**记一次。
+    """
 
     symbol_idx: int
     arrive: int
     expire: int
     stop: float
     limit: float | None
+    counted: bool = False
 
 
 def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
@@ -545,7 +557,10 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
         # ── ① 开盘：处理**活着的入场单**（含前几日挂着的限价单）──────────
         live.extend(pending.get(i, ()))
         keep: list[_Order] = []
-        for o in sorted(live, key=lambda x: x.symbol_idx):
+        # ⚠️ **按"到达日"排，不是按 symbol 排**（复审 10.7）：
+        #    按 symbol 排会让**新信号挤掉旧挂单**（旧单还没到期就先被处理、占了仓位）。
+        #    按 `(arrive, symbol_idx)` 才是"先到先得"。
+        for o in sorted(live, key=lambda x: (x.arrive, x.symbol_idx)):
             j = o.symbol_idx
             op, lo = opens[i, j], lows[i, j]
             if o.expire < i:                                # 超过有效期 ⇒ 放弃
@@ -573,7 +588,9 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
             if px <= o.stop:
                 continue                # 成交价已在止损下方 ⇒ 不进场（不是"进场即止损"）
             if len(positions) >= settings.max_positions:
-                skipped_no_slot += 1
+                if not o.counted:            # ★ 按**单**记一次，不按"单-天"
+                    skipped_no_slot += 1
+                    o.counted = True
                 if i < o.expire:
                     keep.append(o)
                 continue
@@ -583,7 +600,9 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                        for jj, p in positions.items()
                        if np.isfinite(opens[i, jj]))
             if (held + notional) > equity_open * account.max_total_exposure:
-                skipped_exposure += 1
+                if not o.counted:            # ★ 同上
+                    skipped_exposure += 1
+                    o.counted = True
                 if i < o.expire:
                     keep.append(o)
                 continue
@@ -751,8 +770,14 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                     del positions[j]
 
         # ── ③ 收盘：记账 + 用今日收盘生成**明日**候选（由调用方预先算好）──
+        # ⚠️ **收盘口径也要兜底**（与上面 `equity_open` 对称）。
+        #    原来这里直接 `closes[i, j]` —— 任一持仓当日无收盘（停牌/缺数据）
+        #    ⇒ **整条净值变 NaN** ⇒ `total_return` / `Sharpe` 全变 NaN，
+        #    而且**不报错**。同一个函数里"一边兜底、一边不兜"是隐患。
         equity_now = cash + sum(
-            p.shares_left * closes[i, j] for j, p in positions.items())
+            p.shares_left * (closes[i, j] if np.isfinite(closes[i, j])
+                             else p.entry_price)
+            for j, p in positions.items())
         equity_days.append(day)
         equity_values.append(float(equity_now))
         exposures.append(
