@@ -50,6 +50,7 @@ import pandas as pd  # noqa: E402
 import backtest_config  # noqa: E402
 import factor.implementations  # noqa: E402
 import trade_metrics  # noqa: E402
+import verdict  # noqa: E402
 from factor.factor_registry import run_factor  # noqa: E402
 from panel.panel_builder import read_panel  # noqa: E402
 from panel.provide_reader import read_days, read_snapshot, read_stocks  # noqa: E402
@@ -569,6 +570,14 @@ def main(argv: list[str] | None = None) -> int:
         report, mc, title=f"Tugboat 突破交易 2.0 · 入场={args.entry_mode} · "
                           f"VCP={args.vcp} · 四阶段={not args.no_exposure}") + footer
     print(text)
+
+    # ★ **过仓库自己那道门**（第三轮独立复审第 3 条）：
+    #   `backtest_config` 里早就写死了判据，而这条路一条都没用。
+    #   ⇒ 在说"说不清"之前先过门；**按门算可能是 INVALID，不是说不清**。
+    side_ratio = (float(np.mean(result.daily_exposure))
+                  if result.daily_exposure else None)
+    judgements = verdict.judge(report, side_ratio=side_ratio)
+    print(verdict.render_verdict(judgements))
 
     # ★ **默认就出**这两张表 —— 它们最能把问题暴露出来，不该藏在开关后面
     print()
