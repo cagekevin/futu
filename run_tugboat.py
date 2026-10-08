@@ -59,7 +59,7 @@ from strategies.tugboat_breakout import (  # noqa: E402
     DEFAULTS, ENTER_MODES, REQUIRED_FACTORS, TugboatBreakout, TugboatExposure,
 )
 from trade_simulator import (  # noqa: E402
-    ExitPolicy, StaticExposure, reconcile, simulate,
+    ExitPolicy, StaticExposure, reconcile, reconcile_fills, simulate,
 )
 
 #: 票池跳到 287 只那天 —— 比它更早的日子只有 16 只，构不成截面。
@@ -577,7 +577,22 @@ def main(argv: list[str] | None = None) -> int:
         print("   ⇒ 记账有错，报告不可信 —— 已中止。")
         return 2
     print(f"自检   : {chk['n']} 笔逐笔对账通过（含 {chk['n_partial']} 笔部分止盈，"
-          f"最大差 {chk['max_abs_diff']:.1e}）")
+          f"最大差 {chk['max_abs_diff']:.1e}）"
+          + (f"｜**跳过 {chk['skipped']} 笔**（记录不完整）" if chk["skipped"] else ""))
+
+    # ★ **成交逻辑对账**（复审第 9 条）—— 上面那条只验"记录自洽"，
+    #   这一条从 bar **独立反推**成交价，验"**算得对不对**"。
+    chk2 = reconcile_fills(result, panel.dates, panel.symbols, bars,
+                           trade_on_close=account.trade_on_close)
+    if chk2["bad"]:
+        print(f"\n⛔ **成交逻辑对账失败**：入场 {chk2['bad_entry']} 笔 / "
+              f"止损 {chk2['bad_stop']} 笔与按规则重推不符")
+        for line in chk2["examples"]:
+            print("   ", line)
+        print("   ⇒ 成交价与规则不符 ⇒ 报告不可信 —— 已中止。")
+        return 2
+    print(f"成交对账: 入场 {chk2['checked_entry']} 笔 / "
+          f"止损出场 {chk2['checked_stop']} 笔，**全部与规则一致**")
     print()
 
     spy_close = spy_panel.field("close")["SPY"].reindex(panel.dates)

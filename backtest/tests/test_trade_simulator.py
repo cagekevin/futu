@@ -619,6 +619,72 @@ def test_last_bar_signal_is_counted_not_dropped() -> bool:
     return ok
 
 
+# ── ⑫ ★ 成交**逻辑**对账（复审第 9 条）────────────────────────────────
+
+def test_reconcile_fills_checks_the_rules_not_just_the_arithmetic() -> bool:
+    """★ `reconcile_fills` 必须从 bar **独立反推**成交价 —— 验"**算得对不对**"。
+
+    ⚠️ 与 `reconcile` 的分工（复审第 9 条的原话）：
+
+    > `reconcile()` 验证的是「**我记的和我算的一样**」，
+    > **不是**「我算的和规则一样」。
+
+    这里造一笔**跳空越过止损**：入场 100 / 止损 95，
+    出场日 `open = 90`（跳空低开）、`low = 88` ⇒
+    按规则成交价应是 **`min(95, 90) = 90`**（不是 95，也不是 88）。
+    """
+    from trade_simulator import reconcile_fills
+
+    bars = [(100, 100, 100, 100),      # d1 信号（止损 95）
+            (100, 101, 99, 100),       # d2 入场 @100
+            (90, 92, 88, 91)]          # d3 跳空低开 ⇒ 按 min(95, 90) = 90 成交
+    dates, syms, frames = _make(bars)
+    r = simulate(dates, syms, frames,
+                 pd.DataFrame([("d1", SYM, 95.0)],
+                              columns=["day", "symbol", "stop_price"]),
+                 strategy_name="t", strategy_params={},
+                 ma_exit_level=pd.DataFrame(np.nan, index=list(dates),
+                                            columns=list(syms)),
+                 exit_policy=ExitPolicy(use_ma_exit=False, target_r=99,
+                                        max_hold_days=3),
+                 account=AccountPolicy(cost_rate=COST))
+    chk = reconcile_fills(r, dates, syms, frames)
+    ok = chk["bad"] == 0 and chk["checked_entry"] >= 1 and chk["checked_stop"] >= 1
+    print(f"{'[PASS]' if ok else '[FAIL]'} 成交逻辑对账：入场 {chk['checked_entry']} / "
+          f"止损 {chk['checked_stop']} 笔，不符 {chk['bad']}"
+          f"（成交价 {r.trades[0].exit_price if r.trades else '-'}，应 90.0）")
+    return ok
+
+
+def test_reconcile_fills_uses_breakeven_stop_after_partial() -> bool:
+    """★ 做过部分止盈的 ⇒ 止损应已移到**保本**，对账要按保本算。
+
+    入场 100 / 止损 95 / 3R = 115。d3 `high=120 ≥ 115` ⇒ 部分止盈 + 止损移到 100。
+    d4 `open=98, low=97` ⇒ 打中**保本止损 100** ⇒ 成交价 `min(100, 98) = 98`。
+    """
+    from trade_simulator import reconcile_fills
+
+    bars = [(100, 100, 100, 100), (100, 101, 99, 100), (100, 120, 100, 118),
+            (98, 99, 97, 98), (98, 98, 98, 98)]
+    dates, syms, frames = _make(bars)
+    r = simulate(dates, syms, frames,
+                 pd.DataFrame([("d1", SYM, 95.0)],
+                              columns=["day", "symbol", "stop_price"]),
+                 strategy_name="t", strategy_params={},
+                 ma_exit_level=pd.DataFrame(np.nan, index=list(dates),
+                                            columns=list(syms)),
+                 exit_policy=ExitPolicy(use_ma_exit=False, target_r=3.0,
+                                        partial_fraction=0.5,
+                                        breakeven_after_partial=True,
+                                        max_hold_days=4),
+                 account=AccountPolicy(cost_rate=COST))
+    chk = reconcile_fills(r, dates, syms, frames)
+    ok = chk["bad"] == 0 and chk["checked_stop"] >= 1
+    print(f"{'[PASS]' if ok else '[FAIL]'} 保本止损也被对账覆盖"
+          f"（止损出场 {chk['checked_stop']} 笔，不符 {chk['bad']}）")
+    return ok
+
+
 if __name__ == "__main__":
     import traceback
 

@@ -75,6 +75,7 @@ __all__ = [
     "Trade",
     "TradeStrategy",
     "reconcile",
+    "reconcile_fills",
     "simulate",
 ]
 
@@ -398,6 +399,89 @@ def reconcile(result: SimulationResult, cost_rate: float) -> dict[str, Any]:
                                 f" vs 重算 {expect:.6f}")
     return {"n": len(result.trades), "n_partial": n_partial, "bad": bad,
             "max_abs_diff": worst, "examples": examples, "skipped": skipped}
+
+
+def reconcile_fills(result: SimulationResult, dates, symbols, bars: Mapping[str, Any],
+                    *, trade_on_close: bool = False) -> dict[str, Any]:
+    """★ **成交逻辑**对账 —— 从 bar **独立反推**每一笔的成交价，跟记录比。
+
+    ## 为什么需要它（第三轮独立复审第 9 条）
+
+    复审指出 `reconcile()` 的覆盖面被高估：
+
+    > `reconcile()` 验证的是「**我记的和我算的一样**」，
+    > **不是**「我算的和规则一样」。
+
+    它**不覆盖**（而这些正是最可能出错的地方）：
+
+    | 不覆盖的 | 错的话会怎样 |
+    |---|---|
+    | 跳空越过止损 ⇒ `min(止损, 开盘)` | 按止损价成交会**系统性高估** |
+    | 同一根 bar 止损优先 | 取错一侧就**系统性高估** |
+    | 限价 vs 开盘取优 | 取错就高估 |
+    | `trade_on_close` 当天不判出场 | 我**刚修过**的一个真 bug |
+
+    ## 本函数独立重算什么
+
+    对**每一笔**，从 `bars` 里取那几天的行情，**按规则重推**成交价：
+
+    ```
+    入场价  = 入场日的 open（`trade_on_close` 时 = close）
+    止损出场 = 出场日 low ≤ 该笔止损 ⇒ 成交价 = min(该笔止损, 出场日 open)
+    ```
+
+    止损位怎么推：**没做过部分止盈** ⇒ `initial_stop`；
+    **做过** ⇒ `max(initial_stop, entry_price)`（部分止盈后移到保本）。
+
+    ⇒ 这两条正是"跳空"与"保本止损"的落点，也是最容易写错的地方。
+    """
+    import numpy as _np
+
+    o = _np.asarray(bars["open"].loc[list(dates)].to_numpy(), dtype=float)
+    c = _np.asarray(bars["close"].loc[list(dates)].to_numpy(), dtype=float)
+    lo = _np.asarray(bars["low"].loc[list(dates)].to_numpy(), dtype=float)
+    di = {d: i for i, d in enumerate(dates)}
+    si = {s: j for j, s in enumerate(symbols)}
+
+    bad_entry = bad_stop = checked_entry = checked_stop = 0
+    examples: list[str] = []
+    for t in result.trades:
+        i, j = di.get(t.entry_day), si.get(t.symbol)
+        if i is None or j is None:
+            continue
+        # ── 入场价：市价单按 open（`trade_on_close` 时按 close）──
+        want = c[i, j] if trade_on_close else o[i, j]
+        if _np.isfinite(want):
+            checked_entry += 1
+            if abs(float(want) - t.entry_price) > 1e-9:
+                bad_entry += 1
+                if len(examples) < 5:
+                    examples.append(
+                        f"{t.symbol} {t.entry_day} 入场：记录 {t.entry_price:.6f}"
+                        f" vs 按规则 {float(want):.6f}")
+        # ── 止损出场的成交价 ──
+        if t.exit_reason != EXIT_STOP:
+            continue
+        k = di.get(t.exit_day)
+        if k is None:
+            continue
+        stop = t.initial_stop
+        if t.took_partial:
+            stop = max(stop, t.entry_price)          # 部分止盈后移到保本
+        if not (_np.isfinite(lo[k, j]) and _np.isfinite(o[k, j])):
+            continue
+        if lo[k, j] <= stop:                          # 真的打到了
+            expect = min(stop, float(o[k, j]))        # ★ 跳空 ⇒ 取更差的
+            checked_stop += 1
+            if abs(expect - t.exit_price) > 1e-9:
+                bad_stop += 1
+                if len(examples) < 5:
+                    examples.append(
+                        f"{t.symbol} {t.exit_day} 止损：记录 {t.exit_price:.6f}"
+                        f" vs 按规则 {expect:.6f}")
+    return {"checked_entry": checked_entry, "bad_entry": bad_entry,
+            "checked_stop": checked_stop, "bad_stop": bad_stop,
+            "bad": bad_entry + bad_stop, "examples": examples}
 
 
 @dataclass
