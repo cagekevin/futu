@@ -15,6 +15,7 @@ import math
 from collections.abc import Sequence
 
 import backtest_config
+import metrics_core
 
 SECONDS_PER_YEAR = 365.25 * 86400.0
 _EPS = 1e-12
@@ -57,13 +58,23 @@ def periods_per_year(times: Sequence[int]) -> int:
 # ── 风险调整（承 R2/R3）─────────────────────────────────────────────────
 
 def annualized_return(pnl: Sequence[float], periods_per_year_: int) -> float:
-    """年化 = 单 bar 平均收益 × 每年 bar 数（承 R3：**不再除样本长度**）。"""
-    return _mean(pnl) * periods_per_year_
+    """年化 = 单 bar 平均收益 × 每年 bar 数（承 R3：**不再除样本长度**）。
+
+    ⚠️ 这是**算术年化**（逐笔/逐 bar 序列**没有复利语义**），
+       与组合级的**几何** CAGR **不是同一个东西** ⇒ 名字必须不同。
+       口径定义在 `metrics_core.ann_return_from_pnl`（**唯一来源**）。
+    """
+    return metrics_core.ann_return_from_pnl(pnl, periods_per_year_)
 
 
 def sharpe_ratio(pnl: Sequence[float], periods_per_year_: int) -> float:
-    std = _std(pnl)
-    if std < _EPS:
+    """`mean / std × √ppy`。
+
+    ⚠️ 标准差用 **`ddof=1`**（样本）—— 口径在 `metrics_core.STD_DDOF`（**唯一来源**）。
+       曾经这里用 `ddof=0`，而 `trade_metrics` 用 `ddof=1` ⇒ **同名不同口径**。
+    """
+    std = metrics_core.std(pnl)
+    if not (std > _EPS):
         return 0.0
     return _mean(pnl) / std * math.sqrt(periods_per_year_)
 
@@ -84,13 +95,12 @@ def sortino_ratio(pnl: Sequence[float], periods_per_year_: int) -> float:
 
 
 def max_drawdown(pnl: Sequence[float]) -> float:
-    """最大回撤（以累计 PnL 计）。"""
-    cumulative = peak = drawdown = 0.0
-    for x in pnl:
-        cumulative += x
-        peak = max(peak, cumulative)
-        drawdown = max(drawdown, peak - cumulative)
-    return drawdown
+    """最大回撤（**以累计 PnL 计 ⇒ 正数**，单位同 PnL）。
+
+    ⚠️ 与 `trade_metrics` 的 `max_drawdown`（**净值口径 ⇒ 负数**）**符号与量纲都不同**。
+       ⇒ 两者名字必须能区分。口径在 `metrics_core.max_drawdown_from_pnl`（**唯一来源**）。
+    """
+    return metrics_core.max_drawdown_from_pnl(pnl)
 
 
 def long_short_ratio(positions: Sequence[float]) -> tuple[float, float]:
@@ -117,11 +127,20 @@ def count_trades(positions: Sequence[float]) -> int:
 # ── 内部 ────────────────────────────────────────────────────────────────
 
 def _mean(xs: Sequence[float]) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
+    """⚠️ **不能写 `if xs`** —— 传 numpy 数组时 `if` 会抛
+    `ValueError: The truth value of an array ... is ambiguous`。
+    （这个 latent bug 是"让两份 metrics 共用原语"时才暴露的：
+      以前它只被喂 list，所以没炸。）
+    """
+    a = list(xs)
+    return sum(a) / len(a) if a else 0.0
 
 
 def _std(xs: Sequence[float]) -> float:
-    if len(xs) < 2:
-        return 0.0
-    m = _mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+    """⚠️ **委派给 `metrics_core.std`**（`ddof=1`）。
+
+    原来这里是 `ddof=0`（除 `len`）—— 与 `trade_metrics` 的 `ddof=1` 打架。
+    ⇒ 现在**只有一处**定义 ddof。
+    """
+    v = metrics_core.std(xs)
+    return 0.0 if not (v > 0) else v

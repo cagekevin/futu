@@ -30,6 +30,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+import metrics_core
+
 __all__ = ["ROBUSTNESS_DROP_TOP", "monte_carlo", "render_report", "robustness",
            "summarize"]
 
@@ -38,27 +40,26 @@ TRADING_DAYS = 252
 
 
 def _equity_returns(equity: Sequence[float]) -> np.ndarray:
-    e = np.asarray(equity, dtype=float)
-    if e.size < 2:
-        return np.zeros(0)
-    return e[1:] / e[:-1] - 1.0
+    """⚠️ **委派给 `metrics_core.to_returns`**（口径只有一处）。"""
+    return metrics_core.to_returns(equity)
 
 
 def _max_drawdown(equity: Sequence[float]) -> float:
-    e = np.asarray(equity, dtype=float)
-    if e.size == 0:
-        return 0.0
-    peak = np.maximum.accumulate(e)
-    return float((e / peak - 1.0).min())
+    """**净值口径 ⇒ 负数**（`−0.25` = 回撤 25%）。
+
+    ⚠️ 与 `performance_metrics.max_drawdown`（**累计 PnL 口径 ⇒ 正数**）
+       **符号与量纲都不同** —— 那是"同名不同口径"的实例之一。
+       口径在 `metrics_core.max_drawdown_from_equity`（**唯一来源**）。
+    """
+    v = metrics_core.max_drawdown_from_equity(equity)
+    return 0.0 if not np.isfinite(v) else v
 
 
 def _sharpe(rets: np.ndarray) -> float:
-    if rets.size < 2:
-        return float("nan")
-    sd = float(rets.std(ddof=1))
-    if sd == 0:
-        return float("nan")
-    return float(rets.mean() / sd * np.sqrt(TRADING_DAYS))
+    """⚠️ **委派给 `metrics_core.sharpe_from_returns`** ——
+    `ddof` 与年化因子**只有一处**定义（`metrics_core.STD_DDOF` / `TRADING_DAYS`）。
+    """
+    return metrics_core.sharpe_from_returns(rets)
 
 
 def summarize(result, *, benchmark: Sequence[float] | None = None) -> dict[str, Any]:
