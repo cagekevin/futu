@@ -148,6 +148,8 @@ def summarize(result, *, benchmark: Sequence[float] | None = None) -> dict[str, 
         "skipped_no_slot": result.skipped_no_slot,
         "skipped_exposure": result.skipped_exposure,
         "skipped_expired": result.skipped_expired,
+        # ★ 末日的信号（`arrive` 越过数据末尾）—— 原来静默丢弃（复审 G3）
+        "skipped_after_end": result.skipped_after_end,
         "stages": _stage_summary(result.stages),
     }
 
@@ -326,9 +328,9 @@ def render_report(report: dict[str, Any], mc: dict[str, float] | None = None,
     lines += [
         "",
         "  ── 被跳过的 ──",
-        f"  仓位满 / 曝险上限 / 限价到期 : "
+        f"  仓位满 / 曝险上限 / 限价到期 / **末日信号** : "
         f"{report['skipped_no_slot']} / {report['skipped_exposure']} / "
-        f"{report['skipped_expired']}",
+        f"{report['skipped_expired']} / {report['skipped_after_end']}",
         "",
         "  ── 曝险档位（他 §2.2 的四阶段）──",
     ]

@@ -578,6 +578,47 @@ def test_static_exposure_is_the_default() -> bool:
     return ok
 
 
+# ── ⑪ 复审 G2/G3：对齐校验 + 末日信号计数 ─────────────────────────────
+
+def test_misaligned_ma_levels_raises() -> bool:
+    """★ `ma_exit_level` 的**行序/列序**与 `dates`/`symbols` 不一致 ⇒ **报错**。
+
+    ⚠️ 原来直接 `.to_numpy()` ⇒ 传错顺序会**静默错位**：出场均线每天读到
+       **别人的**水平线，不报错、只是全错。（复审 G2）
+    """
+    dates, syms, frames = _make([(100, 100, 100, 100)] * 5)
+    bad = pd.DataFrame(np.nan, index=list(dates)[::-1],     # ← 行序反了
+                       columns=list(syms))
+    try:
+        simulate(dates, syms, frames,
+                 pd.DataFrame([("d1", SYM, 95.0)],
+                              columns=["day", "symbol", "stop_price"]),
+                 strategy_name="t", strategy_params={}, ma_exit_level=bad,
+                 exit_policy=ExitPolicy(), account=AccountPolicy(cost_rate=COST))
+    except ValueError as e:
+        ok = "行序" in str(e)
+        print(f"{'[PASS]' if ok else '[FAIL]'} 均线宽表行序错 ⇒ 报错")
+        return ok
+    print("[FAIL] 均线宽表行序错 ⇒ 竟然没报错（会静默错位）")
+    return False
+
+
+def test_last_bar_signal_is_counted_not_dropped() -> bool:
+    """★ **末日的信号**：`arrive` 越过数据末尾 ⇒ 永远等不到成交。
+
+    原来**静默丢弃、不计入任何计数**（复审 G3）⇒ 现在必须计入
+    `skipped_after_end`（承 P1：不许静默丢东西）。
+    """
+    bars = [(100, 100, 100, 100)] * 4
+    dates = [f"d{i + 1}" for i in range(len(bars))]
+    r = _run(bars, [(dates[-1], SYM, 95.0)],          # ← 信号在**最后一天**
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=2))
+    ok = len(r.trades) == 0 and r.skipped_after_end == 1
+    print(f"{'[PASS]' if ok else '[FAIL]'} 末日信号被**计数**而不是静默丢弃"
+          f"（成交 {len(r.trades)}，末日跳过 {r.skipped_after_end}，应 0 / 1）")
+    return ok
+
+
 if __name__ == "__main__":
     import traceback
 

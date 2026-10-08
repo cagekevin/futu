@@ -325,6 +325,9 @@ class SimulationResult:
     daily_exposure: tuple[float, ...] = field(default=())
     #: 限价单到期没成交的笔数（他的入场②「**超过两天没回撤 ⇒ 放弃**」）。
     skipped_expired: int = 0
+    #: ★ **末日的信号**：`arrive` 越过数据末尾 ⇒ 永远等不到成交。
+    #: 原来**静默丢弃、不计入任何计数**（复审 G3）⇒ 现在显式报出来。
+    skipped_after_end: int = 0
     #: 每天适用的曝险档位名（供报告画时间序列 —— 承规格 §11.1 的 A6'）。
     stages: tuple[str, ...] = ()
 
@@ -438,12 +441,29 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
     closes = np.asarray(bars["close"], dtype=float)
     sym_idx = {s: j for j, s in enumerate(symbols)}
     day_idx = {d: i for i, d in enumerate(dates)}
+    # ★ **对齐校验**（复审 G2）：`ma_exit_level` 必须与 `dates`/`symbols` **同序**。
+    #   原来直接 `.to_numpy()` ⇒ 调用方传错行序/列序会**静默错位**
+    #   （出场均线每天读到**别人的**水平线，不报错、只是全错）。
+    #   当前调用方恰好对齐，所以没暴露 —— 但那是**运气**，不是保证。
+    if tuple(ma_exit_level.index) != tuple(dates):
+        raise ValueError(
+            "ma_exit_level 的**行序**与 dates 不一致 ⇒ 出场均线会静默错位。"
+            f"（前 3 行：{list(ma_exit_level.index[:3])} vs {list(dates[:3])}）"
+            "承 P1：不静默兜底")
+    if tuple(ma_exit_level.columns) != tuple(symbols):
+        raise ValueError(
+            "ma_exit_level 的**列序**与 symbols 不一致 ⇒ 出场均线会静默错位。"
+            f"（前 3 列：{list(ma_exit_level.columns[:3])} vs {list(symbols[:3])}）"
+            "承 P1：不静默兜底")
     ma_levels = ma_exit_level.to_numpy(dtype=float)
 
     # 候选 → 入场单（**按 `(arrive, symbol_idx)` 排序** ⇒ 可复现，不依赖行序）
     has_limit = "limit_price" in candidates.columns
     has_valid = "valid_days" in candidates.columns
     orders: list[_Order] = []
+    #: ★ 末日的信号（`arrive` 越过数据末尾）—— 原来**静默丢弃**（复审 G3）。
+    #: ⚠️ 必须在**订单循环之前**初始化（循环里就要用它计数）。
+    skipped_after_end = 0
     for row in candidates.itertuples(index=False):
         day, symbol = getattr(row, "day"), getattr(row, "symbol")
         stop = getattr(row, "stop_price")
@@ -460,6 +480,12 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
             raise ValueError(f"valid_days 必须 ≥ 1，收到 {valid}（{symbol} @ {day}）")
         # 市价单：默认**次日开盘**；`trade_on_close` 时**当日收盘**
         arrive = i if (limit is None and account.trade_on_close) else i + 1
+        # ★ **末日的信号永远等不到成交**（复审 G3）：`arrive` 已经越过数据末尾，
+        #   主循环不会处理它 —— 原来**静默丢弃、且不计入任何 skipped 计数**。
+        #   ⇒ 显式计数（承 P1：不许静默丢东西）。
+        if arrive >= len(dates):
+            skipped_after_end += 1
+            continue
         orders.append(_Order(symbol_idx=j, arrive=arrive, expire=arrive + valid - 1,
                              stop=float(stop),
                              limit=None if limit is None else float(limit)))
@@ -775,5 +801,6 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
         skipped_exposure=skipped_exposure,
         daily_exposure=tuple(exposures),
         skipped_expired=skipped_expired,
+        skipped_after_end=skipped_after_end,
         stages=tuple(stage_by_day),
     )
