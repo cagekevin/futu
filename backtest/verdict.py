@@ -1,129 +1,148 @@
-"""**判决** —— 用**仓库预注册的阈值**给结果定级。
+"""**判决** —— 用**仓库现成的 8 条硬判定**给结果定级。
 
-## 为什么需要这个文件（第三轮独立复审的第 3 条）
+## 这个文件的第一版是错的（如实记录）
 
-复审指出：
+我第一版**自己写了一套** 5 条判据（`MIN_ANN_RET` / `MIN_SHARPE` / 两档回撤 /
+单边占比），**而仓库里早就有 `walk_forward_validation.judge_verdict`** ——
+它是**8 条**（多了前后半段、分段一致性、2 倍成本、交易数门槛）。
 
-> `backtest_config.py` 里**早就写好了判据**（`MIN_ANN_RET` / `MIN_SHARPE` /
-> `MDD_SUSPICIOUS` / `MDD_INVALID` / `MAX_SIDE_RATIO`），
-> **而 Tugboat 这条路一条都没用。**
->
-> ⇒ **在说"无法下结论"之前，应该先过自己那道门。**
-> **按门算，答案是 `INVALID`，不是"说不清"。**
+⇒ **同一件事两份实现** —— 正是仓库铁律「**PnL / 判据只能有一处**」要禁止的。
+（讽刺的是：我在 `18-改动裁定` 里刚批评过 `trade_metrics` 与 `performance_metrics`
+  同名不同口径，**转头自己又犯了一次**。）
 
-它说得对。我一直在讲"样本太短 ⇒ 说不清"，
-可**仓库早就把判据写死了** —— 拿自己的尺子量自己的结果，
-这一步是**免费的**，我却没做。
+⇒ 现在本文件**只剩两件事**：
 
-## 设计：判据**只有一个来源**
-
-阈值一律从 `backtest_config` 取，**这里不写任何数字**。
-⇒ 改判据只改一处；报告里的结论**不可能与判据漂移**。
-
-## 三种等级（与 `independent_audit` 的口径一致）
-
-| 等级 | 含义 |
+| 做什么 | 说明 |
 |---|---|
-| `INVALID` | 明确不合格 —— **不是"说不清"，是不合格** |
-| `SUSPICIOUS` | 可疑（需要解释）|
-| `PASS` | 过了这道门（**不等于"有优势"**，只是没被这条判据拦下）|
+| **补 `judge_verdict` 要的输入** | 前后半段年化 / 分段一致性 / 2 倍成本 —— 这些要**真的跑**才能拿到 |
+| **渲染** | 把它的 `(verdict, issues)` 变成报告里那一段 |
+
+判据本身**一条都不在这里**。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
-import backtest_config as cfg
+import numpy as np
 
-__all__ = ["Judgement", "judge", "render_verdict"]
+import backtest_config as cfg
+import walk_forward_validation as wf
+
+__all__ = ["Verdict", "compute_segments", "render_verdict", "run_verdict"]
 
 INVALID = "INVALID"
 SUSPICIOUS = "SUSPICIOUS"
-PASS = "PASS"
+VALID = "VALID"
 
-#: 等级排序（取最坏的那条当总判决）。
-_SEVERITY = {PASS: 0, SUSPICIOUS: 1, INVALID: 2}
-
-
-@dataclass(frozen=True)
-class Judgement:
-    """一条判据的结论。"""
-
-    rule: str
-    level: str
-    detail: str
+#: 报告里那句"这不是说不清"的措辞（`INVALID` 时）。
+_NOT_UNSURE = ("⚠️ **这不是「说不清」，是「不合格」** —— "
+               "「样本太短所以说不清」不能用来**盖过**自己那道门。")
 
 
-def judge(report: dict[str, Any], *, side_ratio: float | None = None,
-          ) -> list[Judgement]:
-    """按 `backtest_config` 的**预注册阈值**逐条判。
+class Verdict(dict):
+    """`{"verdict": str, "issues": list[str], "inputs": dict}` 的薄包装。"""
 
-    `report` 是 `trade_metrics.summarize()` 的输出。
-    `side_ratio`：**单边占比**（持仓市值 / 净值 的时间均值）——
-    它不在 `summarize` 里（那是逐日曝险，来自模拟器结果），由调用方传入。
+    @property
+    def level(self) -> str:
+        return str(self["verdict"])
+
+    @property
+    def issues(self) -> list[str]:
+        return list(self["issues"])
+
+
+def compute_segments(result, *, n_folds: int = cfg.WF_FOLDS) -> dict[str, Any]:
+    """算 `judge_verdict` 要的四样：前后半段年化 / 分段一致性。
+
+    ★ 为什么必须**真的跑**：`judge_verdict` 的判据里
+      「前后半段同号」「分段多数为正」**只有拿到净值序列才能算** ——
+      这也是"光看总年化会骗人"的落点（一个前半段 +40%、后半段 −30% 的策略，
+      总年化可能还是正的）。
     """
-    out: list[Judgement] = []
-    cagr = float(report.get("cagr", float("nan")))
-    sharpe = float(report.get("sharpe", float("nan")))
-    mdd = abs(float(report.get("max_drawdown", float("nan"))))   # 取绝对值比阈值
-    n = int(report.get("n_trades", 0))
+    eq = np.asarray(result.equity_values, dtype=float)
+    n = eq.size
+    if n < 4:
+        return {"h1_ann": float("nan"), "h2_ann": float("nan"),
+                "wf_positive": 0, "wf_total": 0}
+    half = n // 2
 
-    # ── 年化 ──
-    if cagr < cfg.MIN_ANN_RET:
-        out.append(Judgement("MIN_ANN_RET", INVALID,
-                             f"年化 {cagr * 100:.2f}% < {cfg.MIN_ANN_RET * 100:.0f}%"))
+    def _ann(seg: np.ndarray) -> float:
+        if seg.size < 2 or seg[0] <= 0:
+            return float("nan")
+        total = seg[-1] / seg[0] - 1.0
+        years = (seg.size - 1) / 252.0
+        if years <= 0:
+            return float("nan")
+        return float((1.0 + total) ** (1.0 / years) - 1.0) if total > -1 else -1.0
 
-    # ── Sharpe ──
-    if sharpe < cfg.MIN_SHARPE:
-        out.append(Judgement("MIN_SHARPE", SUSPICIOUS,
-                             f"Sharpe {sharpe:.3f} < {cfg.MIN_SHARPE}"))
-
-    # ── 最大回撤（两档）──
-    if mdd > cfg.MDD_INVALID:
-        out.append(Judgement("MDD_INVALID", INVALID,
-                             f"最大回撤 {mdd * 100:.2f}% > "
-                             f"{cfg.MDD_INVALID * 100:.0f}%"))
-    elif mdd > cfg.MDD_SUSPICIOUS:
-        out.append(Judgement("MDD_SUSPICIOUS", SUSPICIOUS,
-                             f"最大回撤 {mdd * 100:.2f}% > "
-                             f"{cfg.MDD_SUSPICIOUS * 100:.0f}%"))
-
-    # ── 单边占比（疑似 beta）──
-    if side_ratio is not None and side_ratio > cfg.MAX_SIDE_RATIO:
-        out.append(Judgement("MAX_SIDE_RATIO", SUSPICIOUS,
-                             f"单边占比 {side_ratio * 100:.1f}% > "
-                             f"{cfg.MAX_SIDE_RATIO * 100:.0f}% ⇒ 疑似 beta"))
-
-    # ── 样本量（**这条是我加的**：`backtest_config` 没有，但 qsx 参照线是 120）──
-    if n < 120:
-        out.append(Judgement("MIN_TRADES(自加)", SUSPICIOUS,
-                             f"{n} 笔 < 120（qsx 参照线）⇒ 判决能力有限"))
-
-    if not out:
-        out.append(Judgement("（无）", PASS, "没有触发任何预注册判据"))
-    return out
+    folds = wf.segment_consistency_folds(n, n_folds=n_folds)
+    pos = tot = 0
+    for f in folds:
+        # ⚠️ 键名是 `val`（`(start, end)` 元组），**不是** `start`/`end`
+        #    —— 我第一版写错了，直接 `KeyError` 才发现的。
+        a, b = (int(x) for x in f.get("val", (0, 0)))
+        if b <= a or b > n:
+            continue
+        r = _ann(eq[a:b])
+        if not np.isfinite(r):
+            continue
+        tot += 1
+        pos += int(r > 0)
+    return {"h1_ann": _ann(eq[:half]), "h2_ann": _ann(eq[half:]),
+            "wf_positive": pos, "wf_total": tot}
 
 
-def worst(judgements: list[Judgement]) -> str:
-    """总判决 = **最坏的那一条**。"""
-    if not judgements:
-        return PASS
-    return max(judgements, key=lambda j: _SEVERITY[j.level]).level
+def run_verdict(result, report: dict[str, Any], *,
+                side_ratio: float | None = None,
+                cost2x_profitable: bool | None = None,
+                min_trades: int = 120) -> Verdict:
+    """补齐输入 → 调**仓库自己的** `judge_verdict`。
+
+    `cost2x_profitable`：**2 倍成本下还赚不赚** —— 它要**重跑一次**才能得到
+    （成本是执行假设，不是策略参数；这一条问的是"结果有多依赖成本假设"）。
+    `None` ⇒ 传 `False`（**保守**：不知道就当没通过，不假装通过）。
+    """
+    seg = compute_segments(result)
+    inputs = {
+        "ann_ret": float(report.get("cagr", float("nan"))),
+        "sharpe": float(report.get("sharpe", float("nan"))),
+        "mdd": abs(float(report.get("max_drawdown", float("nan")))),
+        "max_side": float(side_ratio) if side_ratio is not None else 1.0,
+        "h1_ann": seg["h1_ann"], "h2_ann": seg["h2_ann"],
+        "wf_positive": seg["wf_positive"], "wf_total": seg["wf_total"],
+        "cost2x_profitable": bool(cost2x_profitable),
+        "n_trades": int(report.get("n_trades", 0)),
+        "min_trades": int(min_trades),
+    }
+    # ⚠️ `NaN` 传进判据会**静默判错**（比较全为 False）⇒ 先替成保守值
+    for k in ("ann_ret", "sharpe", "mdd", "h1_ann", "h2_ann"):
+        if not np.isfinite(inputs[k]):
+            inputs[k] = 0.0 if k != "mdd" else 1.0
+    if inputs["wf_total"] == 0:
+        inputs["wf_total"] = 1              # 避免除零；`wf_positive=0` ⇒ 视为未通过
+    verdict, issues = wf.judge_verdict(**inputs)
+    return Verdict(verdict=verdict, issues=list(issues), inputs=inputs)
 
 
-def render_verdict(judgements: list[Judgement]) -> str:
-    """渲染成报告里的那一段。"""
-    lines = ["", "  ── ★ 判决（**仓库预注册的判据**，`backtest_config`）──"]
-    icon = {INVALID: "⛔", SUSPICIOUS: "⚠️", PASS: "✅"}
-    for j in judgements:
-        lines.append(f"  {icon[j.level]} {j.rule:22s} {j.level:11s} {j.detail}")
-    total = worst(judgements)
-    lines.append(f"  ⇒ **总判决：{total}**")
-    if total == INVALID:
-        lines.append("     ⚠️ **这不是「说不清」，是「不合格」** ——")
-        lines.append("        「样本太短所以说不清」不能用来**盖过**自己那道门。")
-    elif total == SUSPICIOUS:
+def render_verdict(v: Verdict) -> str:
+    """渲染成报告里那一段。**判据不在这里** —— 只在 `judge_verdict`。"""
+    icon = {INVALID: "⛔", SUSPICIOUS: "⚠️", VALID: "✅"}
+    lines = ["", "  ── ★ 判决（**仓库预注册的 8 条硬判定**，`walk_forward_validation`）──"]
+    i = v["inputs"]
+    lines.append(
+        f"  输入：年化 {i['ann_ret'] * 100:.2f}%｜Sharpe {i['sharpe']:.3f}｜"
+        f"MDD {i['mdd'] * 100:.2f}%｜单边 {i['max_side'] * 100:.0f}%｜"
+        f"前半段 {i['h1_ann'] * 100:.1f}% / 后半段 {i['h2_ann'] * 100:.1f}%｜"
+        f"分段为正 {i['wf_positive']}/{i['wf_total']}｜"
+        f"2×成本仍赚 {'是' if i['cost2x_profitable'] else '**否**'}｜"
+        f"{i['n_trades']} 笔")
+    for msg in v.issues:
+        lines.append(f"  {icon[v.level]} {msg}")
+    lines.append(f"  ⇒ **总判决：{v.level}**")
+    if v.level == INVALID:
+        lines.append(f"     {_NOT_UNSURE}")
+    elif v.level == SUSPICIOUS:
         lines.append("     可疑 —— 需要解释，**不等于有优势**。")
     else:
-        lines.append("     过了这道门 —— **不等于「有优势」**，只是没被这几条判据拦下。")
+        lines.append("     过了这道门 —— **不等于「有优势」**，只是没被这 8 条拦下。")
     return "\n".join(lines)

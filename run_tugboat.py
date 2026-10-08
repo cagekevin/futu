@@ -165,6 +165,12 @@ def _market_state(panel, spy_panel) -> pd.DataFrame:
     }).shift(1)
 
 
+def _replace_account(account):
+    """把成本**翻倍**（测"结果有多依赖成本假设"）。"""
+    from dataclasses import replace as _r
+    return _r(account, cost_rate=account.cost_rate * 2.0)
+
+
 def _load_entries(path: str, panel) -> pd.DataFrame:
     """读**你自己的入场清单**（CSV：`day,symbol`，可选 `stop_price`）。
 
@@ -639,8 +645,17 @@ def main(argv: list[str] | None = None) -> int:
     #   ⇒ 在说"说不清"之前先过门；**按门算可能是 INVALID，不是说不清**。
     side_ratio = (float(np.mean(result.daily_exposure))
                   if result.daily_exposure else None)
-    judgements = verdict.judge(report, side_ratio=side_ratio)
-    print(verdict.render_verdict(judgements))
+    # ★ **2 倍成本还赚不赚** —— 它要**重跑一次**（成本是执行假设，不是策略参数）
+    _ac2 = _replace_account(account)
+    r2 = simulate(panel.dates, panel.symbols, bars, cand,
+                  strategy_name=strategy.name, strategy_params={},
+                  ma_exit_level=ma_exit, exit_policy=strategy.exit_policy,
+                  account=_ac2, exposure=exposure)
+    cost2x_ok = float(trade_metrics.summarize(
+        r2, benchmark=bench)["total_return"]) > 0.0
+    v = verdict.run_verdict(result, report, side_ratio=side_ratio,
+                            cost2x_profitable=cost2x_ok)
+    print(verdict.render_verdict(v))
 
     # ★ **默认就出**这两张表 —— 它们最能把问题暴露出来，不该藏在开关后面
     print()
