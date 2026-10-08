@@ -563,7 +563,24 @@ class TugboatExposure:
                  index_stretch: float = INDEX_STRETCH,
                  stall_window: int = STALL_WINDOW,
                  stall_stop_ratio: float = STALL_STOP_RATIO,
-                 hot_win_ratio: float = HOT_WIN_RATIO) -> None:
+                 hot_win_ratio: float = HOT_WIN_RATIO,
+                 use_slots: bool = True, use_exit: bool = True) -> None:
+        # ★ **两个组成部分可以单独关掉** —— 这是为了把"四阶段"**拆成四臂**测
+        #   （第三轮独立复审第 5 条）。
+        #
+        #   复审把两个作用**拆开**跑过，结论是：
+        #     只调 `max_positions` +2.29%｜只改阶段④出场规则 **−4.69%**｜
+        #     两个一起 +4.59%｜都不做 −0.86%
+        #   ⇒ **两个组成部分单独都小或负，合起来才 +4.59%** ⇒
+        #     ★ **这是交互项主导，不是"四阶段有正贡献"。**
+        #
+        #   而我当时把它列进「**机制级结论（幅度大、方向一致）**」——
+        #   **恰好搞反了**：交互项主导是**不稳定**的标志，不是稳健的标志
+        #   （`A×B` 交互产生的效应，**换个窗口几乎必然翻转**）。
+        #
+        #   ⇒ 所以这两个开关的作用不是"多一个参数"，是**让拆解成为可能**。
+        self.use_slots = bool(use_slots)
+        self.use_exit = bool(use_exit)
         self.base_max_positions = int(base_max_positions)
         self.breadth_washout = float(breadth_washout)
         self.breadth_euphoria = float(breadth_euphoria)
@@ -606,9 +623,13 @@ class TugboatExposure:
             cap = max(1, cap - 1)
             stage += STAGE_DOWNSHIFT
 
+        # ★ 拆解开关：关掉哪一半，就回退到"不做四阶段"那一半
+        if not self.use_slots:
+            cap = default.max_positions
+
         # ③ 出场规则随档位变（只有④"节奏变快"）
         ep = default.exit_policy
-        if stage.startswith(STAGE_EUPHORIA):
+        if self.use_exit and stage.startswith(STAGE_EUPHORIA):
             ep = replace(ep, partial_after_days=_FAST_EXIT_PARTIAL_DAYS)
 
         return ExposureSettings(max_positions=cap,

@@ -408,25 +408,38 @@ def _render_curve(result, bench_rets, spy_close) -> str:
     return "\n".join(out)
 
 
-def sensitivity(base_params: dict, hold: int) -> list[tuple[str, dict, dict, int]]:
+def sensitivity(base_params: dict,
+                hold: int) -> list[tuple[str, dict, dict, int, float | None]]:
     """要扫的参数（**一次只动一个**）—— 回答"哪个参数最要紧"。
 
     返回 `(标签, 策略参数覆盖, 出场规则覆盖, 持仓上限)`。
     """
     out: list[tuple[str, dict, dict, int]] = []
-    for v in (1.5, 2.0, 3.0, None):
-        out.append((f"止损宽度上限={v or '不限'}×ADR", {"max_stop_adr": v}, {}, 5))
+    # ⚠️ 参数名在 RuleSet 重写时从 `max_stop_adr` 改成了 `stop_width_adr`
+    #    —— 这个块**当时没重跑**，所以一直抛 `未知参数`（这次才抓到）。
+    #    `None` 也不能用了（它是 float）⇒ 用一个大数表示"不限"。
+    for v in (1.0, 1.5, 2.0, 10.0):
+        lab = "不限" if v > 9 else f"{v}×ADR"
+        out.append((f"止损宽度上限={lab}", {"stop_width_adr": v}, {}, 5, None))
     for v in (2.0, 3.0, 4.0, 6.0):
-        out.append((f"止盈={v}R 减半", {}, {"target_r": v}, 5))
+        out.append((f"止盈={v}R 减半", {}, {"target_r": v}, 5, None))
     for v in (0.0, 0.33, 0.5, 1.0):
         out.append((f"部分止盈比例={v:.2f}",
                     {}, {"partial_fraction": v,
-                         "breakeven_after_partial": v > 0}, 5))
+                         "breakeven_after_partial": v > 0}, 5, None))
     for v in (3, 5, 8):
-        out.append((f"最多同时持仓={v} 笔", {}, {}, v))
+        out.append((f"最多同时持仓={v} 笔", {}, {}, v, None))
     for v in (3, 5, 10, 10 ** 9):
         out.append((f"5 天无进展离场：{'关' if v > 100 else f'{v} 天'}",
-                    {}, {"no_progress_days": v}, 5))
+                    {}, {"no_progress_days": v}, 5, None))
+    # ★ **`max_total_exposure`（我加的，不是他的规则）** —— 第三轮复审第 6 条：
+    #   它的敏感度**比表里多数项都大**，却**不在表里**。
+    #   复审实测：1.0（默认）+4.59%｜1.5 **−10.24%**｜2.0 +1.63%｜5.0 −3.25%
+    #   ⇒ 而且它和四阶段的 `max_positions` **强耦合**（1.5 那个点最差，
+    #     因为一放松曝险上限，"仓位满"重新变成约束）。
+    #   ⚠️ 它**不是他的规则** —— 是我加的"不许杠杆"约束（原文没给）。
+    for v in (0.5, 1.0, 1.5, 2.0, 5.0):
+        out.append((f"总曝险上限={v:.1f}（⚠️我加的）", {}, {}, 5, v))
     return out
 
 
@@ -451,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="★ 净值曲线 + 逐年表现 + R 倍数分布")
     ap.add_argument("--free-params", action="store_true",
                     help="★★ **验我自创的近似**（入场时点 / 止损位 / 6 个阈值）会不会翻掉结论")
+    ap.add_argument("--decompose", action="store_true",
+                    help="★ 四阶段**拆四臂**（只持仓数 / 只出场规则 / 两个 / 都不）")
     ap.add_argument("--random", action="store_true",
                     help="★ 随机对照（同日/同数量/同票池/同一套规则）+ **分辨力**"
                          " + **持有期分布对照**")
@@ -626,6 +641,43 @@ def main(argv: list[str] | None = None) -> int:
     if args.trades:
         _dump_trades(result, args.trades)
 
+    if args.decompose:
+        # ★★ **四阶段拆解**（第三轮独立复审第 5 条）。
+        #   复审拆开跑过：只调持仓数 +2.29%｜只改阶段④出场规则 −4.69%｜
+        #   两个一起 +4.59%｜都不做 −0.86% ⇒ **交互项主导**。
+        #   而我当时把它列进「机制级结论（幅度大、方向一致）」—— **恰好搞反了**。
+        print()
+        print("═" * 74)
+        print("★ 四阶段**拆解** —— 两个组成部分单独跑，看是不是交互项主导")
+        print("   （`TugboatExposure` 调两样东西：**持仓数上限** 与 **阶段④的出场规则**）")
+        print("─" * 74)
+        print(f"  {'臂':36s}{'笔数':>6s}{'总收益':>10s}{'Sharpe':>9s}"
+              f"{'MDD':>10s}{'每笔R':>9s}")
+        for label, ex in (("都不做（= 四阶段关）", StaticExposure()),
+                          ("**只调持仓数**（不改出场规则）",
+                           TugboatExposure(use_exit=False)),
+                          ("**只改阶段④出场规则**（不调持仓数）",
+                           TugboatExposure(use_slots=False)),
+                          ("**两个一起**（= 现状）", exposure)):
+            # ⚠️ `StaticExposure`（"都不做"那一臂）**没有** `attach_market_state`
+            #    —— 它不读市场状态。所以按**能力**判断，不按 `--no-exposure`。
+            if hasattr(ex, "attach_market_state"):
+                ex.attach_market_state(market_state)
+            rr = simulate(panel.dates, panel.symbols, bars, cand,
+                          strategy_name=strategy.name, strategy_params={},
+                          ma_exit_level=ma_exit, exit_policy=strategy.exit_policy,
+                          account=account, exposure=ex)
+            mm = trade_metrics.summarize(rr, benchmark=bench)
+            print(f"  {label:36s}{mm['n_trades']:>6d}"
+                  f"{mm['total_return'] * 100:>9.2f}%{mm['sharpe']:>9.2f}"
+                  f"{mm['max_drawdown'] * 100:>9.2f}%{mm['expectancy_r']:>9.3f}")
+        print("─" * 74)
+        print("  ★ 怎么读：**若两个组成部分单独都小或负、合起来才大** ⇒")
+        print("     那是**交互项主导**，**不是**「四阶段有正贡献」。")
+        print("     ⚠️ 交互项主导是**不稳定**的标志 —— `A×B` 产生的效应")
+        print("        换个窗口几乎必然翻转，**不能**当\"机制级结论\"。")
+        return 0
+
     if args.random:
         # ★ 随机对照 —— 唯一能隔离"选股贡献"的参照。
         #   ⚠️ n 默认 **200**（不是 20）：n=20 时分位标准误 ≈11pp，
@@ -796,7 +848,8 @@ def main(argv: list[str] | None = None) -> int:
                      f"{report['max_drawdown'] * 100:>9.2f}%"
                      f"{report['expectancy_r']:>9.3f}")
         print("  " + base_line)
-        for label, sparams, eparams, cap in sensitivity(strategy.params, hold_days):
+        for label, sparams, eparams, cap, exp_cap in sensitivity(
+                strategy.params, hold_days):
             st = TugboatBreakout(**{**base_over, **sparams})
             try:
                 c = st.candidates(panel, factors)
@@ -811,7 +864,9 @@ def main(argv: list[str] | None = None) -> int:
                 strategy_name=st.name, strategy_params=st.params,
                 ma_exit_level=st.ma_exit_level(panel, factors),
                 exit_policy=_replace(st.exit_policy, **eparams),
-                account=_replace(account, max_positions=cap),
+                account=_replace(account, max_positions=cap,
+                                 **({} if exp_cap is None
+                                    else {"max_total_exposure": exp_cap})),
                 exposure=exposure)
             m = trade_metrics.summarize(r, benchmark=bench)
             print(f"  {label:30s}{m['n_trades']:>6d}"
