@@ -279,9 +279,18 @@ class TugboatBreakout:
                       <= (s10 - s20).abs().shift(int(p["tight_days"])))
         t2 = flat & converging if p["require_converging"] else flat
 
-        # ── T3 / T8：200 日线之上，且 200MA 不向下 ──
+        # ── T3 / T8：200 日线之上，且 **200MA 本身**不向下 ──
         t3 = ma["ma_dist_sma200"] > 0
-        t8 = ma["ma_dist_sma200"] >= ma["ma_dist_sma200"].shift(20)
+
+        # ★ T8 曾经写错（2026-10-08 由条件对账审计抓出）：
+        #   当时写的是 `ma_dist_sma200 >= ma_dist_sma200.shift(20)` ——
+        #   可那是「**离 200MA 的距离**（ATR 归一）不下降」，**不是 200MA 不下降**：
+        #   当 200MA 在**跌**而股价在**涨**时，这个距离**照样会上升** ⇒ 条件被放行 ✗
+        #   （审计实测：56% 的格子上两者结论不同。）
+        #   ⇒ 正确做法：从因子反推出 **200MA 本身**，再跟 20 天前比。
+        atr = self._get(factors, "atr14")
+        sma200 = close - ma["ma_dist_sma200"] * atr
+        t8 = sma200 >= sma200.shift(20)
 
         # ── T4：贴近**任一**条均线（≤1 个 ATR）──
         near = ma[_MA_DIST[0]].abs()
