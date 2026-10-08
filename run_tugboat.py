@@ -50,6 +50,7 @@ import pandas as pd  # noqa: E402
 import backtest_config  # noqa: E402
 import factor.implementations  # noqa: E402
 import random_control  # noqa: E402
+import statistics as _stats  # noqa: E402
 import trade_metrics  # noqa: E402
 import verdict  # noqa: E402
 from factor.factor_registry import run_factor  # noqa: E402
@@ -169,6 +170,46 @@ def _replace_account(account):
     """把成本**翻倍**（测"结果有多依赖成本假设"）。"""
     from dataclasses import replace as _r
     return _r(account, cost_rate=account.cost_rate * 2.0)
+
+
+def _cluster_p_value(trades) -> tuple[float, int, int]:
+    """**簇级 bootstrap 的 p 值**（检验「每笔平均 R ≠ 0」）。
+
+    ## 为什么不能用普通的 t 检验
+
+    同一**交易日**的多笔交易共享当天的行情 ⇒ **不独立**。
+    按笔做 t 检验会**系统性高估显著性**（`statistics` 的文档里也写了这条：
+    "futu 实测：4,076 笔只落在 **992 天**，按笔 vs 按日，结论**符号翻转**"）。
+
+    ⇒ 重采样单位取**交易日**（簇），不是笔。
+
+    返回 `(p 值, 观测数, 簇数)`；样本不足 ⇒ `(nan, n, k)`。
+    """
+    by_day: dict[str, list[float]] = {}
+    for t in trades:
+        by_day.setdefault(t.entry_day, []).append(float(t.r_multiple))
+    # ⚠️ **空簇要先挡**：`effective_sample_size` 对空映射会**抛错**
+    #    （承 V12：缺就是缺，不拿默认值兜底 —— 那是它的设计，不是 bug）。
+    #    某个变体一笔都没成交时就会走到这里。
+    if not by_day:
+        return float("nan"), 0, 0
+    obs, k = _stats.effective_sample_size(by_day)
+    if k < 3:
+        return float("nan"), obs, k
+    rng = np.random.default_rng(20261009)
+    keys = list(by_day)
+    means = np.empty(2000)
+    for i in range(means.size):
+        pick = rng.integers(0, k, size=k)
+        vals = [v for j in pick for v in by_day[keys[j]]]
+        means[i] = float(np.mean(vals)) if vals else np.nan
+    means = means[np.isfinite(means)]
+    if means.size == 0:
+        return float("nan"), obs, k
+    # 双侧：均值落在 0 **另一侧**的比例 ×2
+    lo = float((means <= 0).mean())
+    p = 2.0 * min(lo, 1.0 - lo)
+    return float(min(max(p, 1.0 / means.size), 1.0)), obs, k
 
 
 def _load_entries(path: str, panel) -> pd.DataFrame:
@@ -470,6 +511,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="★ 净值曲线 + 逐年表现 + R 倍数分布")
     ap.add_argument("--free-params", action="store_true",
                     help="★★ **验我自创的近似**（入场时点 / 止损位 / 6 个阈值）会不会翻掉结论")
+    ap.add_argument("--bh", action="store_true",
+                    help="★ **多重检验校正**（BH）—— 同一数据上跑 N 个变体，必须报分母")
+    ap.add_argument("--bh-alpha", type=float, default=0.05,
+                    help="BH 的 alpha（默认 0.05）")
     ap.add_argument("--decompose", action="store_true",
                     help="★ 四阶段**拆四臂**（只持仓数 / 只出场规则 / 两个 / 都不）")
     ap.add_argument("--random", action="store_true",
@@ -670,6 +715,70 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.trades:
         _dump_trades(result, args.trades)
+
+    if args.bh:
+        # ★★ **多重检验校正**（复审第 2 条后半）。
+        #   复审的原话：「策略注册表 + 阈值网格 ⇒ 必然试 N 次；
+        #   1 − 0.95¹⁸ ≈ **60%** ⇒ **只报单个 p<0.05 而不报分母，等于没做统计。**」
+        #   而 `--matrix` / `--sensitivity` / `--free-params` 正是"同一数据上跑 N 个变体"。
+        from dataclasses import replace as _rep2
+
+        combos = []
+        for mode in ENTER_MODES:
+            for exp_on in (True, False):
+                combos.append((f"{mode}｜四阶段={'开' if exp_on else '关'}",
+                               mode, exp_on))
+        ps, tags, info = [], [], []
+        for tag, mode, exp_on in combos:
+            st = TugboatBreakout(entry_mode=mode)
+            c = st.candidates(panel, factors)
+            if c.empty:
+                continue
+            ex = exposure if exp_on else StaticExposure()
+            if hasattr(ex, "attach_market_state"):
+                ex.attach_market_state(market_state)
+            rr = simulate(panel.dates, panel.symbols, bars, c,
+                          strategy_name=st.name, strategy_params={},
+                          ma_exit_level=st.ma_exit_level(panel, factors),
+                          exit_policy=st.exit_policy, account=account, exposure=ex)
+            p, obs, k = _cluster_p_value(rr.trades)
+            ps.append(p)
+            tags.append(tag)
+            info.append((len(c), rr, obs, k))
+        finite = [i for i, v in enumerate(ps) if np.isfinite(v)]
+        print()
+        print("═" * 78)
+        print("★ 多重检验校正（**同一份数据上跑了 N 个变体**）")
+        print(f"  p 值口径：**簇级 bootstrap**（簇 = 交易日）—— 同日多笔**不独立**，"
+              f"按笔算会高估显著性")
+        print("─" * 78)
+        print(f"  {'变体':30s}{'候选':>6s}{'笔数':>6s}{'簇数':>6s}"
+              f"{'每笔R':>9s}{'p(原始)':>10s}")
+        for i, tag in enumerate(tags):
+            n_c, rr, obs, k = info[i]
+            m = trade_metrics.summarize(rr, benchmark=bench)
+            print(f"  {tag:30s}{n_c:>6d}{obs:>6d}{k:>6d}"
+                  f"{m['expectancy_r']:>9.3f}{ps[i]:>10.4f}")
+        if finite:
+            res = _stats.benjamini_hochberg([ps[i] for i in finite],
+                                            alpha=args.bh_alpha)
+            print("─" * 78)
+            # ⚠️ `res.threshold` 在"一个都不显著"时是 `NaN`（不是 0）——
+            #    直接 `:.4f` 会印出 `nan`，读起来像出错。
+            thr = res.threshold
+            thr_txt = f"{thr:.4f}" if np.isfinite(thr) else "无（没有变体过线）"
+            print(f"  **BH 校正**（族大小 = **{res.family_size}**，"
+                  f"alpha = {res.alpha}，阈值 = {thr_txt}）")
+            for j, i in enumerate(finite):
+                mark = "✅ 显著" if res.significant[j] else "— 不显著"
+                print(f"    {tags[i]:30s} p={ps[i]:.4f} → "
+                      f"BH p={res.adjusted[j]:.4f}  {mark}")
+            print(f"  ⇒ **通过 BH 的变体数：{sum(res.significant)} / {res.family_size}**")
+        else:
+            print("  （所有变体的 p 值都算不出来 —— 样本/簇数不足）")
+        print("─" * 78)
+        print("  ⚠️ 不报分母的 p 值是**没有意义**的 —— 这就是为什么这张表要一起给。")
+        return 0
 
     if args.decompose:
         # ★★ **四阶段拆解**（第三轮独立复审第 5 条）。
