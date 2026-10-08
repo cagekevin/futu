@@ -110,6 +110,10 @@ class ExitPolicy:
     no_progress_days: int = 5
     no_progress_min_r: float = 1.0
     max_hold_days: int = 60
+    #: **时间型部分止盈**：持有满 N 天仍未触发 3R ⇒ 也先减半（按当日收盘）。
+    #: 出处：他 §2.2 阶段④「**压低曝险 + 节奏变快**（很窄的止损、**2–3 天部分获利**）」。
+    #: `None` = 关闭（默认；只有阶段④会打开）。
+    partial_after_days: int | None = None
 
 
 @dataclass(frozen=True)
@@ -520,6 +524,21 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                 p.took_partial = True
                 if ep.breakeven_after_partial:
                     p.stop = max(p.stop, p.entry_price)      # 止损上移到入场点
+
+            # ②b **时间型**部分止盈（他阶段④的「2–3 天部分获利」）—— 按当日**收盘**成交
+            if (not p.took_partial and ep.partial_after_days is not None
+                    and hold >= ep.partial_after_days and np.isfinite(cl)
+                    and p.shares_left > 1e-12):
+                sold = p.shares_left * ep.partial_fraction
+                p.realized += (cl - p.entry_price) * sold
+                notional = cl * sold
+                c = cost_of(notional)
+                p.cost_paid += c
+                cash += notional - c
+                p.shares_left -= sold
+                p.took_partial = True
+                if ep.breakeven_after_partial:
+                    p.stop = max(p.stop, p.entry_price)
 
             # ③ 均线破坏（他"最后一段"的规则）
             if (ep.use_ma_exit and p.shares_left > 1e-12

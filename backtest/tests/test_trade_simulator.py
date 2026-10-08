@@ -410,6 +410,31 @@ def test_exposure_policy_can_change_exit_policy() -> bool:
     return ok
 
 
+def test_time_based_partial_takes_half_at_close() -> bool:
+    """★ 时间型部分止盈（他阶段④的「**2–3 天部分获利**」）。
+
+    入场 100 / 止损 95（风险 5）：d4 收盘 110 = **+2R** 且持有已 2 天
+      ⇒ 按当日**收盘**减半，止损上移到 100
+      ⇒ d5 打到 100（= 0R）⇒ 总 R = 0.5×2 + 0.5×0 = **+1.0**
+
+    对照组（关掉时间止盈）：一路持到 d5 收盘 100 ⇒ R ≈ **0**。两者必须不同。
+    """
+    bars = [(100, 100, 100, 100),      # d1 信号
+            (100, 100, 100, 100),      # d2 入场 @100
+            (100, 104, 100, 104),      # d3 收盘 104
+            (100, 110, 100, 110),      # d4 收盘 110 = +2R ⇒ 时间止盈
+            (101, 101, 100, 100)]      # d5 回到 100 ⇒ 打中移到 100 的止损
+    base = ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=4)
+    fast = ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=4,
+                      partial_after_days=2)
+    slow_r = _run(bars, [("d1", SYM, 95.0)], exit_policy=base).trades[0].r_multiple
+    got = _run(bars, [("d1", SYM, 95.0)], exit_policy=fast).trades[0].r_multiple
+    ok = (abs(got - 1.0) < 0.02) and got > slow_r + 0.5
+    print(f"{'[PASS]' if ok else '[FAIL]'} 时间型部分止盈：R {slow_r:.3f} → {got:.3f}"
+          f"（应 ≈ 1.0）")
+    return ok
+
+
 def test_static_exposure_is_the_default() -> bool:
     r = _run([(100, 100, 100, 100)] * 4, [("d1", SYM, 95.0)],
              exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=1))

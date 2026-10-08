@@ -102,12 +102,15 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 
-from trade_simulator import ExitPolicy
+from trade_simulator import (
+    EXIT_STOP, AccountState, ExitPolicy, ExposureSettings,
+)
 
 #: 形态（他 §6.1 的三种，按「离 52 周高点多近」分）。
 FORM_HIGH = "high_tight_flag"
@@ -423,5 +426,148 @@ class TugboatBreakout:
         return panel.field("close") - np.minimum(d10, d20) * atr
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 曝险四阶段（他的 §2.2）—— 他说这一块「占 7–8 成重要性」
+# ══════════════════════════════════════════════════════════════════════════
+
+#: 阶段的阈值与动作（**冻结** —— 承规格 §11.1 的 A6'：状态依赖策略会产生反馈环，
+#: 规则必须写死在契约里，且报告要画出档位时间序列让人看得见）。
+#:
+#: ⚠️ **阈值全是我定的**（原文只给方向："情绪低落"、"极度乐观"、"到上限"），
+#: 且**状态只能用代理**（见模块 docstring 的"做不到"清单）。
+BREADTH_WASHOUT = 0.20     # 「疑似见底」：§7.3 条件④ 原话「50 日线以上比例 **< 20%**」
+BREADTH_EUPHORIA = 0.80    # 「过度延伸」：绝大多数票都在 50 日线上
+INDEX_STRETCH = 0.25       # 「过度延伸」：指数高于 200 日线 **25%** 以上
+STALL_WINDOW = 10          # 看最近多少笔成交
+STALL_STOP_RATIO = 0.6     # 止损占比 ≥ 此值 ⇒ **降档**（他："止损密集被打中 ⇒ 果断降曝险"）
+HOT_WIN_RATIO = 0.5        # 近期胜率 ≥ 此值 ⇒ 视为"交易开始顺手"（阶段②→③）
+
+STAGE_WASHOUT = "①疑似见底"
+STAGE_RECOVER = "②动能恢复"
+STAGE_FULL = "③到上限"
+STAGE_EUPHORIA = "④过度延伸"
+STAGE_DOWNSHIFT = "+降档"
+
+#: 一个"快节奏"的出场规则 —— 他阶段④：「压低曝险 + 节奏变快（很窄的止损、**2–3 天部分获利**）」。
+_FAST_EXIT_PARTIAL_DAYS = 2
+
+
+class TugboatExposure:
+    """他的 §2.2「曝险四阶段」。
+
+    ## ★ 关键设计（规格 §11.1 的定论，**不是实现细节**）
+
+    | 项 | 定论 |
+    |---|---|
+    | 调什么 | **`max_positions`（暴露多少笔），不调 R** —— 他自己说「R 的绝对值不随本金变动」 |
+    | 状态从哪来 | **由调用方按日传入**（`market_state`），因为模拟器**不许 import 因子层** |
+    | 降档依据 | **自己的近期成交结果**（止损密度）—— 他原话就是"止损密集被打中" |
+    | 反馈环 | 规则**写死在这里**；每天的档位**记进结果**，报告会画时间序列 |
+
+    ⚠️ **做不到的**：情绪维度（NAAIM/AAII/COT）无数据 ⇒ ①④ 只能靠**宽度 + 指数偏离**代理。
+    """
+
+    def __init__(self, *, base_max_positions: int = 5,
+                 breadth_washout: float = BREADTH_WASHOUT,
+                 breadth_euphoria: float = BREADTH_EUPHORIA,
+                 index_stretch: float = INDEX_STRETCH,
+                 stall_window: int = STALL_WINDOW,
+                 stall_stop_ratio: float = STALL_STOP_RATIO,
+                 hot_win_ratio: float = HOT_WIN_RATIO) -> None:
+        self.base_max_positions = int(base_max_positions)
+        self.breadth_washout = float(breadth_washout)
+        self.breadth_euphoria = float(breadth_euphoria)
+        self.index_stretch = float(index_stretch)
+        self.stall_window = int(stall_window)
+        self.stall_stop_ratio = float(stall_stop_ratio)
+        self.hot_win_ratio = float(hot_win_ratio)
+        #: 每日市场状态（索引 = 日期，列含 `breadth` / `index_dist_200ma`）。
+        #: **由调用方注入**（`attach_market_state`）—— 保证本文件不依赖因子层。
+        self.market_state: pd.DataFrame | None = None
+
+    def attach_market_state(self, state: pd.DataFrame) -> None:
+        """注入按日的市场状态（列：`breadth`、`index_dist_200ma`）。"""
+        missing = [c for c in ("breadth", "index_dist_200ma")
+                   if c not in state.columns]
+        if missing:
+            raise ValueError(
+                f"market_state 缺列 {missing}（承 P1：不静默兜底）")
+        self.market_state = state
+
+    # ── 主逻辑 ──────────────────────────────────────────────────────────
+
+    def settings(self, state: AccountState, default: ExposureSettings,
+                 ) -> ExposureSettings:
+        day = self._day_of(state)
+        breadth, stretch = self._state_of(day)
+
+        # ① 档位（顺序即优先级 —— 写死的，不是"看情况"）
+        if breadth < self.breadth_washout:
+            stage, cap = STAGE_WASHOUT, 1
+        elif breadth > self.breadth_euphoria or stretch > self.index_stretch:
+            stage, cap = STAGE_EUPHORIA, 2
+        elif self._is_hot(state):
+            stage, cap = STAGE_FULL, self.base_max_positions
+        else:
+            stage, cap = STAGE_RECOVER, max(2, self.base_max_positions - 2)
+
+        # ② **降档**：近期"止损密集被打中" ⇒ 果断降曝险（他原话）
+        if self._is_stalled(state):
+            cap = max(1, cap - 1)
+            stage += STAGE_DOWNSHIFT
+
+        # ③ 出场规则随档位变（只有④"节奏变快"）
+        ep = default.exit_policy
+        if stage.startswith(STAGE_EUPHORIA):
+            ep = replace(ep, partial_after_days=_FAST_EXIT_PARTIAL_DAYS)
+
+        return ExposureSettings(max_positions=cap,
+                                risk_fraction=default.risk_fraction,
+                                exit_policy=ep, stage=stage)
+
+    # ── 判定用的三个小函数（都可单独测）────────────────────────────────
+
+    def _day_of(self, state: AccountState) -> str | None:
+        if self.market_state is None:
+            return None
+        if state.day_index >= len(self.market_state.index):
+            return None
+        return str(self.market_state.index[state.day_index])
+
+    def _state_of(self, day: str | None) -> tuple[float, float]:
+        if day is None or self.market_state is None or day not in self.market_state.index:
+            # 没有状态 ⇒ 取**中性**（不假装是见底也不假装是亢奋）
+            return 0.5, 0.0
+        row = self.market_state.loc[day]
+        breadth = float(row["breadth"])
+        stretch = float(row["index_dist_200ma"])
+        if not np.isfinite(breadth):
+            breadth = 0.5
+        if not np.isfinite(stretch):
+            stretch = 0.0
+        return breadth, stretch
+
+    def _is_hot(self, state: AccountState) -> bool:
+        """近期交易是否"顺手"（他阶段②→③ 的依据：「你的交易开始顺手」）。"""
+        recent = state.recent_r[-self.stall_window:]
+        if not recent:
+            return False
+        return float(np.mean([1.0 if r > 0 else 0.0 for r in recent])) >= self.hot_win_ratio
+
+    def _is_stalled(self, state: AccountState) -> bool:
+        """他 §2.2 的降曝险触发：**突破失败 / 止损密集被打中**。
+
+        ⚠️ 只看**已平仓**的成交（无未来信息）。样本不足时**不降档**（不猜）。
+        """
+        reasons = state.recent_reasons[-self.stall_window:]
+        if len(reasons) < self.stall_window:
+            return False
+        n_stop = sum(1 for r in reasons if r == EXIT_STOP)
+        return (n_stop / len(reasons)) >= self.stall_stop_ratio
+
+
 #: 注册（照 `strategies/__init__.py` 的写法；见该文件的说明）。
-__all__ = ["DEFAULTS", "ENTER_MODES", "REQUIRED_FACTORS", "TugboatBreakout"]
+__all__ = [
+    "DEFAULTS", "ENTER_MODES", "REQUIRED_FACTORS",
+    "TugboatBreakout", "TugboatExposure",
+]
