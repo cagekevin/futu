@@ -42,6 +42,10 @@ class StepResult:
     detail: str
 
 
+# 批量取数的默认并发（见 `run_per_symbol`：不突破限流，只重叠 RTT）。
+DEFAULT_WORKERS = 4
+
+
 # ── M5.1 定日期（美东，不是本机日期）────────────────────────────────────
 
 def trading_day(now_et: datetime | None = None) -> str:
@@ -51,6 +55,34 @@ def trading_day(now_et: datetime | None = None) -> str:
     """
     now = now_et or datetime.now(ET)
     return now.astimezone(ET).strftime("%Y-%m-%d")
+
+
+# 美股常规收盘（美东）= 16:00。判断"今天收没收盘"只看小时，够用。
+MARKET_CLOSE_HOUR = 16
+
+
+def last_closed_trading_day(now_et: datetime | None = None) -> str:
+    """**最后一个已收盘的交易日**（美东）—— 所有"更新"动作的**统一目标日**。
+
+    为什么不直接用"今天"（承 P5 / L4）：
+      - **盘前**跑：今天还没有 bar，"今天"这个名字下什么也没有；
+      - **盘中**跑：今天那根是**半成品**，入库即污染（下次跑才会覆盖）；
+      - **盘后**跑：今天才真的完整。
+    ⇒ **未收盘（< 16:00 ET）一律退到上一个交易日**；盘后才用今天。
+
+    **只退周末、不查节假日** —— 假日不必处理：对 REST 而言日期只是"翻页起点"，
+    它会自然返回该日之前真实存在的 bar；真正的日期归属由 **bar 自身的美东日**决定
+    （见 `run_kline` 的 `bar_et_day`）。
+
+    这是"什么都不用想"的关键：**任何时间跑，都不会把半成品当完整一天**。
+    """
+    now = (now_et or datetime.now(ET)).astimezone(ET)
+    d = now.date()
+    if now.hour < MARKET_CLOSE_HOUR:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:          # 5 = 周六，6 = 周日
+        d -= timedelta(days=1)
+    return d.isoformat()
 
 
 # ── M5.2 编排 ────────────────────────────────────────────────────────────
@@ -218,6 +250,31 @@ def run_adjust_factors(symbols: list[str], *, root=None,
 
 # ── K线（底层，按 bar 的美东日入库；缓存 + 增量，承"四问·缓存"）────────
 
+def _last_bar_is_complete(symbol: str, day: str, *, root=None) -> bool:
+    """库里 `day` 那根 K线，**是不是在该日收盘之后才拉的**（⇒ 可判定为完整）。
+
+    为什么值得判（这是"日常跑能秒完"的关键）：
+      `refresh_last_day` 的初衷是"当天那根可能是半成品"，于是**每次都重取最后一天**。
+      但盘后/次日拉过的那根**本来就是完整的** —— 再拉一次纯属浪费：
+      328 只 × 0.7s 限流 ≈ 4 分钟，全花在**重复请求同一份数据**上。
+
+    判据（用落盘的 `fetched_at`，它必然存在 —— 承 P3 数据自证）：
+      `fetched_at >= day 当天 16:00（美东）` → 该日已收盘，拿到的是收盘态 ⇒ 完整。
+      - 盘中拉的（今天 12:00）→ 不完整 ⇒ 仍会重取 ✅
+      - 盘后 / 次日拉的 → 完整 ⇒ 跳过 ✅
+    """
+    try:
+        rec = axis.get(day, symbol, "kline", root=root)
+    except Exception:
+        return False                     # 读不到 → 当作不完整（保守，宁可多拉一次）
+    ts = rec.get("fetched_at")
+    if not ts:
+        return False
+    got_at = datetime.fromtimestamp(int(ts), ET)
+    close_at = datetime.fromisoformat(f"{day}T{MARKET_CLOSE_HOUR:02d}:00:00")
+    return got_at.replace(tzinfo=None) >= close_at
+
+
 def run_kline(
     symbols: list[str],
     *,
@@ -228,6 +285,7 @@ def run_kline(
     full_months: int | None = None,
     refresh_last_day: bool = True,
     force_full: bool = False,
+    as_of: str | None = None,
 ) -> dict:
     """取若干标的的 K线，按**每根 bar 的美东交易日**入库（数据项 `kline`）。
 
@@ -245,13 +303,19 @@ def run_kline(
     # **默认值只有一处**（`universe` 设置项）；调用方给了就用调用方的（承"唯一设置项"）。
     ktype = ktype or universe.KLINE_KTYPE
     full_years = universe.KLINE_FULL_YEARS if full_years is None else full_years
-    as_of = trading_day(datetime.now(ET))
+    as_of = as_of or last_closed_trading_day()
     steps: list[StepResult] = []
     written = 0
+    skipped = 0
     for sym in symbols:
         # `force_full` = 忽略库里已有数据、重拉全窗口（**加长历史**的唯一办法 ——
         # 增量逻辑只会"从最后一天往前补"，不会回溯延长）。
         last = None if force_full else axis.latest_day(sym, "kline", root=root)
+        # 已到目标日、且那根是**收盘后**拉的 ⇒ 无需请求（"没新数据时秒完"的来源）。
+        if (last is not None and not force_full and last >= as_of
+                and _last_bar_is_complete(sym, last, root=root)):
+            skipped += 1
+            continue
         if last is None:
             since = None
             years, months = full_years, full_months
@@ -284,8 +348,10 @@ def run_kline(
         steps.append(StepResult(
             "kline", f"{sym}: since={since or '全量'} → {len(by_day)} 天"))
         log.info("K线 %s: %d 天入库", sym, len(by_day))   # 长跑要有进度（-v 可见）
-    steps.append(StepResult("kline-store", f"{written} 天入库"))
-    return {"symbols": symbols, "ktype": ktype, "days": written, "steps": steps}
+    steps.append(StepResult(
+        "kline-store", f"{written} 天入库；已最新跳过 {skipped} 只"))
+    return {"symbols": symbols, "ktype": ktype, "days": written,
+            "skipped": skipped, "steps": steps}
 
 
 def _next_day(day: str) -> str:
@@ -331,7 +397,7 @@ def _chain_payload(res, day: str) -> dict:
 
 def run_plates(plate_codes: list[str], *, market: str = "US",
                plate_types: tuple[str, ...] = ("CONCEPT", "INDUSTRY"),
-               root=None) -> dict:
+               day: str | None = None, root=None) -> dict:
     """拉**板块名册** + 指定板块的**成分股**，入库。
 
     落两条：
@@ -343,7 +409,7 @@ def run_plates(plate_codes: list[str], *, market: str = "US",
        名册里没有的代码 → **跳过并上报**（承 F4：不静默）。
     """
     root = root if root is not None else DATA_DIR
-    day = trading_day(datetime.now(ET))
+    day = day or last_closed_trading_day()
     steps: list[StepResult] = []
 
     # ① 名册（各类型合并成一份全局项）
@@ -380,14 +446,17 @@ def run_plates(plate_codes: list[str], *, market: str = "US",
 
 # ── 全市场快照（行业 / RPS 的原料，**不吃历史额度**）────────────────────
 
-def run_snapshot(*, market: str = "US", root=None) -> dict:
-    """全市场快照入库 —— 键 `(当天, UNIVERSE, snapshot)`。
+def run_snapshot(*, market: str = "US", day: str | None = None, root=None) -> dict:
+    """全市场快照入库 —— 键 `(day, UNIVERSE, snapshot)`。
 
     走 V2 服务器端筛（`get_stock_screen`，**不吃历史额度**）：
     每只的 价 / 市值 / **行业** / N 日涨幅 —— 这是 `engine/industry.py` 的原料。
+
+    `day` 默认 = **最后一个已收盘交易日** —— 盘前跑时快照内容其实是"上一交易日
+    收盘态"，硬标成"今天"就是**日期错位**（承 P5：显形，不偷换）。
     """
     root = root if root is not None else DATA_DIR
-    day = trading_day(datetime.now(ET))
+    day = day or last_closed_trading_day()
     res = fetch_api.snapshot(market=market)
     axis.put(day, UNIVERSE_SYMBOL, "snapshot",
              {"market": market, "rows": res.rows,
@@ -441,7 +510,7 @@ def run_industry_state(*, day: str | None = None, root=None,
     （行业名含中文/空格、不是合法代码 → 只能做全局项；板块有代码 → `run_plate_state`。）
     """
     root = root if root is not None else DATA_DIR
-    day = day or trading_day(datetime.now(ET))
+    day = day or last_closed_trading_day()
     rows = axis.get(day, UNIVERSE_SYMBOL, "snapshot", root=root)["rows"]
     states = _group_state(rows, {}, min_count=min_count)
     axis.put(day, None, "industry_state",
@@ -458,7 +527,7 @@ def run_plate_state(*, day: str | None = None, root=None) -> dict:
     算法与行业**同一个** `_group_state`（板块名当行业名）。
     """
     root = root if root is not None else DATA_DIR
-    day = day or trading_day(datetime.now(ET))
+    day = day or last_closed_trading_day()
     by_symbol = {r["symbol"]: r
                  for r in axis.get(day, UNIVERSE_SYMBOL, "snapshot",
                                    root=root)["rows"]}
@@ -497,7 +566,8 @@ def _report_failures(failures: list[dict]) -> None:
     for f in failures:
         print(f"   [{f['item']}] {f['symbol']}: {f['error']}")
 
-def run_per_symbol(item: str, symbols: list[str], fn):
+def run_per_symbol(item: str, symbols: list[str], fn, *,
+                   workers: int = DEFAULT_WORKERS, label: str | None = None):
     """逐只跑，**隔离失败**（一只坏不拖垮全批），失败逐条上报（承 F4）。
 
     `fn(sym) -> int`（该只写入的记录数）。返回 `(ok, total_records, failures)`。
@@ -506,46 +576,93 @@ def run_per_symbol(item: str, symbols: list[str], fn):
       K线 / 复权**逐只独立**（标的不共享状态），而网络抖动是常态 ——
       一只标的一次代理断连，不该让另外 300 只白跑。
       而"一天一批"的期权链是**原子**的（半批入库更糟），那条路径保持 fail-fast。
+
+    **并发（`workers > 1`）为什么不会突破限流**：
+      `fetch/rate_limit.py` 的 `wait()` 是**全局**的（模块级状态 + `threading.Lock`），
+      取数前仍按桶的**最小间隔**排队 ⇒ 请求**发出速率不变**。
+      并发只是让**网络往返（RTT）互相重叠**（串行时每只要"等限流 + 等响应"两段相加）。
+      ⇒ 收益来自 RTT 重叠，**不是**靠超发。
     """
-    ok, total, failures = 0, 0, []
-    for sym in symbols:
-        try:
-            total += fn(sym)
-            ok += 1
-        except Exception as e:
-            failures.append({"item": item, "symbol": sym, "error": str(e)[:200]})
+    if workers <= 1 or len(symbols) <= 1:
+        ok, total, failures = 0, 0, []
+        for sym in symbols:
+            try:
+                total += fn(sym)
+                ok += 1
+            except Exception as e:
+                failures.append({"item": item, "symbol": sym, "error": str(e)[:200]})
+        return ok, total, failures
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    ok, total, failures, done = 0, 0, [], 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fn, s): s for s in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            done += 1
+            try:
+                total += fut.result()          # 汇总只在主线程做 → 无竞态
+                ok += 1
+            except Exception as e:
+                failures.append({"item": item, "symbol": sym,
+                                 "error": str(e)[:200]})
+            if label and done % 50 == 0:
+                log.warning("%s 进度 %d/%d", label, done, len(symbols))
     return ok, total, failures
 
 
 def run_kline_bulk(symbols: list[str], *, ktype: str, full_years: int,
-                   force_full: bool = False, root=None):
-    """批量 K线（逐只隔离失败）。返回 `(StepResult, failures)`。"""
+                   force_full: bool = False, root=None,
+                   workers: int = DEFAULT_WORKERS, as_of: str | None = None):
+    """批量 K线（逐只隔离失败 + 并发）。返回 `(StepResult, failures)`。"""
+    # 目标日在**批开始前**定一次 —— 否则长跑跨过收盘时刻时，同批内日期会不一致。
+    as_of = as_of or last_closed_trading_day()
     ok, total, failures = run_per_symbol(
         "kline", symbols,
         lambda s: run_kline([s], ktype=ktype, full_years=full_years,
-                            force_full=force_full, root=root)["days"])
-    return StepResult("kline", f"{ok}/{len(symbols)} 只，{total} 天"), failures
+                            force_full=force_full, root=root, as_of=as_of)["days"],
+        workers=workers, label="K线")
+    return StepResult(
+        "kline", f"{ok}/{len(symbols)} 只，{total} 天（目标日 {as_of}）"), failures
 
 
-def run_adjust_factors_bulk(symbols: list[str], *, root=None):
-    """批量复权因子（逐只隔离失败）。返回 `(StepResult, failures)`。"""
+def run_adjust_factors_bulk(symbols: list[str], *, root=None,
+                            workers: int = DEFAULT_WORKERS):
+    """批量复权因子（逐只隔离失败 + 并发）。返回 `(StepResult, failures)`。"""
     ok, total, failures = run_per_symbol(
         "adjust_factor", symbols,
-        lambda s: run_adjust_factors([s], root=root)["records"])
+        lambda s: run_adjust_factors([s], root=root)["records"],
+        workers=workers, label="复权因子")
     return StepResult("adjust_factor", f"{ok}/{len(symbols)} 只，{total} 条"), failures
 
 
 def run_daily(*, day: str | None = None, ktype: str | None = None,
-              full_years: int | None = None, root=None) -> dict:
-    """每日更新：按 `universe` 的设置，把配置的项各跑一遍（**一条命令**）。
+              full_years: int | None = None, root=None,
+              workers: int = DEFAULT_WORKERS,
+              skip_adjust: bool = False) -> dict:
+    """每日更新 —— **一条命令，跑完即最新，不需要想任何事**。
+
+    **目标日**（`day`）：省略时取 **最后一个已收盘的交易日**
+    （`last_closed_trading_day`）—— 盘前 / 盘中跑都会自动退到上一个完整交易日，
+    所以**任何时间跑都不会把半成品当成一天**，也不用手动算该补哪天。
+
+    **幂等**：已在库的**整日项**（`snapshot` / `plate_list`）直接跳过、不重复拉；
+    K 线 / 复权因子走**增量**（只补库里最后一天起）。⇒ 连着跑两次，第二次很快。
+
+    **顺序**：按 `universe.PULL_ITEMS`（唯一设置项），项间有依赖
+    （`snapshot` 是 `industry_state` / `plate_state` 的原料，故排在其前）。
 
     `ktype` / `full_years` 省略 → 用 `universe` 的默认；给了就覆盖（同 CLI）。
     """
     root = root if root is not None else DATA_DIR
-    day = day or trading_day()
+    day = day or last_closed_trading_day()
     symbols = universe.load_symbols()
     steps: list[StepResult] = []
     failures: list[dict] = []
+
+    def _skip(step: str) -> None:
+        steps.append(StepResult(step, f"{day} 已在库，跳过"))
 
     for item in universe.PULL_ITEMS:
         if item == "calendar":
@@ -556,28 +673,47 @@ def run_daily(*, day: str | None = None, ktype: str | None = None,
                 symbols, ktype=ktype or universe.KLINE_KTYPE,
                 full_years=(universe.KLINE_FULL_YEARS if full_years is None
                             else full_years),
-                root=root)
+                root=root, workers=workers, as_of=day)
             steps.append(step)
             failures += fails
         elif item == "adjust_factor":
-            step, fails = run_adjust_factors_bulk(symbols, root=root)
-            steps.append(step)
-            failures += fails
+            if skip_adjust:
+                # `get_rehab` 是 60 次/30 秒且**限流在请求前**生效 ⇒ 328 只 ≈ 3 分钟，
+                # 是全流程最大的一笔开销；而除权一年只有几次，故可降频。
+                steps.append(StepResult(
+                    "adjust_factor",
+                    "已跳过（--skip-adjust；复权事件变化极慢，建议每周跑一次）"))
+            else:
+                step, fails = run_adjust_factors_bulk(symbols, root=root,
+                                                      workers=workers)
+                steps.append(step)
+                failures += fails
         elif item == "plates":
-            out = run_plates(universe.load_plate_codes(),
-                             market=universe.PLATE_MARKET,
-                             plate_types=universe.PLATE_TYPES, root=root)
-            steps.append(out["steps"][-1])
-            failures += out["failures"]
+            if axis.exists(day, None, "plate_list", root=root):
+                _skip("plates")
+            else:
+                out = run_plates(universe.load_plate_codes(),
+                                 market=universe.PLATE_MARKET,
+                                 plate_types=universe.PLATE_TYPES,
+                                 day=day, root=root)
+                steps.append(out["steps"][-1])
+                failures += out["failures"]
         elif item == "snapshot":
-            steps.append(run_snapshot(market=universe.SNAPSHOT_MARKET,
-                                      root=root)["steps"][0])
+            if axis.exists(day, UNIVERSE_SYMBOL, "snapshot", root=root):
+                _skip("snapshot")
+            else:
+                steps.append(run_snapshot(market=universe.SNAPSHOT_MARKET,
+                                          day=day, root=root)["steps"][0])
         elif item == "industry_state":
             steps.append(run_industry_state(day=day, root=root)["steps"][0])
         elif item == "plate_state":
             steps.append(run_plate_state(day=day, root=root)["steps"][0])
         elif item == "chain":
-            out = run_day(day, list(universe.CHAIN_SYMBOLS), root=root)
+            # ⚠️ 期权链用**今天**，不是"最后收盘日"—— 两者的日期语义本来就不同：
+            #    期权链是**时刻快照**（CBOE 给的就是"此刻最新"）⇒ 归属当天；
+            #    K 线的 bar 归属于"它**完成**的那天"（未收盘即半成品）⇒ 用 last_closed。
+            #    盘前跑时两者会差一天，那是**故意的**，不是 bug。
+            out = run_day(trading_day(), list(universe.CHAIN_SYMBOLS), root=root)
             steps.append(StepResult("daily:chain", f"{out['records']} 条"))
 
     return {"day": day, "steps": steps, "failures": failures}
@@ -591,7 +727,14 @@ def main() -> None:
     ap.add_argument("--symbols", nargs="*", default=None,
                     help="标的；**省略 = 用 universe 清单**（唯一设置项）")
     ap.add_argument("--daily", action="store_true",
-                    help="每日更新：按 universe 设置跑完所有项（一条命令）")
+                    help="★ 每日更新（推荐）：一条命令跑完全部项；"
+                         "目标日自动取「最后一个已收盘交易日」")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help=f"批量取数并发数（默认 {DEFAULT_WORKERS}；"
+                         "**不突破限流**，只重叠网络往返）")
+    ap.add_argument("--skip-adjust", action="store_true",
+                    help="跳过复权因子（它变化极慢：一年几次除权，"
+                         "却要 328 只 × 0.5s 限流 ≈ 3 分钟；可每周单独跑一次）")
     ap.add_argument("--bucket", default="Tout")
     ap.add_argument("--rate-fallback", action="store_true",
                     help="允许利率用兜底常量（默认不允许，承 P6）")
@@ -634,8 +777,12 @@ def main() -> None:
         return args.symbols if args.symbols else universe.load_symbols()
 
     # 每日更新：按 universe 设置跑完所有项
+    # ⚠️ 这里传 `args.day`（**不是** `day`）—— 不给就让 `run_daily` 自己取
+    #    `last_closed_trading_day()`；传 `day` 会把它锁成"今天"、退化成盘前的半成品。
     if args.daily:
-        out = run_daily(day=day, ktype=args.ktype, full_years=args.full_years)
+        out = run_daily(day=args.day, ktype=args.ktype,
+                        full_years=args.full_years, workers=args.workers,
+                        skip_adjust=args.skip_adjust)
         print(f"✅ 每日更新 {out['day']}：{len(out['steps'])} 项")
         for s in out["steps"]:
             print(f"   [{s.step}] {s.detail}")
@@ -657,15 +804,16 @@ def main() -> None:
 
     # 快照模式：全市场快照（行业 / RPS 的原料）
     if args.snapshot:
-        out = run_snapshot(market=universe.SNAPSHOT_MARKET)
+        out = run_snapshot(market=universe.SNAPSHOT_MARKET, day=args.day)
         print(f"✅ 快照 {out['day']}：{out['steps'][0].detail}")
         return
 
     # 状态模式：行业 + 板块的集体行为 / 状态机
     if args.states:
-        a = run_industry_state(day=day)
-        b = run_plate_state(day=day)
-        print(f"✅ 状态 {day}：{a['steps'][0].detail}；{b['steps'][0].detail}")
+        d = args.day or last_closed_trading_day()
+        a = run_industry_state(day=d)
+        b = run_plate_state(day=d)
+        print(f"✅ 状态 {d}：{a['steps'][0].detail}；{b['steps'][0].detail}")
         return
 
     # 板块模式：名册 + 成分股
@@ -673,7 +821,7 @@ def main() -> None:
         codes = (args.plate_codes if args.plate_codes
                  else universe.load_plate_codes())
         out = run_plates(codes, market=universe.PLATE_MARKET,
-                         plate_types=universe.PLATE_TYPES)
+                         plate_types=universe.PLATE_TYPES, day=args.day)
         print(f"✅ 板块 {out['day']}：{len(out['steps'])} 步")
         for s in out["steps"]:
             print(f"   [{s.step}] {s.detail}")
@@ -684,7 +832,8 @@ def main() -> None:
 
     # 复权因子模式：只跑公司行动（逐只隔离失败）
     if args.adjust_factors:
-        step, failures = run_adjust_factors_bulk(_symbols())
+        step, failures = run_adjust_factors_bulk(_symbols(),
+                                                 workers=args.workers)
         print(f"✅ 复权因子：{step.detail}")
         _report_failures(failures)
         return
@@ -693,8 +842,11 @@ def main() -> None:
     if args.kline:
         step, failures = run_kline_bulk(_symbols(), ktype=args.ktype,
                                         full_years=args.full_years,
-                                        force_full=args.force_full)
-        print(f"✅ K线（{args.ktype}，首次 {args.full_years} 年）：{step.detail}")
+                                        force_full=args.force_full,
+                                        workers=args.workers, as_of=args.day)
+        # ⚠️ 不写"首次 N 年"—— 那是**新建标的**时的窗口，印在增量跑里会让人以为
+        #    重拉了全历史（实际只补缺口）。实际范围看 detail 里的"目标日"。
+        print(f"✅ K线（{args.ktype}）：{step.detail}")
         _report_failures(failures)
         return
 

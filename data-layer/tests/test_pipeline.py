@@ -137,6 +137,67 @@ def test_time_fields_are_unix_seconds():
     assert ng["as_of"] == "2026-10-06"          # as_of 是交易日（日期，非时刻）
 
 
+# ── 目标日：最后一个**已收盘**交易日（承 P5：不把半成品当一天）────────────
+
+def test_last_closed_day_before_close_rolls_back():
+    """盘前 / 盘中跑 → 退到**上一个**交易日（否则会把"今天那根半成品"入库）。"""
+    et = ZoneInfo("America/New_York")
+    for hour in (0, 8, 12, 15):
+        got = pipeline.last_closed_trading_day(datetime(2026, 10, 8, hour, 0, tzinfo=et))
+        assert got == "2026-10-07", f"{hour}:00 周四未收盘，应退到 10-07，得到 {got}"
+
+
+def test_last_closed_day_after_close_is_today():
+    """盘后跑 → 今天（此刻它才真的完整）。"""
+    et = ZoneInfo("America/New_York")
+    for hour in (16, 17, 23):
+        got = pipeline.last_closed_trading_day(datetime(2026, 10, 8, hour, 0, tzinfo=et))
+        assert got == "2026-10-08", f"{hour}:00 周四已收盘，应为 10-08，得到 {got}"
+
+
+def test_last_closed_day_never_lands_on_weekend():
+    """周末不可能是交易日 —— 目标日必须退到周五。"""
+    et = ZoneInfo("America/New_York")
+    assert pipeline.last_closed_trading_day(
+        datetime(2026, 10, 10, 20, 0, tzinfo=et)) == "2026-10-09"   # 周六
+    assert pipeline.last_closed_trading_day(
+        datetime(2026, 10, 11, 20, 0, tzinfo=et)) == "2026-10-09"   # 周日
+    assert pipeline.last_closed_trading_day(
+        datetime(2026, 10, 12, 10, 0, tzinfo=et)) == "2026-10-09"   # 周一盘中
+
+
+def test_market_close_hour_matches_us_regular():
+    """收盘时刻是 16:00 美东（改它等于改"何时算完整一天"，要显式）。"""
+    assert pipeline.MARKET_CLOSE_HOUR == 16
+
+
+# ── 并发批量：语义与串行一致 + 失败仍逐只隔离（承 F4）────────────────────
+
+def test_run_per_symbol_isolates_failures_under_concurrency():
+    """并发下失败仍**逐只隔离**，计数正确 —— 一只坏不拖垮全批。"""
+    def fn(sym: str) -> int:
+        if sym == "BAD":
+            raise RuntimeError("simulated failure")
+        return 1
+
+    syms = [f"S{i}" for i in range(20)] + ["BAD"]
+    ok, total, failures = pipeline.run_per_symbol("x", syms, fn, workers=4)
+    assert ok == 20, f"应成功 20 只，得到 {ok}"
+    assert total == 20, f"应累计 20 条，得到 {total}"
+    assert len(failures) == 1 and failures[0]["symbol"] == "BAD"
+
+
+def test_run_per_symbol_parallel_matches_serial():
+    """并发与串行**结果一致** —— 并发只重叠 RTT，不改语义。"""
+    def fn(sym: str) -> int:
+        return len(sym)
+
+    syms = [f"S{i}" for i in range(30)]
+    serial = pipeline.run_per_symbol("x", syms, fn, workers=1)
+    parallel = pipeline.run_per_symbol("x", syms, fn, workers=8)
+    assert serial == parallel, f"串行 {serial} != 并发 {parallel}"
+
+
 if __name__ == "__main__":
     import traceback
 
