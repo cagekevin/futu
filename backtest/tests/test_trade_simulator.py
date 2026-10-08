@@ -460,6 +460,90 @@ def test_full_partial_through_target_closes_the_position() -> bool:
     return ok
 
 
+# ── ⑪ ★ 对账：R 必须能从**记录字段独立重算**（最强的检查）──────────────
+
+def test_trade_records_reconcile() -> bool:
+    """★ 没用过部分止盈的那些交易，`r_multiple` 必须能从 CSV 里的字段**独立算出来**。
+
+    独立公式（**与模拟器内部实现无关**，照定义写）：
+
+    ```
+    gross = (出场价 − 入场价) × 股数
+    cost  = (入场价 × 股数 + 出场价 × 股数) × 费率   ← 进、出各收一次
+    R     = (gross − cost) / (股数 × (入场价 − 初始止损))
+    ```
+
+    ⇒ 这条不过，说明**记的账和算的账对不上** —— 那所有报告都别信。
+    """
+    # 多标的 + 一路下跌 ⇒ 全部**止损出局**（不触发 3R ⇒ 全部可精确重算）
+    syms = ("AAA", "BBB", "CCC", "DDD")
+    # ⚠️ 止损距取 **5%**（不是 1%）—— 否则单笔就占满 100% 名义，
+    #    曝险上限只让 1 笔进场，对账样本就只剩 1 笔。
+    bars = [(100, 101, 99, 100),                     # d1 信号（止损 = 95）
+            (100, 100, 94, 94),                      # d2 入场 @100，low 94 ⇒ 打止损
+            (94, 94, 93, 93), (93, 93, 93, 93)]
+    cand = [("d1", s, 95.0) for s in syms]
+    r = _run(bars, cand, symbols=syms,
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=3.0,
+                                    max_hold_days=5))
+    checked = bad = 0
+    for t in r.trades:
+        if t.took_partial:
+            continue                                   # 有部分止盈 ⇒ 需要更多字段才能重算
+        gross = (t.exit_price - t.entry_price) * t.shares
+        cost = (t.entry_price * t.shares + t.exit_price * t.shares) * COST
+        denom = t.shares * (t.entry_price - t.initial_stop)
+        expect = (gross - cost) / denom
+        checked += 1
+        if abs(expect - t.r_multiple) > 1e-9:
+            bad += 1
+            print(f"   ✗ {t.symbol} {t.entry_day}: 记录 {t.r_multiple:.6f} "
+                  f"vs 重算 {expect:.6f}")
+    ok = checked > 0 and bad == 0
+    print(f"{'[PASS]' if ok else '[FAIL]'} 逐笔对账：{checked} 笔可重算，"
+          f"不符 {bad} 笔")
+    return ok
+
+
+def test_zero_partial_does_not_move_stop_to_breakeven() -> bool:
+    """★ `partial_fraction=0`（**一股都不卖**）**不准**把止损移到保本。
+
+    ⚠️ 漏了这道门槛等于**白送一次止损上移**：没落袋任何利润，风险却先降了。
+    """
+    bars = [(100, 100, 100, 100),      # d1 信号（止损 95）
+            (100, 100, 100, 100),      # d2 入场 @100
+            (100, 116, 100, 110),      # d3 high 116 ≥ 3R(115) —— 但只卖 0 股
+            (99, 100, 98, 99),         # d4 low 98：止损若被移到 100 就会在这被打掉
+            (99, 99, 99, 99), (99, 99, 99, 99)]
+    r = _run(bars, [("d1", SYM, 95.0)],
+             exit_policy=ExitPolicy(target_r=3.0, use_ma_exit=False,
+                                    partial_fraction=0.0,
+                                    breakeven_after_partial=True,
+                                    max_hold_days=3))
+    t = r.trades[0]
+    ok = t.exit_reason == "time_cap" and abs(t.exit_price - 99.0) < 1e-9
+    print(f"{'[PASS]' if ok else '[FAIL]'} 卖 0 股不移动止损"
+          f"（{t.exit_reason} @ {t.exit_price}，应 time_cap @ 99.0）")
+    return ok
+
+
+def test_full_partial_records_the_actual_fill_price() -> bool:
+    """★ 全出那条路径记的**成交价必须是实际成交价**（`max(止盈价, 开盘)`），不是收盘价。
+
+    入场 100 / 止损 95 ⇒ 3R = 115。d3 `open=100, high=130, close=120`
+    ⇒ 实际成交在 **115**（`max(115, 100)`），而**不是**收盘 120。
+    """
+    bars = [(100, 100, 100, 100), (100, 100, 100, 100), (100, 130, 100, 120)]
+    r = _run(bars, [("d1", SYM, 95.0)],
+             exit_policy=ExitPolicy(target_r=3.0, use_ma_exit=False,
+                                    partial_fraction=1.0))
+    t = r.trades[0]
+    ok = abs(t.exit_price - 115.0) < 1e-9
+    print(f"{'[PASS]' if ok else '[FAIL]'} 全出记的是实际成交价"
+          f"（{t.exit_price}，应 115.0 而非收盘 120.0）")
+    return ok
+
+
 def test_static_exposure_is_the_default() -> bool:
     r = _run([(100, 100, 100, 100)] * 4, [("d1", SYM, 95.0)],
              exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=1))

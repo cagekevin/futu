@@ -258,6 +258,10 @@ class _Position:
     realized: float = 0.0       # 已实现盈亏（含成本前的毛利，成本单列）
     cost_paid: float = 0.0
     peak_r: float = 0.0         # 持有期内达到过的最大浮盈（R 计）—— 供"无进展"判定
+    #: 最近一次**实际成交**的价格 —— 全出那条路径要用它记 `exit_price`。
+    #: ⚠️ 用它而不是 `close`：部分止盈的成交价是 `max(止盈价, 开盘)`，
+    #:    与当日收盘**不是一回事**（记错会让导出的逐笔清单**看起来对不上账**）。
+    last_fill: float = float("nan")
 
     @property
     def risk_per_share(self) -> float:
@@ -279,6 +283,8 @@ class Trade:
     return_pct: float
     exit_reason: str
     hold_days: int
+    #: 是否**做过部分止盈** —— 供对账：`False` 的那些可以**逐笔精确重算** R。
+    took_partial: bool = False
 
 
 @dataclass(frozen=True)
@@ -411,6 +417,14 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
         return abs(notional) * account.cost_rate
 
     for i, day in enumerate(dates):
+        # ★ 两个权益口径，**不能混用**：
+        #   `equity_open` —— 用**开盘价**估已有持仓 ⇒ 开盘那一刻真的知道的值。
+        #       **定仓与曝险检查必须用它**（否则是轻微前视：开盘时不知道今天收盘）。
+        #   `equity_close` —— 用**收盘价** ⇒ 只用于**当日收盘记账**。
+        equity_open = cash + sum(
+            p.shares_left * (opens[i, j] if np.isfinite(opens[i, j])
+                             else p.entry_price)
+            for j, p in positions.items())
         equity_now = cash + sum(
             p.shares_left * (closes[i, j] if np.isfinite(closes[i, j])
                              else p.entry_price)
@@ -463,12 +477,12 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                 if i < o.expire:
                     keep.append(o)
                 continue
-            shares = (equity_now * settings.risk_fraction) / (px - o.stop)
+            shares = (equity_open * settings.risk_fraction) / (px - o.stop)
             notional = shares * px
-            held = sum(p.shares_left * closes[i, jj]
+            held = sum(p.shares_left * opens[i, jj]
                        for jj, p in positions.items()
-                       if np.isfinite(closes[i, jj]))
-            if (held + notional) > equity_now * account.max_total_exposure:
+                       if np.isfinite(opens[i, jj]))
+            if (held + notional) > equity_open * account.max_total_exposure:
                 skipped_exposure += 1
                 if i < o.expire:
                     keep.append(o)
@@ -507,6 +521,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                     symbol=p.symbol, entry_day=p.entry_day,
                     entry_price=p.entry_price, initial_stop=p.initial_stop,
                     exit_day=day, exit_price=float(px), shares=p.shares_initial,
+                    took_partial=p.took_partial,
                     r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
                     return_pct=(p.realized - p.cost_paid)
                     / (p.shares_initial * p.entry_price),
@@ -520,30 +535,36 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
             if (not p.took_partial and np.isfinite(hi) and hi >= target):
                 px = max(target, op) if np.isfinite(op) else target
                 sold = p.shares_left * ep.partial_fraction
-                p.realized += (px - p.entry_price) * sold
-                notional = px * sold
-                c = cost_of(notional)
-                p.cost_paid += c
-                cash += notional - c
-                p.shares_left -= sold
-                p.took_partial = True
-                if ep.breakeven_after_partial:
-                    p.stop = max(p.stop, p.entry_price)      # 止损上移到入场点
+                # ★ 只有**真的卖了**才算"部分止盈"、才准把止损移到保本。
+                #   否则 `partial_fraction=0` 会变成**白送一次止损上移**。
+                if sold > 1e-12:
+                    p.realized += (px - p.entry_price) * sold
+                    notional = px * sold
+                    c = cost_of(notional)
+                    p.cost_paid += c
+                    cash += notional - c
+                    p.shares_left -= sold
+                    p.took_partial = True
+                    p.last_fill = float(px)
+                    if ep.breakeven_after_partial:
+                        p.stop = max(p.stop, p.entry_price)  # 止损上移到入场点
 
             # ②b **时间型**部分止盈（他阶段④的「2–3 天部分获利」）—— 按当日**收盘**成交
             if (not p.took_partial and ep.partial_after_days is not None
                     and hold >= ep.partial_after_days and np.isfinite(cl)
                     and p.shares_left > 1e-12):
                 sold = p.shares_left * ep.partial_fraction
-                p.realized += (cl - p.entry_price) * sold
-                notional = cl * sold
-                c = cost_of(notional)
-                p.cost_paid += c
-                cash += notional - c
-                p.shares_left -= sold
-                p.took_partial = True
-                if ep.breakeven_after_partial:
-                    p.stop = max(p.stop, p.entry_price)
+                if sold > 1e-12:
+                    p.realized += (cl - p.entry_price) * sold
+                    notional = cl * sold
+                    c = cost_of(notional)
+                    p.cost_paid += c
+                    cash += notional - c
+                    p.shares_left -= sold
+                    p.took_partial = True
+                    p.last_fill = float(cl)
+                    if ep.breakeven_after_partial:
+                        p.stop = max(p.stop, p.entry_price)
 
             # ②c ★ 部分止盈把**股数减到 0** ⇒ 这笔已经**平完了**，必须收尾。
             #     ⚠️ 漏了这一步，仓位会**带着 0 股继续占着持仓位**，
@@ -551,10 +572,16 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
             #     （这个 bug 被敏感性扫描抓到：`partial_fraction=1.0` 那行
             #      只有 26 笔、Sharpe 0.95 —— 看起来像"参数好"，其实是**没平仓**。）
             if p.shares_left <= 1e-12:
+                # ★ 成交价取**最后一次实际成交价**（`last_fill`），不是当日收盘 ——
+                #   部分止盈的成交价是 `max(止盈价, 开盘)`，与收盘**不是一回事**。
+                #   （记错不会影响 PnL，但会让导出的逐笔清单**对不上账**。）
+                fill = p.last_fill if np.isfinite(p.last_fill) else float(cl)
                 trades.append(Trade(
                     symbol=p.symbol, entry_day=p.entry_day,
                     entry_price=p.entry_price, initial_stop=p.initial_stop,
-                    exit_day=day, exit_price=float(cl), shares=p.shares_initial,
+                    exit_day=day, exit_price=float(fill),
+                    shares=p.shares_initial,
+                    took_partial=p.took_partial,
                     r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
                     return_pct=(p.realized - p.cost_paid)
                     / (p.shares_initial * p.entry_price),
@@ -574,6 +601,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                     symbol=p.symbol, entry_day=p.entry_day,
                     entry_price=p.entry_price, initial_stop=p.initial_stop,
                     exit_day=day, exit_price=float(cl), shares=p.shares_initial,
+                    took_partial=p.took_partial,
                     r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
                     return_pct=(p.realized - p.cost_paid)
                     / (p.shares_initial * p.entry_price),
@@ -596,6 +624,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                         symbol=p.symbol, entry_day=p.entry_day,
                         entry_price=p.entry_price, initial_stop=p.initial_stop,
                         exit_day=day, exit_price=float(cl), shares=p.shares_initial,
+                    took_partial=p.took_partial,
                         r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
                         return_pct=(p.realized - p.cost_paid)
                         / (p.shares_initial * p.entry_price),
@@ -614,6 +643,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
 
     # 数据末尾仍持仓 → 按最后收盘价平掉（**显形**，不当作正常出场）
     last = len(dates) - 1
+    cleanup_cost = 0.0
     for j in sorted(positions):
         p = positions[j]
         cl = closes[last, j]
@@ -622,16 +652,24 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
         p.realized += (cl - p.entry_price) * p.shares_left
         notional = cl * p.shares_left
         p.cost_paid += cost_of(notional)
+        # ★ 这笔平仓成本**必须进最终权益** —— 否则最后一天的净值会**虚高**
+        #   （`equity_values[-1]` 是在这一步**之前**记的）。
+        cleanup_cost += cost_of(notional)
         trades.append(Trade(
             symbol=p.symbol, entry_day=p.entry_day,
             entry_price=p.entry_price, initial_stop=p.initial_stop,
             exit_day=dates[last], exit_price=float(cl),
             shares=p.shares_initial,
+                    took_partial=p.took_partial,
             r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
             return_pct=(p.realized - p.cost_paid)
             / (p.shares_initial * p.entry_price),
             exit_reason=EXIT_END_OF_DATA,
             hold_days=last - p.entry_bar))
+
+    # ★ 末尾平仓的成本要进**最终权益** —— 否则最后一天的净值虚高
+    if equity_values:
+        equity_values[-1] = float(equity_values[-1] - cleanup_cost)
 
     return SimulationResult(
         strategy=strategy_name,
