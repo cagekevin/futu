@@ -15,6 +15,7 @@ from . import source_registry
 
 __all__ = [
     "chain", "spot", "kline", "snapshot", "watchlist", "trading_days", "rehab",
+    "plate_list", "plate_members",
     "Request", "ChainResult", "FetchError", "available_sources",
 ]
 
@@ -83,14 +84,14 @@ def kline(symbol: str, *, as_of: str | None = None, ktype: str = "K_DAY",
     return fn(req, ktype=ktype, years=years, months=months)
 
 
-def snapshot(*, source: str | None = None):
+def snapshot(*, market: str = "US", source: str | None = None):
     """取全市场快照（供 RPS / 行业用，需全样本）。"""
     req = Request(symbol="UNIVERSE", kind="snapshot")
     src = source_registry.get_source(source or "futu-opend")
     fn = getattr(src, "fetch_snapshot", None)
     if fn is None:
         raise FetchError(f"源 {src.name!r} 不支持快照取数")
-    return fn(req)
+    return fn(req, market=market)
 
 
 def watchlist(*, source: str | None = None):
@@ -100,6 +101,30 @@ def watchlist(*, source: str | None = None):
     fn = getattr(src, "fetch_watchlist", None)
     if fn is None:
         raise FetchError(f"源 {src.name!r} 不支持自选取数")
+    return fn(req)
+
+
+def plate_list(*, market: str = "US", plate_type: str = "CONCEPT",
+               source: str | None = None):
+    """取某市场的**板块名册**（`CONCEPT` 概念 / `INDUSTRY` 行业）。
+
+    板块 = 一揽子股票；概念与行业走**同一条**通路（吸收自参照项目 plates.py）。
+    """
+    req = Request(symbol="PLATES", kind="plate_list")
+    src = source_registry.get_source(source or "futu-opend")
+    fn = getattr(src, "fetch_plate_list", None)
+    if fn is None:
+        raise FetchError(f"源 {src.name!r} 不支持板块名册取数")
+    return fn(req, market=market, plate_type=plate_type)
+
+
+def plate_members(plate_code: str, *, source: str | None = None):
+    """取一个**板块的成分股**（板块纯代码，如 `LIST23925`）。"""
+    req = Request(symbol=plate_code, kind="plate_members")
+    src = source_registry.get_source(source or "futu-opend")
+    fn = getattr(src, "fetch_plate_members", None)
+    if fn is None:
+        raise FetchError(f"源 {src.name!r} 不支持板块成分股取数")
     return fn(req)
 
 

@@ -1,0 +1,29 @@
+[
+  {
+    "id": "msg-1789217351706-mn57fl",
+    "from": "team-lead",
+    "to": "@team",
+    "type": "broadcast",
+    "content": "收口工作进入尾声：director3d 现在只剩 4 个文件共 64 处错误（App.tsx 38、rig.ts 16、Inspector.tsx 9、project.ts 1）。这 4 个文件需要共享领域类型上下文，由我统一接管收尾，请立即停止对 director3d 的任何编辑并汇报你已完成的部分。",
+    "timestamp": "2026-09-12T12:49:11.706Z",
+    "read": true
+  },
+  {
+    "id": "shutdown-1789217352132",
+    "from": "team-lead",
+    "to": "d3d-viewport",
+    "type": "shutdown_request",
+    "content": "{\"type\":\"shutdown_request\",\"request_id\":\"shutdown-1789217352132\",\"reason\":\"收尾由我统一接管，请停止编辑并回复当前进度。\",\"from\":\"team-lead\",\"timestamp\":\"2026-09-12T12:49:12.132Z\"}",
+    "timestamp": "2026-09-12T12:49:12.132Z",
+    "read": true
+  },
+  {
+    "id": "nudge-1789217382149-dp8rqh",
+    "from": "team-lead",
+    "to": "d3d-viewport",
+    "type": "message",
+    "content": "Reminder: a previous shutdown_request (request_id=shutdown-1789217352132) is still awaiting your response.\nPer the Shutdown Protocol, you MUST reply now with:\n  send_message(type='shutdown_response', approve=true, request_id='shutdown-1789217352132')\nIf you have unreported deliverables, send them via send_message first, then acknowledge.\nForce termination will occur shortly if no response is received.",
+    "timestamp": "2026-09-12T12:49:42.149Z",
+    "read": false
+  }
+]

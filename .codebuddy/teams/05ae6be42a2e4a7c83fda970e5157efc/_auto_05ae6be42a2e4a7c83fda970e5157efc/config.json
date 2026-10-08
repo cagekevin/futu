@@ -1,0 +1,49 @@
+{
+  "name": "_auto_05ae6be42a2e4a7c83fda970e5157efc",
+  "mainConversationId": "05ae6be42a2e4a7c83fda970e5157efc",
+  "workspacePath": "/Users/kevin/Documents/maomao",
+  "createdAt": "2026-09-12T12:31:26.876Z",
+  "options": {
+    "workspacePath": "/Users/kevin/Documents/maomao",
+    "isAutoTeam": true
+  },
+  "isAutoTeam": true,
+  "members": [
+    {
+      "memberId": "d3d-app@_auto_05ae6be42a2e4a7c83fda970e5157efc",
+      "name": "d3d-app",
+      "role": "清除 App.tsx 隐式 any",
+      "sessionId": "dc1c9f8f88a845048147921dcf366075"
+    },
+    {
+      "memberId": "d3d-viewport@_auto_05ae6be42a2e4a7c83fda970e5157efc",
+      "name": "d3d-viewport",
+      "role": "清除 Viewport/SceneGizmo/depth 隐式 any",
+      "sessionId": "70cf2200847249dab191078d54b24f64"
+    },
+    {
+      "memberId": "d3d-models@_auto_05ae6be42a2e4a7c83fda970e5157efc",
+      "name": "d3d-models",
+      "role": "清除 models/primitives 隐式 any",
+      "sessionId": "03b8b5c3d7334f6e8deffcc76280a0d5"
+    },
+    {
+      "memberId": "d3d-panels1@_auto_05ae6be42a2e4a7c83fda970e5157efc",
+      "name": "d3d-panels1",
+      "role": "清除 Timeline/Inspector 隐式 any",
+      "sessionId": "61d87674b2984773b1a2b99de88410ae"
+    },
+    {
+      "memberId": "d3d-panels2@_auto_05ae6be42a2e4a7c83fda970e5157efc",
+      "name": "d3d-panels2",
+      "role": "清除其余 panels 隐式 any",
+      "sessionId": "55aba4f0727f4179815a3d5fe8008b41"
+    },
+    {
+      "memberId": "d3d-small@_auto_05ae6be42a2e4a7c83fda970e5157efc",
+      "name": "d3d-small",
+      "role": "清除小文件隐式 any",
+      "sessionId": "7dc729e61fb84510935704e8ce823aa2"
+    }
+  ]
+}

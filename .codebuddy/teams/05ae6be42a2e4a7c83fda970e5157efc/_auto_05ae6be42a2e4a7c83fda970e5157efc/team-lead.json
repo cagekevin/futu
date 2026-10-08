@@ -1,0 +1,137 @@
+[
+  {
+    "id": "msg-1789217165023-7murbi",
+    "from": "d3d-models",
+    "to": "team-lead",
+    "type": "message",
+    "content": "[dstrict] director3d/models.tsx：38 处 → 0 处；director3d/primitives.tsx：18 处 → 0 处\n\n== models.tsx（38 → 0）==\n- TS7006 参数隐式 any × 12：`dominantBoneNameFromHit(event)`、`beginIKDrag(event, jointId)`、`beginBoneDrag(event, jointId)`、`dragBone(event)`、`endBoneDrag(event)`、`beginBoneDragFromSurface(event)`、`handleSurfacePointerDown/Move/Up(event)`、`StudioPerson(props)` —— 指针回调统一标 `ThreeEvent<PointerEvent>`（已 `import type { ThreeEvent } from '@react-three/fiber'`），jointId 标 `string`，props 标 `MixamoPersonModelProps`。\n- TS7031 解构隐式 any × 25：`MixamoJointMarker`(8)、`MixamoIKHandle`(7)、`MixamoPersonModel`(10) 三组件新增 Props 接口（`bone: THREE.Bone`、`jointId: string`、`selected: boolean`、`modelRoot: React.RefObject<THREE.Group>`、各 onXxx 回调按 `ThreeEvent<PointerEvent>` 标注）。\n- TS7053 索引隐式 any × 1：`endBoneDrag` 内 `const rotations = {}` → `Record<string, [number, number, number]>`。\n- 顺带修掉因「给 event 标真实类型」而新冒出的 3 处 TS2339：`event.target` 是 `EventTarget`（无 setPointerCapture/releasePointerCapture），改为 `(event.target as Element | null)?.setPointerCapture?.(...)` / `releasePointerCapture?.(...)`（纯类型收窄，无运行时影响）。\n\n== primitives.tsx（18 → 0）==\n- TS7031 解构隐式 any × 17：所有模型组件（`ArchPrimitive`/`RoofPrimitive`/`SimplePart`/`AssemblyModel`/`StairsModel`/`TableModel`/`ChairModel`/`SofaModel`/`DoorModel`/`WindowModel`/`TreeModel`/`VehicleModel`/`PrimitiveModel`）的 `color/selected/type/parts` 补 `?: string | boolean` 等；新增本地 `interface PrimitivePart { shape: string; position?: [number,number,number]; rotationDegrees?: [number,number,number]; scale?: [number,number,number] }`。\n- TS7006 参数隐式 any × 1：`AssemblyModel` 内 `.map((value) => …)` 的 `value` 因 `rotationDegrees` 标 `number[]` 而推断为 `number`。\n\n== 验证 ==\n- `node scripts/strict-report.mjs --file src/components/director3d/models.tsx` → ✅ 无隐式 any（0）\n- `node scripts/strict-report.mjs --file src/components/director3d/primitives.tsx` → ✅ 无隐式 any（0）\n- `npm run type-check`（npx tsc --noEmit）：**我改的两个文件 0 错**。全仓仍 33 处错误，全部位于其它 director3d 文件（App.tsx 17、Viewport.tsx 9、panels/Timeline.tsx 4、depth.tsx 1，以及若干类型不兼容续行），属本次任务范围外、预先存在，已忽略并注明。\n\n== 白名单 ==\n未改动 `scripts/strict-src-whitelist.json`：`src/components/director3d/` 仍是 712 存量大目录，仅清零其中 2 个文件，目录级门禁暂不登记（避免把整目录 700+ 存量误判为收口）。\n\n== ⚠️ 待确认（unknown 收窄项） ==\n1. `MixamoPersonModel` 的 `rigRoot` / `joints` 标成了 `unknown`：因 Viewport 经 `ProjectObject`（`[key:string]: unknown` 索引签名）传入 `unknown`，且 `rig.ts` 的 `poseForObject`/`cloneJointPose` 入参未导出精确类型（按铁律未改 rig.ts）。内部 `poseForObject({...})` 的返回值类型仍由 rig.ts 自身推断，功能不受影响。建议后续在 rig.ts 导出 `JointPose` 类型后收紧为具体类型。\n2. `PrimitivePart.rotationDegrees` 的 `.map(...)` 结果用 `as [number, number, number]` 收窄：R3F 的 `rotation` prop 只接受元组 `[number,number,number]`，`number[]` 不兼容，纯类型断言、无行为变化。\n3. `event.target as Element | null` 收窄（见上）同上，属必要的库类型适配。\n\n全程仅加类型标注与必要类型收窄断言，未改任何逻辑/命名/删代码，未触碰 project.ts/tracks.ts/rig.ts/storage.ts/history.ts/d3dPersistence.ts。",
+    "timestamp": "2026-09-12T12:46:05.023Z",
+    "read": true
+  },
+  {
+    "id": "msg-1789217233379-wuay76",
+    "from": "d3d-small",
+    "to": "team-lead",
+    "type": "message",
+    "content": "## [strict] src/components/director3d：8 文件隐式 any 清零（共 52 处 → 0）\n\n### 各文件修法（错误码 → 数量，及处理）\n- **log.ts（11→0）**：TS7034×1（`errorReporter` 变量）、TS7006×4（`fn` / `args` / `arg` / 余）、TS7019×4（`error/warn/info/debug` 的 rest `args`）、TS7005×3（`errorReporter` 取值处）。\n  → 新增 `type ErrorReporter = (payload: { level: string; message: string; raw: unknown }) => void`；`let errorReporter: ErrorReporter | null = null`；`configureErrorReporting(fn: ErrorReporter)`；`describe(args: unknown[])`；四个方法 `(...args: unknown[])`。\n- **useToast.ts（2→0）**：TS7006×2（`text` / `id`）。\n  → 新增 `type ToastLevel = 'info'|'success'|'warning'|'error'`；`notify(text: string, level: ToastLevel = 'info')`；`dismiss(id: string)`。\n- **ConfirmDialog.tsx（3→0）**：TS7006×3（`message` / `opts` / `result`）。\n  → 新增 `interface ConfirmDialogOpts { confirmText?; cancelText?; danger? }`；`ask((message: string, opts: ConfirmDialogOpts) => …)`；`settle((result: boolean) => …)`。\n- **ErrorBoundary.tsx（3→0）**：TS7006×3（`error`×2 / `info`）。\n  → `import { Component, type ErrorInfo } from 'react'`；`getDerivedStateFromError(error: unknown)`（用 `(error as { message?: unknown })?.message` 守卫，保留原 `error?.message || String(error)` 语义）；`componentDidCatch(error: Error, info: ErrorInfo)`。\n- **thumbnails.ts（2→0）**：TS7006×2（`source` / `monitorCanvasRef`）。\n  → `import type { RefObject } from 'react'`；`thumbnailFromCanvas(source: HTMLCanvasElement)`；`thumbnailFromMonitorRef(monitorCanvasRef: RefObject<HTMLCanvasElement | null>)`。（注：`ImageData` 不在 `CanvasImageSource` 内，drawImage 不接受；全仓只有 canvas ref 一个调用方，故按真实用法标 `HTMLCanvasElement`。）\n- **Director3DOverlay.tsx（11→0）**：TS7031×3（`nodeId`/`onExit` 解构、`type`/`blob`/`fileName` 解构）、TS7006×4（`e` 事件 ×4、`dataUrl`）、TS7034×1 + TS7005×1（`rootCaptureCleanup` 数组）。\n  → 新增 `interface CaptureItem { type: 'image'|'video'; blob: Blob; fileName: string }` 与 `interface Director3DOverlayProps { nodeId: string; onExit?: (payload: { thumbnailDataUrl: string | null; captures: CaptureItem[] }) => void }`；`capturesRef = useRef<CaptureItem[]>([])`、`thumbnailRef = useRef<string | null>(null)`；四个事件 `(e: Event)`；`rootCaptureCleanup: Array<() => void> = []`；`handleExport(({ type, blob, fileName }: CaptureItem)`；`handleThumbnail(dataUrl: string)`。（`CaptureItem.type` 用 `'image'|'video'` 是为了与调用方 `Director3DNode.tsx` 的 `Director3DCapture` 保持可赋值、不破坏其 type-check。）\n- **history.ts（15→0）**：TS7018×4（`past`/`future`/`last`/`timer` 字面量）、TS7006×11（`state`/`latest`/`previous`/`clearTimer` 等）。\n  → 新增 `interface HistoryState { past: unknown[]; future: unknown[]; last: unknown | null; restoring: boolean; deferCount: number; timer: ReturnType<typeof setTimeout> | null }`；`createHistoryState(): HistoryState`；`consumeDefer(state, latest): boolean`；`recordChange(state, previous, latest): void`；`flushChange(state, latest): boolean`；`undoPeek(state): unknown | null`；`redoPeek(state): unknown | null`；`resetHistory(state, clearTimer: (timer) => void): void`。\n- **storage.ts（5→0）**：TS7006×5（`key`/`fallback`/`key`/`value`/`key`）。\n  → `import type { D3dProject } from './d3dPersistence.ts'`；`readJson(key: string, fallback: unknown = null)`；`writeJson(key: string, value: unknown): boolean`（工程键分支 `d3dPersistence.writeProject(key, value as D3dProject)` 收窄，附注释说明合同）；`removeKey(key: string): boolean`。\n\n### 验证结果\n- **strict-report（逐文件）**：8 个文件全部 `0 处 / 无隐式 any` ✅（已重跑确认）。\n- **type-check**：退出码非 0，但所有报错均位于**其它 director3d 文件**（`App.tsx` 相机字面量联合、`Viewport.tsx` 找不到 `ProjectLighting`、`models.tsx` `setPointerCapture on EventTarget`、`depth.tsx` `Float32Array` buffer、`project.ts:1166` `ProjectShot` 缺属性）。**我编辑的 8 个文件（含 history.ts / storage.ts）均未出现在错误列表中** → 本次改动未引入新错。`App.tsx:1661`、`Viewport.tsx:243/247` 的 `unknown` 报错经核查为既有（track / node-data 松散类型），与本次无关。\n- **lint**：8 文件 `read_lints` 均 0。\n- 未编辑 `project.ts` / `tracks.ts` / `rig.ts` / `d3dPersistence.ts`（history.ts、storage.ts 按授权已改）。\n- 白名单：未把 `director3d` 加进 `scripts/strict-src-whitelist.json`（该目录仍有 700+ 错误，按 handoff 应最后单独排期，不应提前收口）。\n\n### ⚠️ 待确认项\n1. **readJson 返回类型保留为「推断 any」**（来自 `JSON.parse` 的库内 any），未标 `unknown` —— 因为调用方 `project.ts` 的 `normalizeProjectData(data: ProjectDataInput)` 在禁改清单内，若本处标 `unknown` 会让 `project.ts:1240` 报 TS2345。建议后续在 project.ts 调用点改 `as D3dProject` / 守卫后，再把本处返回收口为 `unknown`。\n2. **history.ts 快照用 `unknown`**（undoPeek/redoPeek 返回 `unknown | null`）。当前 `App.tsx` 的 `applyProjectSnapshot(next)` 未报错（该函数参数应为 `unknown`/`any`）；若日后给 `applyProjectSnapshot` 收紧为具体工程类型，需在 App.tsx 处补 `as D3dProject` 收窄。本次未引入报错。\n3. **thumbnails.ts source** 按真实用法标 `HTMLCanvasElement`（JSDoc 虽写 `HTMLCanvasElement|ImageData`，但 `ImageData` 不在 `CanvasImageSource`、且全仓无 ImageData 调用方）。若未来真有 ImageData 源，需另开分支处理。",
+    "timestamp": "2026-09-12T12:47:13.379Z",
+    "read": true
+  },
+  {
+    "id": "msg-1789217234104-0jkifv",
+    "from": "d3d-panels2",
+    "to": "team-lead",
+    "type": "message",
+    "content": "已完成 director3d/panels 下 6 个文件的「隐式 any」清零。共修 69 处 → 全部 0。未触碰 project.ts / tracks.ts / rig.ts / storage.ts / history.ts / d3dPersistence.ts。\n\n【各文件结果】（strict-report 均 0 处 ✅）\n\n1. GlobalSettingsPanel.tsx ：22 → 0\n   - TS7031 ×12（解构 props）→ 新增 `GlobalSettingsPanelProps`，用 project.ts 的 `ProjectSettings`/`ProjectLighting` + `Dispatch<SetStateAction<ProjectLighting>>` 标注；`cameraAspect: string`；`onAspectChange: (value: string)=>void`；`onApplySettings: (settings: ProjectSettings)=>void`。\n   - TS7006 ×10：commitDuration(value:string)、updateLighting(patch: Record<string, number|string> + 内部 `patch as Partial<ProjectLighting>` 收窄给 normalizeLighting)、updateLighting 内 updater(current: ProjectLighting)、lightRange/lightColor 的 (label:string, key: keyof ProjectLighting, minimum:number, maximum:number, step:number, suffix?:string) 与 (label:string, key: keyof ProjectLighting)。\n   - 另：`const settings: ProjectSettings = projectSettings || ({} as ProjectSettings)` 保持原 `|| {}` 运行时语义。\n\n2. Sidebar.tsx ：19 → 0\n   - TS7031 ×19（SceneList 5 处 + LeftSidebar 14 处）→ 新增 `SceneListProps`/`LeftSidebarProps`。objects 用 `ProjectObject` 扩展本地 `SceneObject`(加 locked?/visible?，因 ProjectObject 索引签名不强制)；shots 用本地 `ShotSummary`（与 ShotsPanel.ShotCard 同形）透传；回调均为 `(id:string)=>void` / `()=>void` / `(id,name,commit?)=>void`、`activeShotId: string|null`。\n\n3. CameraAnglePanel.tsx ：10 → 0\n   - TS7031 ×4 → 新增 `CameraAnglePanelProps`：camera: ProjectCamera；onChange:(patch: Partial<ProjectCamera>)=>void；onClose/onLevel: ()=>void。\n   - TS7006 ×6：updateAxis(axis:number, degrees:string)、range(label:string, axis:number, minimum:number, maximum:number)。\n\n4. AssetMenu.tsx ：8 → 0\n   - TS7031 ×3 → 新增 `AssetMenuProps`：onAddPerson/onAddPrimitive: (value:string)=>void；onImport: (event: ChangeEvent<HTMLInputElement>)=>void。\n   - TS7006 ×5：onDocClick(event: MouseEvent)、onKey(event: KeyboardEvent)、pick(node: AssetNode)、enterColumn(depth:number, index:number)。\n\n5. ReferenceOverlay.tsx ：8 → 0\n   - TS7031 ×3 → 新增 `ReferenceOverlayProps`：reference: ProjectReference；onChange: Dispatch<SetStateAction<ProjectReference>>；cameraAspect?: number；children?: React.ReactNode。\n   - TS7006 ×5：update(patch: Partial<ProjectReference>)、beginDrag/moveDrag/endDrag(event: React.PointerEvent)。\n\n6. controls.tsx ：2 → 0\n   - TS7006 ×2：update(index:number, next:number)。\n\n【⚠️ 待确认 / 说明】\n- 全程未使用 any / as any / as unknown as X。仅两处使用了被 §6.10 允许的「具体收窄断言」：\n  · GlobalSettingsPanel 的 `{} as ProjectSettings`（保留原 `|| {}` 防御写法，纯类型标注不改运行时）；\n  · updateLighting 内 `patch as Partial<ProjectLighting>`（由 `Record<string, number|string>` 收窄喂给 normalizeLighting）。\n- 所有回调/字段均有明确真实类型，无需要 unknown+守卫 的拿不准项。Sidebar 的 SceneObject 扩展、CameraAnglePanel 的 onChange 形状、ReferenceOverlay/GlobalSettingsPanel 的 Dispatch<SetStateAction<…>> 均按 App.tsx 实际传值（setReference/setLighting/updateObjectById 等）对齐。\n\n【验证】\n- `node scripts/strict-report.mjs --file <各文件>`：6 个文件全部 0 处 ✅。\n- `npm run type-check`：我改的 6 个文件 **0 报错**；全仓仍 36 处报错，全部位于其它 director3d 文件（App.tsx 24、Inspector.tsx 9、Viewport.tsx 3），与本次改动无关、不在本次清零范围，按约定忽略并注明。\n- 未执行白名单登记：director3d 整个目录尚未收口（712 处），不宜单独把这几个文件加进目录级白名单；待整目录清零后再统一登记。",
+    "timestamp": "2026-09-12T12:47:14.104Z",
+    "read": true
+  },
+  {
+    "id": "resp-1789217352652-mv4bdw",
+    "from": "d3d-panels1",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1789217352557\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"d3d-panels1\",\"timestamp\":\"2026-09-12T12:49:12.652Z\"}",
+    "timestamp": "2026-09-12T12:49:12.652Z",
+    "read": false
+  },
+  {
+    "id": "resp-1789217353383-zh86fd",
+    "from": "d3d-viewport",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1789217352132\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"d3d-viewport\",\"timestamp\":\"2026-09-12T12:49:13.383Z\"}",
+    "timestamp": "2026-09-12T12:49:13.383Z",
+    "read": false
+  },
+  {
+    "id": "resp-1789217353383-e8ae82",
+    "from": "d3d-models",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1789217352337\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"d3d-models\",\"timestamp\":\"2026-09-12T12:49:13.383Z\"}",
+    "timestamp": "2026-09-12T12:49:13.383Z",
+    "read": false
+  },
+  {
+    "id": "resp-1789217353384-ax5n96",
+    "from": "d3d-app",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1789217351938\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"d3d-app\",\"timestamp\":\"2026-09-12T12:49:13.384Z\"}",
+    "timestamp": "2026-09-12T12:49:13.384Z",
+    "read": false
+  },
+  {
+    "id": "resp-1789217354650-awht0z",
+    "from": "d3d-panels2",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1789217352799\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"d3d-panels2\",\"timestamp\":\"2026-09-12T12:49:14.650Z\"}",
+    "timestamp": "2026-09-12T12:49:14.650Z",
+    "read": false
+  },
+  {
+    "id": "resp-1789217354650-q1rfaz",
+    "from": "d3d-small",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1789217352934\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"d3d-small\",\"timestamp\":\"2026-09-12T12:49:14.650Z\"}",
+    "timestamp": "2026-09-12T12:49:14.650Z",
+    "read": false
+  },
+  {
+    "id": "timeout-1789217411941-k3g78y",
+    "from": "d3d-app",
+    "to": "team-lead",
+    "type": "message",
+    "content": "[System] Shutdown timeout: \"d3d-app\" did not acknowledge the shutdown_request (request_id=shutdown-1789217351938) within 60s and has been force-terminated.Any unreported deliverables from this teammate may have been lost.You can proceed with team_delete or continue with the remaining teammates.",
+    "timestamp": "2026-09-12T12:50:11.941Z",
+    "read": false
+  },
+  {
+    "id": "timeout-1789217412141-tljz52",
+    "from": "d3d-viewport",
+    "to": "team-lead",
+    "type": "message",
+    "content": "[System] Shutdown timeout: \"d3d-viewport\" did not acknowledge the shutdown_request (request_id=shutdown-1789217352132) within 60s and has been force-terminated.Any unreported deliverables from this teammate may have been lost.You can proceed with team_delete or continue with the remaining teammates.",
+    "timestamp": "2026-09-12T12:50:12.141Z",
+    "read": false
+  },
+  {
+    "id": "timeout-1789217412342-hn6yi8",
+    "from": "d3d-models",
+    "to": "team-lead",
+    "type": "message",
+    "content": "[System] Shutdown timeout: \"d3d-models\" did not acknowledge the shutdown_request (request_id=shutdown-1789217352337) within 60s and has been force-terminated.Any unreported deliverables from this teammate may have been lost.You can proceed with team_delete or continue with the remaining teammates.",
+    "timestamp": "2026-09-12T12:50:12.342Z",
+    "read": false
+  },
+  {
+    "id": "timeout-1789217412561-m0iw3g",
+    "from": "d3d-panels1",
+    "to": "team-lead",
+    "type": "message",
+    "content": "[System] Shutdown timeout: \"d3d-panels1\" did not acknowledge the shutdown_request (request_id=shutdown-1789217352557) within 60s and has been force-terminated.Any unreported deliverables from this teammate may have been lost.You can proceed with team_delete or continue with the remaining teammates.",
+    "timestamp": "2026-09-12T12:50:12.561Z",
+    "read": false
+  },
+  {
+    "id": "timeout-1789217412825-oidlux",
+    "from": "d3d-panels2",
+    "to": "team-lead",
+    "type": "message",
+    "content": "[System] Shutdown timeout: \"d3d-panels2\" did not acknowledge the shutdown_request (request_id=shutdown-1789217352799) within 60s and has been force-terminated.Any unreported deliverables from this teammate may have been lost.You can proceed with team_delete or continue with the remaining teammates.",
+    "timestamp": "2026-09-12T12:50:12.825Z",
+    "read": false
+  },
+  {
+    "id": "timeout-1789217412938-iwejwn",
+    "from": "d3d-small",
+    "to": "team-lead",
+    "type": "message",
+    "content": "[System] Shutdown timeout: \"d3d-small\" did not acknowledge the shutdown_request (request_id=shutdown-1789217352934) within 60s and has been force-terminated.Any unreported deliverables from this teammate may have been lost.You can proceed with team_delete or continue with the remaining teammates.",
+    "timestamp": "2026-09-12T12:50:12.938Z",
+    "read": false
+  }
+]

@@ -25,10 +25,25 @@ from datetime import datetime
 from typing import Any
 
 from ...fetch_types import FetchError, Request
+from ...rate_limit import declare as _declare_limit
+from ...rate_limit import wait as _wait_limit
 from trading_time import to_unix_seconds, trading_day
 
 _HOST = os.getenv("FUTU_OPEND_HOST", "127.0.0.1")
 _PORT = int(os.getenv("FUTU_OPEND_PORT", "11111"))
+
+# OpenD 限频（`opend.md` §3.9）：这几个族**都是 30 秒内最多 10 次**，
+# 但**各算各的桶**（自选 / 板块 / 服务器端筛互不影响）—— 所以按桶声明。
+# 节流器在 `fetch/rate_limit.py`（公共组件）；**限额数字留在源内**（承 F1：
+# 上游不该知道源的限频，更不该各自 `sleep`）。
+_declare_limit("opend:watchlist", calls=10, per_seconds=30)
+_declare_limit("opend:plate", calls=10, per_seconds=30)
+_declare_limit("opend:screen", calls=10, per_seconds=30)
+# ★ 复权因子（2026-10-07 补）：**限额数字来自实测报错原文** ——
+#   批量跑 328 只时 268 只失败，OpenD 回：
+#   「获取复权因子频率太高，请求失败，**每30秒最多60次**」。
+#   此前只在 docstring 里写了限额、**没接限流器** → 批量必炸（承 P2：声明与执行要一致）。
+_declare_limit("opend:rehab", calls=60, per_seconds=30)
 
 # K线通用字段（归一化后，承 F2）。含 time_key —— 分钟线去重/排序靠它。
 KLINE_FIELDS = ("time_key", "date", "open", "high", "low", "close", "volume")
@@ -241,6 +256,7 @@ class FutuSource:
             page_idx = 0
             while True:
                 req_obj = _build_screen_request(market, days, offset, PAGE_MAX)
+                _wait_limit("opend:screen")      # 承限频（`opend.md` §3.9）—— 翻页也受限
                 try:
                     ret, data = ctx.get_stock_screen(req_obj)
                 except Exception as e:  # noqa: BLE001 — 含 protobuf 版本坑，必须显形
@@ -300,7 +316,7 @@ class FutuSource:
     def fetch_rehab(self, req: Request) -> Rows:
         """取某标的的**复权因子**（每个除权除息日一行）。
 
-        `get_rehab(code)` —— 富途复权因子接口（**不吃历史 K线额度**；限频 60/30s）。
+        `get_rehab(code)` —— 复权因子接口（**不吃历史 K线额度**；限频 60/30s）。
         每行含各类公司行动 + 复权因子：
           `forward_adj_factorA/B`（前复权）、`backward_adj_factorA/B`（后复权）、
           `split_ratio` / `per_cash_div` / `bonus_*` 等。
@@ -310,6 +326,7 @@ class FutuSource:
         ctx = _context()
         try:
             try:
+                _wait_limit("opend:rehab")       # 承限频（60/30s）—— 批量跑必炸，见声明处
                 ret, data = ctx.get_rehab(_code(req.symbol))
             except (ValueError, TypeError) as e:
                 raise FetchError(
@@ -350,6 +367,7 @@ class FutuSource:
             rows = []
             for g in groups.to_dict("records"):
                 gname = g["group_name"]
+                _wait_limit("opend:watchlist")   # 承限频（`opend.md` §3.9）
                 r2, lst = ctx.get_user_security(group_name=gname)
                 if r2 != _ret_ok():
                     raise FetchError(f"取数失败（自选组 {gname}）：{lst}")
@@ -361,6 +379,81 @@ class FutuSource:
                                  "name": s.get("name")})
             return Rows(symbol="WATCHLIST", fetched_at=datetime.now(),
                         rows=rows, extra={"groups": len(groups)})
+        finally:
+            _close(ctx)
+
+    # ── 板块（概念 / 行业）—— 一揽子股票（**不吃额度**）─────────────────
+    # 吸收自参照项目 `fetch/opend/plates.py`。三条要点：
+    #   · 板块 = 一揽子股票的集合，**概念与行业不该区别对待**；
+    #   · 拿到成分股后，把板块名当行业名喂 `engine.industry.industry_stats` 即可（一行不改）；
+    #   · 成分股**变化很慢** —— 不必天天拉（见 `pipeline.run_plates`）。
+
+    def fetch_plate_list(self, req: Request, *, market: str = "US",
+                         plate_type: str = "CONCEPT") -> Rows:
+        """某市场的**板块名册**（`get_plate_list`）。
+
+        `plate_type`：`CONCEPT`（概念）/ `INDUSTRY`（行业）—— 富途的两种板块。
+        行：`{symbol, name, plate_type}`（**剥市场前缀**，承 X4）。
+        """
+        ctx = _context()
+        try:
+            _wait_limit("opend:plate")           # 承限频（`opend.md` §3.9）
+            try:
+                ret, data = ctx.get_plate_list(market, plate_type)
+            except (ValueError, TypeError) as e:
+                raise FetchError(f"取数失败（板块名册）：OpenD 未就绪（{e}）") from e
+            if ret != _ret_ok():
+                raise FetchError(f"取数失败（板块名册 {market}/{plate_type}）：{data}")
+            rows = []
+            for r in data.to_dict("records"):
+                code = r.get("code")
+                if not code:
+                    continue
+                rows.append({"symbol": _strip(code),
+                             "name": r.get("plate_name"),
+                             "plate_type": plate_type})
+            if not rows:
+                raise FetchError(
+                    f"取数失败（板块名册 {market}/{plate_type}）：空结果（承 F4）"
+                )
+            return Rows(symbol="PLATES", fetched_at=datetime.now(), rows=rows,
+                        extra={"market": market, "plate_type": plate_type,
+                               "count": len(rows)})
+        finally:
+            _close(ctx)
+
+    def fetch_plate_members(self, req: Request) -> Rows:
+        """一个板块的**成分股**（`get_plate_stock`，**一次返回全部**，SDK 不分页）。
+
+        `req.symbol` = 板块**纯代码**（如 `LIST23925`）。
+        行：`{symbol, name, stock_type}`（剥前缀承 X4；`stock_type` 原样带出，承 P2 不丢）。
+        """
+        ctx = _context()
+        try:
+            _wait_limit("opend:plate")           # 承限频（`opend.md` §3.9）
+            plate_code = _code(req.symbol)
+            try:
+                ret, data = ctx.get_plate_stock(plate_code)
+            except (ValueError, TypeError) as e:
+                raise FetchError(
+                    f"取数失败（板块成分股 {req.symbol}）：OpenD 未就绪（{e}）"
+                ) from e
+            if ret != _ret_ok():
+                raise FetchError(f"取数失败（板块成分股 {req.symbol}）：{data}")
+            rows = []
+            for r in data.to_dict("records"):
+                code = r.get("code")
+                if not code:
+                    continue
+                rows.append({"symbol": _strip(code),
+                             "name": r.get("stock_name"),
+                             "stock_type": r.get("stock_type")})
+            if not rows:
+                raise FetchError(
+                    f"取数失败（板块成分股 {req.symbol}）：空结果（承 F4）"
+                )
+            return Rows(symbol=req.symbol.upper(), fetched_at=datetime.now(),
+                        rows=rows, extra={"count": len(rows)})
         finally:
             _close(ctx)
 

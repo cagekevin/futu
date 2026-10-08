@@ -134,6 +134,36 @@ def test_opend_fails_loudly_when_down_or_ok():
         assert r.rows
 
 
+def test_opend_rate_limit_buckets_declared():
+    """★ 承 P2：OpenD 的限频桶必须**显式声明**（`opend:rehab` 曾漏）。
+
+    根因（2026-10-07 实测）：`fetch_rehab` 的 docstring 写了「限频 60/30s」，
+    但**没接限流器** —— 批量跑 328 只时 268 只被打回，OpenD 回：
+    「获取复权因子频率太高，请求失败，**每30秒最多60次**」。
+    """
+    from fetch.rate_limit import declared_buckets  # noqa: PLC0415
+
+    buckets = declared_buckets()
+    for name in ("opend:watchlist", "opend:plate", "opend:screen", "opend:rehab"):
+        assert name in buckets, f"限频桶未声明：{name}"
+
+
+def test_rehab_actually_waits_on_its_bucket():
+    """★ 阳性对照：光"声明了"不够 —— 源码里**必须真的 `wait`**。
+
+    本次的 bug 恰恰是"声明（docstring）了但没执行"，
+    所以只测"桶已声明"会漏掉它，必须查 `fetch_rehab` 的源码。
+    """
+    import inspect  # noqa: PLC0415
+
+    from fetch.sources.futu import opend_source  # noqa: PLC0415
+
+    src = inspect.getsource(opend_source.FutuSource.fetch_rehab)
+    assert '_wait_limit("opend:rehab")' in src, (
+        "fetch_rehab 必须在调 ctx.get_rehab 前 wait 自己的桶（承 P2：声明与执行要一致）"
+    )
+
+
 if __name__ == "__main__":
     import traceback
 

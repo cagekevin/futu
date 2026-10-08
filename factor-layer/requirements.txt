@@ -1,0 +1,16 @@
+# trading-desk — 截面因子层依赖
+# Python 3.12
+#
+# ⚠️ 本层**独立 venv**（不复用 data-layer 的）——
+#    承 PRD §7.2：本层只依赖 data-layer 的**契约**（provide.cli 的 JSON），
+#    不依赖它的模块命名空间与依赖树（同 `backtest/data_source.py` 的判据）。
+#
+# 只装真正用到的：
+#   · 截面运算（逐日标准化 / 逐日 OLS 取残差）→ pandas + numpy
+#   · IC 的 t 检验 p 值（t 分布 CDF）→ scipy
+#     ⚠️ 为什么不用正态近似：IC 序列的有效天数常在 60–250 天量级，
+#        此时 t 分布与正态的尾部差异**不可忽略**（n=60 时 5% 分位差 ~4%）。
+#        按「准确性 > 复杂度」判据，加一个依赖换正确的 p 值。
+pandas>=3.0
+numpy>=2.0
+scipy>=1.14

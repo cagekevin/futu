@@ -28,6 +28,8 @@ from typing import Any
 import requests
 
 from ...fetch_types import FetchError, Request
+from ...rate_limit import declare as _declare_limit
+from ...rate_limit import wait as _wait_limit
 from trading_time import to_unix_seconds
 
 # ── 常量：全部来自端方源码，不自己发明 ──────────────────────────────────
@@ -43,6 +45,10 @@ _LIMIT_EXTRA_WAIT_MS = 1000                            # futu-client.mjs:82 (+10
 _NUM_MAX = 370                                         # kline.mjs:102 (num: 370)
 _MAX_PAGES = 60                                        # kline.mjs:63 (MAX_PAGES)
 _GAP_MS = 700                                          # kline.mjs:61 (GAP_MS 默认 700)
+
+# 翻页间隔 → 收进公共限频器（`fetch/rate_limit.py`）：与 OpenD 那几族**同一套机制**，
+# 只是**桶不同**（`rest:kline`，与 `opend:*` 互不影响）。
+_declare_limit("rest:kline", calls=1, per_seconds=_GAP_MS / 1000)
 
 # REST history-kline 的 ktype 编号 —— **实测扫 0..30 得出的有效集合**（不是猜的）：
 #   有效：1 2 3 4 5 6 7 8 9 10 11 14 15 26 29
@@ -261,7 +267,7 @@ class FutuRestSource:
                     break
                 prev_earliest = earliest_iso
                 end = (date.fromisoformat(earliest_iso) - timedelta(days=1)).isoformat()
-            time.sleep(_GAP_MS / 1000)                     # kline.mjs:128 (GAP_MS)
+            _wait_limit("rest:kline")                      # kline.mjs:128 (GAP_MS)
 
         rows = [bars[k] for k in sorted(bars)]
         if not rows:

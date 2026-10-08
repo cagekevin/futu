@@ -16,6 +16,15 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 
+# "整市场一份"的数据（如全市场快照）标地位用的**约定代码** —— 它本身不是标的。
+UNIVERSE_SYMBOL = "UNIVERSE"
+
+# 板块代码前缀（板块编码规则，如 `LIST23925`）。
+# 板块是"一揽子股票"，**本身不是标的** —— 它的代码只出现在 `plate_members` /
+# `plate_state` 的标地位。**票池必须排除它**（否则会把"板块"当成"股票"参与比较）。
+# 这是**编码规则**，不是猜测；`plate_list`（全局项）里的代码实测全部以此开头。
+PLATE_CODE_PREFIX = "LIST"
+
 # ── 数据项受控清单（承 K3 / §6.1）────────────────────────────────────────
 #
 # 规矩：`<主体>_<属性>`，全小写蛇形；不含源名、不含用途名。
@@ -26,6 +35,9 @@ KNOWN_ITEMS: frozenset[str] = frozenset({
     "kline",            # K线（OHLCV）
     "snapshot",         # 全市场快照（本项带标的=UNIVERSE，见 UNIVERSE_SYMBOL）
     "watchlist",        # 自选清单
+    # 板块（概念 / 行业）—— 一揽子股票
+    "plate_members",    # 一个板块的成分股（标的位 = 板块代码，如 LIST23925）
+    "plate_state",      # 一个板块的集体行为 + 状态（标的位 = 板块代码）
     # 市场结构（指标）
     "spot",
     "net_gex",
@@ -47,11 +59,16 @@ KNOWN_ITEMS: frozenset[str] = frozenset({
     "rates",
     # ── 全局项（无标的，标地位为 None）──────────────────────────────
     "calendar",         # 交易日历（某市场哪天开市）★见 GLOBAL_ITEMS
+    "plate_list",       # 板块名册（代码/名字/类型）★见 GLOBAL_ITEMS
+    "industry_state",   # 行业集体行为 + 状态 ★见 GLOBAL_ITEMS
+                        # （**无标的**：行业名含中文/空格，不是合法代码）
 })
 
 # 全局数据项：键的标的位为 None（承架构确认）。**显式清单**（承 P2）。
 GLOBAL_ITEMS: frozenset[str] = frozenset({
     "calendar",
+    "plate_list",
+    "industry_state",
 })
 
 # 全局项在物理布局里的文件名前缀（标地位为空 → `_<item>.json`）。

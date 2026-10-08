@@ -21,3 +21,7 @@ build/
 # 编辑器
 .idea/
 .vscode/
+
+# 工具运行态（scripts/）
+scripts/.probe/
+scripts/.move-dir-undo.json
