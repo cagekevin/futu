@@ -1,0 +1,138 @@
+"""**规则登记** —— 治「出处写在注释里、文档手写」与「并列规则集用布尔开关」这两类错。
+
+## 为什么需要这个文件（两次真实的教训）
+
+### 教训 1：出处会漂移
+
+`rise_12m_min = 0.50`：
+
+- **代码注释**写的是「他『过去 12 个月至少涨过 50%』」⇒ **他的原文**
+- **文档**却把它算进「**我定的** 6 个阈值」
+
+⇒ 于是我在 `--free-params` 里**动了它的原文数字**，还拿它当"结论关于我的近似"的**主证据**。
+
+**根因**：出处**写了两遍**（注释一遍、文档一遍），必然漂移。
+
+### 教训 2：布尔开关表达不了"并列"
+
+我写了 `vcp_filter: bool`，于是把 **§6.1 通用条件** 与 **§7.1 VCP 条件** 当成"基础 + 附加"**连乘**：
+
+```
+16 条各自通过率相乘 = 4.0e-10  ⇒  满窗口 0.0001 个候选
+```
+
+**可他自己说得很清楚：VCP 只是三种形态里的"中间盘整"那一种** ⇒ 两套是**并列**的。
+
+**根因**：布尔开关**只能表达"加/不加"**，表达不了"**二选一**"。
+
+## 本文件的作用
+
+| 做法 | 治什么 |
+|---|---|
+| `Rule.source` 是**数据**（不是注释）| 出处只有一处 ⇒ 不可能漂移 |
+| 文档 / 表头 / `--free-params` 分组 **从 `Rule` 自动生成** | 手写的地方**全部消失** |
+| `RuleSet` 是**对象**（`BASE` / `HTF` / `VCP`…）| 跑法是"**选一个 RuleSet**"，不是"给 base 加开关" ⇒ **连乘不可能** |
+| `validate()` 强制：`原文` 必须有 `where`、`我定` 必须有 `value` | 想含糊其辞**登记不进去** |
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any, Iterator
+
+__all__ = ["Rule", "RuleSet", "Source", "render_rule_table"]
+
+
+class Source(StrEnum):
+    """这条规则的出处 —— **决定它能不能被当成"我的近似"来质疑**。"""
+
+    ORIGINAL = "原文"    # 他资料里明写的（`where` 必填）
+    INFERRED = "推断"    # 我据原文推出来的（如"盘整态看昨天"）
+    CHOSEN = "我定"      # 他确实没给（`value` 必填）
+
+
+class RuleError(ValueError):
+    """登记不合法。**宁可炸，也不让含糊的规则混进去。**"""
+
+
+@dataclass(frozen=True)
+class Rule:
+    """一条**可登记**的规则/阈值。
+
+    ⚠️ **它不负责计算** —— 计算在 `RuleSet` 对应的实现里（用 `key` 关联）。
+       本类只管"**这条规则是什么、出处在哪、单位是什么**"。
+    """
+
+    key: str
+    label: str
+    source: Source
+    unit: str                       # "bool" / "比例" / "ADR倍数" / "美元" / "倍数"
+    where: str = ""                 # 出处（`原文` 必填，例："§10.6① 行 1448"）
+    value: Any = None               # 阈值（`我定` 必填）
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        if self.source is Source.ORIGINAL and not self.where:
+            raise RuleError(
+                f"规则 {self.key!r} 标为「原文」⇒ **必须**给 `where`（出处行号）。"
+                f"承 R3：出处是数据，不许靠注释兜底")
+        if self.source is Source.CHOSEN and self.value is None:
+            raise RuleError(
+                f"规则 {self.key!r} 标为「我定」⇒ **必须**给 `value`（我定的数是多少）。"
+                f"否则报告里说不清'到底哪个数是我编的'")
+        if self.unit not in ("bool", "比例", "ADR倍数", "美元", "倍数", "百分位"):
+            raise RuleError(
+                f"规则 {self.key!r} 的 unit={self.unit!r} 不在允许清单里 —— "
+                f"承 R1：单位必须显式，不许留白")
+
+
+@dataclass(frozen=True)
+class RuleSet:
+    """**并列的一套规则**（不是"基础 + 开关"）。
+
+    ⚠️ 跑法是「**选一个 RuleSet**」——
+       不许"给 base 加 vcp 开关"，那正是把并列的连乘（见模块 docstring 教训 2）。
+    """
+
+    name: str
+    label: str
+    rules: tuple[Rule, ...] = ()
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        keys = [r.key for r in self.rules]
+        dup = {k for k in keys if keys.count(k) > 1}
+        if dup:
+            raise RuleError(f"RuleSet {self.name!r} 里 key 重复：{sorted(dup)}")
+
+    def __iter__(self) -> Iterator[Rule]:
+        return iter(self.rules)
+
+    def __len__(self) -> int:
+        return len(self.rules)
+
+    def by_source(self, source: Source) -> tuple[Rule, ...]:
+        return tuple(r for r in self.rules if r.source is source)
+
+    def summary(self) -> str:
+        n_o = len(self.by_source(Source.ORIGINAL))
+        n_i = len(self.by_source(Source.INFERRED))
+        n_c = len(self.by_source(Source.CHOSEN))
+        return (f"{self.label}：共 {len(self)} 条"
+                f"（原文 {n_o}｜推断 {n_i}｜**我定 {n_c}**）")
+
+
+def render_rule_table(rs: RuleSet) -> str:
+    """**从 `RuleSet` 生成文档表格** —— 手写的条件表全部作废。
+
+    ⇒ 出处、单位、阈值只有一处来源，**不可能漂移**（承 R3）。
+    """
+    out = [f"| # | 条件 | 出处 | 单位 | 阈值 |", "|---|---|---|---|---|"]
+    for i, r in enumerate(rs.rules, 1):
+        val = "—" if r.value is None else f"`{r.value}`"
+        where = r.where or ("—" if r.source is not Source.ORIGINAL else "⚠️缺")
+        out.append(f"| {i} | {r.label} | **{r.source.value}** {where} | "
+                   f"{r.unit} | {val} |")
+    out.append("")
+    out.append(f"> {rs.summary()}")
+    return "\n".join(out)
