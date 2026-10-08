@@ -138,6 +138,13 @@ class AccountPolicy:
     max_positions: int = 5
     max_total_exposure: float = 1.0
     cost_rate: float = backtest_config.COST_RATE
+    #: ★ **市价单在「信号日收盘」成交**（而不是次日开盘）。
+    #:
+    #: 默认 `False` = 次日开盘 —— **保守且无前视争议**。
+    #: 打开它是为了测一件要紧的事：**我们比他晚了整整一天**。
+    #: 他做的是**日内**（"开盘第一根 K 线最高点入场"），而突破策略对**那一天**极敏感。
+    #: ⇒ 用"当日收盘成交"当他的**上界近似**（比次日开盘更接近他的成交时点）。
+    trade_on_close: bool = False
 
 
 @dataclass(frozen=True)
@@ -448,10 +455,12 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
             limit = None
         valid = int(getattr(row, "valid_days", 1)) if has_valid else 1
         if limit is None:
-            valid = 1                       # 市价单只有次日一次机会
+            valid = 1                       # 市价单只有一次机会
         if valid < 1:
             raise ValueError(f"valid_days 必须 ≥ 1，收到 {valid}（{symbol} @ {day}）")
-        orders.append(_Order(symbol_idx=j, arrive=i + 1, expire=i + valid,
+        # 市价单：默认**次日开盘**；`trade_on_close` 时**当日收盘**
+        arrive = i if (limit is None and account.trade_on_close) else i + 1
+        orders.append(_Order(symbol_idx=j, arrive=arrive, expire=arrive + valid - 1,
                              stop=float(stop),
                              limit=None if limit is None else float(limit)))
     orders.sort(key=lambda o: (o.arrive, o.symbol_idx))
@@ -521,10 +530,12 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                 if i < o.expire:
                     keep.append(o)
                 continue
-            if o.limit is None:                             # 市价单：只有次日一次机会
-                if not np.isfinite(op) or op <= 0:
+            if o.limit is None:                             # 市价单：只有一次机会
+                # 默认按**开盘**；`trade_on_close` 时按**当日收盘**
+                ref = closes[i, j] if account.trade_on_close else op
+                if not np.isfinite(ref) or ref <= 0:
                     continue
-                px = float(op)
+                px = float(ref)
             else:                                           # 限价单：碰到才算
                 if not np.isfinite(lo) or not np.isfinite(op) or lo > o.limit:
                     if i < o.expire:
@@ -566,6 +577,14 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
             if not np.isfinite(cl):
                 continue
             hold = i - p.entry_bar
+
+            # ★ **收盘成交 ⇒ 成交那根 bar 不能再判出场。**
+            #   那根 bar 的 high/low **已经走完**（成交价就是它的收盘），
+            #   拿它的 low 去判止损 = **用已经过去的信息** ⇒ 当天必被打掉。
+            #   （这个 bug 是 `--free-params` 抓到的：`trade_on_close=True` 时
+            #    跑出 **−97.66%**、363 笔 —— 荒谬到一眼可见，但它确实是记账错。）
+            if hold == 0 and account.trade_on_close:
+                continue
 
             # 记录"达到过的最大 R"（供"5 天无进展"判定）
             if np.isfinite(hi):

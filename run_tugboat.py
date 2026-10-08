@@ -54,7 +54,7 @@ from factor.factor_registry import run_factor  # noqa: E402
 from panel.panel_builder import read_panel  # noqa: E402
 from panel.provide_reader import read_days, read_snapshot, read_stocks  # noqa: E402
 from strategies.tugboat_breakout import (  # noqa: E402
-    ENTER_MODES, REQUIRED_FACTORS, TugboatBreakout, TugboatExposure,
+    DEFAULTS, ENTER_MODES, REQUIRED_FACTORS, TugboatBreakout, TugboatExposure,
 )
 from trade_simulator import (  # noqa: E402
     ExitPolicy, StaticExposure, reconcile, simulate,
@@ -245,36 +245,58 @@ def _group_table(df: pd.DataFrame, by: str, *, top: int = 12) -> list[str]:
     return lines
 
 
-def _render_curve(result, bench_rets, spy_close) -> str:
-    """净值曲线（按季取样）+ **逐年表现** + R 倍数分布。"""
+def _yearly_table(result, spy_close) -> str:
+    """★ **逐年**：策略 vs SPY。
+
+    为什么把它做成**默认输出**：这是最能把"策略有本事"和"那一年行情好"
+    分开看的一栏 —— 也最能暴露「**近期持续性弱**」。
+    """
     eq = np.asarray(result.equity_values, dtype=float)
     days = list(result.equity_days)
-    out: list[str] = []
-
-    # ── 逐年：策略 vs 基准（**这是"哪一年挣的"最直接的答案**）──
-    out.append(f"  {'年份':8s}{'策略':>10s}{'基准(SPY)':>11s}{'笔数':>6s}"
-               f"{'胜率':>8s}{'总R':>9s}{'年内最大回撤':>13s}")
-    years = sorted({d[:4] for d in days})
-    trades = result.trades
-    for y in years:
+    spy = spy_close.to_numpy(dtype=float)
+    out = [f"  {'年份':8s}{'策略':>10s}{'基准(SPY)':>11s}{'笔数':>6s}"
+           f"{'胜率':>8s}{'总R':>9s}{'年内最大回撤':>13s}"]
+    for y in sorted({d[:4] for d in days}):
         idx = [i for i, d in enumerate(days) if d.startswith(y)]
         if len(idx) < 2:
             continue
         i0, i1 = idx[0], idx[-1]
         strat = eq[i1] / eq[i0] - 1.0
-        # 基准：同区间（用 SPY 收盘，与净值日对齐）
-        spy = spy_close.to_numpy(dtype=float)
         base = float("nan")
         if np.isfinite(spy[i0]) and np.isfinite(spy[i1]) and spy[i0] > 0:
             base = spy[i1] / spy[i0] - 1.0
         seg = eq[i0:i1 + 1]
         dd = float((seg / np.maximum.accumulate(seg) - 1.0).min())
-        ty = [t for t in trades if t.exit_day.startswith(y)]
+        ty = [t for t in result.trades if t.exit_day.startswith(y)]
         rs = np.array([t.r_multiple for t in ty], dtype=float)
         out.append(
             f"  {y:8s}{strat * 100:>9.2f}%{base * 100:>10.2f}%{len(ty):>6d}"
             f"{(rs > 0).mean() * 100 if rs.size else float('nan'):>7.1f}%"
             f"{rs.sum():>9.1f}{dd * 100:>12.2f}%")
+    return "\n".join(out)
+
+
+def _hold_table(result) -> str:
+    """★ **按持有天数** —— 这条最能说明"利润从哪来"。"""
+    trades = result.trades
+    rs = np.array([t.r_multiple for t in trades], dtype=float)
+    holds = np.array([t.hold_days for t in trades], dtype=float)
+    out = [f"  {'持有':10s}{'笔数':>6s}{'胜率':>8s}{'平均R':>9s}{'总R':>9s}"]
+    for lo, hi, label in ((-1, 2, "≤2 天"), (2, 5, "3–5 天"), (5, 10, "6–10 天"),
+                          (10, 20, "11–20 天"), (20, 10 ** 9, ">20 天")):
+        m = (holds > lo) & (holds <= hi)
+        if not m.any():
+            continue
+        out.append(f"  {label:10s}{int(m.sum()):>6d}{float((rs[m] > 0).mean()) * 100:>7.1f}%"
+                   f"{float(rs[m].mean()):>9.3f}{float(rs[m].sum()):>9.1f}")
+    return "\n".join(out)
+
+
+def _render_curve(result, bench_rets, spy_close) -> str:
+    """净值曲线（按季取样）+ R 倍数分布（逐年 / 持有期已进默认报告）。"""
+    eq = np.asarray(result.equity_values, dtype=float)
+    days = list(result.equity_days)
+    out: list[str] = []
 
     # ── 净值曲线（按季取样，画成柱状）──
     out.append("")
@@ -290,6 +312,7 @@ def _render_curve(result, bench_rets, spy_close) -> str:
         out.append(f"  {days[i]}  {eq[i] / 1e6:6.3f}M  {rel * 100:+7.2f}%  {bar}")
 
     # ── R 倍数分布（直方图）──
+    trades = result.trades
     rs = np.array([t.r_multiple for t in trades], dtype=float)
     out.append("")
     out.append("  R 倍数分布（每笔）")
@@ -346,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="★ 把 入场×曝险×VCP 的组合**全跑完**（一次不留尾巴）")
     ap.add_argument("--curve", action="store_true",
                     help="★ 净值曲线 + 逐年表现 + R 倍数分布")
+    ap.add_argument("--free-params", action="store_true",
+                    help="★★ **验我自创的近似**（入场时点 / 止损位 / 6 个阈值）会不会翻掉结论")
     ap.add_argument("--vcp", action="store_true",
                     help="变体：只挑 VCP 那一个形态（§7.1 六要点）")
     ap.add_argument("--no-exposure", action="store_true",
@@ -446,8 +471,85 @@ def main(argv: list[str] | None = None) -> int:
                           f"VCP={args.vcp} · 四阶段={not args.no_exposure}") + footer
     print(text)
 
+    # ★ **默认就出**这两张表 —— 它们最能把问题暴露出来，不该藏在开关后面
+    print()
+    print("  ── ★ 逐年（策略 vs SPY）──")
+    print(_yearly_table(result, spy_close))
+    print()
+    print("  ── ★ 按持有天数（利润从哪来）──")
+    print(_hold_table(result))
+    print()
+    print("  ⚠️ 逐年看很重要：某一年特别赚，往往说明那一年行情适合这类策略，")
+    print("     而不是策略本身强。**若最近一两年为负，那是最该警惕的信号。**")
+
     if args.trades:
         _dump_trades(result, args.trades)
+
+    if args.free_params:
+        # ★★ **这个测试才有意义**：验"我自创的近似"会不会把结论翻掉。
+        #
+        # 他的资料只给方向（"够紧""靠近支撑""不要太远"），**没给数字**；
+        # 他的入场是**日内**，而我们只有日线。⇒ 这些**全是我的选择**。
+        # 若结论对它们敏感 ⇒ 那结论是**关于我的近似**，不是关于**他的系统**。
+        from dataclasses import replace as _replace
+
+        def row(label: str, sp: dict, *, on_close: bool = False,
+                cap: int | None = None) -> None:
+            st = TugboatBreakout(**{**base_over, **sp})
+            c = st.candidates(panel, factors)
+            if c.empty:
+                print(f"  {label:34s}       —— 候选 0")
+                return
+            ac = _replace(account, trade_on_close=on_close,
+                          **({"max_positions": cap} if cap else {}))
+            rr = simulate(panel.dates, panel.symbols, bars, c,
+                          strategy_name=st.name, strategy_params=st.params,
+                          ma_exit_level=st.ma_exit_level(panel, factors),
+                          exit_policy=st.exit_policy, account=ac, exposure=exposure)
+            mm = trade_metrics.summarize(rr, benchmark=bench)
+            print(f"  {label:34s}{len(c):>6d}{mm['n_trades']:>6d}"
+                  f"{mm['total_return'] * 100:>9.2f}%{mm['sharpe']:>9.2f}"
+                  f"{mm['max_drawdown'] * 100:>9.2f}%{mm['expectancy_r']:>9.3f}"
+                  f"{mm['ir_stripped']:>9.2f}")
+
+        base_over = {"entry_mode": args.entry_mode, "vcp_filter": args.vcp}
+        print()
+        print("═" * 78)
+        print("★ 我自创的近似 —— 换一换，结论会不会翻？")
+        print("─" * 78)
+        print(f"  {'情形':34s}{'候选':>6s}{'笔数':>6s}{'总收益':>10s}"
+              f"{'Sharpe':>9s}{'MDD':>10s}{'每笔R':>9s}{'IR剥离':>9s}")
+        row("【基准】我的默认", {})
+
+        print("\n  ① **入场时点**（他做日内，我们只有日线）")
+        row("次日开盘（我的默认）", {})
+        row("当日收盘（更接近他的日内）", {}, on_close=True)
+
+        print("\n  ② **止损位**（他给了四个候选，我挑了一个）")
+        for b, lab in (("breakout_low", "突破那根 K 线的 low（我的默认）"),
+                       ("prior_low", "前一日 low"),
+                       ("range_bottom", "区间底部"),
+                       ("range_mid", "区间中部（原文没有，上界）")):
+            row(lab, {"stop_basis": b})
+
+        print("\n  ③ **6 个选股阈值**（他**只给方向、没给数字**）")
+        for key, vals in (("tight_range_max", (0.04, 0.06, 0.09)),
+                          ("ma_converge_max", (0.01, 0.02, 0.04)),
+                          ("near_ma_max_atr", (0.5, 1.0, 2.0)),
+                          ("rise_12m_min", (0.30, 0.50, 0.80)),
+                          ("no_dump_adr", (1.5, 2.0, 3.0)),
+                          ("overextend_max", (0.10, 0.15, 0.25))):
+            for v in vals:
+                mark = "  ←默认" if abs(v - DEFAULTS[key]) < 1e-12 else ""
+                row(f"{key} = {v}{mark}", {key: v})
+
+        print("─" * 78)
+        print("  ★ 怎么读这张表：")
+        print("     · 若**换一换就翻**（正负/量级大变）⇒ 结论是**关于我的近似**的，")
+        print("       不是关于**他的系统**的 ⇒ 那个负结论**不能算数**。")
+        print("     · 若**换一换都差不多**（都在 0 附近、IR 剥离都为负）⇒")
+        print("       结论**稳健** ⇒ 可以归因到系统本身。")
+        return 0
 
     if args.curve:
         print()

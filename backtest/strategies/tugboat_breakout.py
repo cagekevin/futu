@@ -154,6 +154,8 @@ DEFAULTS: Mapping[str, Any] = {
     "entry_mode": ENTER_BREAKOUT,    # 他的三种之①（②③ 见 `ENTER_MODES`）
     "pullback_days": 2,              # 他入场②：「**当天或第二天**，超过两天没回撤 ⇒ 放弃」
     "anticipate_days": 5,            # ⚠️ 入场③ 的挂单有效期 —— **原文没给**，我取紧区间长度
+    # 止损位取他**四个候选**里的哪一个（见 `_stop_series` 的说明）
+    "stop_basis": "breakout_low",
     # ── 止损宽度（B4）──
     # ⚠️ **默认 `None` = 不设宽度上限** —— 这是一个**做不到**的显形，不是省略：
     #
@@ -222,30 +224,41 @@ class TugboatBreakout:
         high, low = panel.field("high"), panel.field("low")
         return (high.shift(1).rolling(n).max(), low.shift(1).rolling(n).min())
 
-    @staticmethod
-    def _stop_series(panel) -> pd.DataFrame:
-        """止损位 —— **他四个候选里的第一个**：「**确认突破那根 K 线的底部**」。
+    def _stop_series(self, panel) -> pd.DataFrame:
+        """止损位 —— 他给了**四个候选**（§6.1 行 526），这里四个都能跑。
 
-        ## ★ 为什么不是"区间底部"（我先选错了，如实记录）
+        | `stop_basis` | 含义 |
+        |---|---|
+        | **`breakout_low`（默认）** | 「**确认突破那根 K 线的底部**」= 信号日的 `low` |
+        | `prior_low` | 「**前一日低点**」|
+        | `range_bottom` | 「**区间底部**」= 紧区间内的最低 `low` |
+        | `range_mid` | ⚠️ 原文没有，加它是当**上界**（更紧的止损 = 更高赔率）|
 
-        他给的四个候选（§6.1 行 526）：
-        「确认突破那根 K 线的底部 / 当日低点 / 前一日低点 / **区间底部**」，
-        并另说「**止损尽量不大于 1 个 ADR**」。
+        ## ★ 为什么默认取 `breakout_low`（我先选错了，如实记录）
 
-        我第一版选了**区间底部**，理由是"更保守"。**那是错的**：
+        第一版我选了**区间底部**，理由是"更保守"。**那是错的**：
 
         > 紧密盘整（T1 要求 5 日区间 ≤6%）的票 **ADR 只有 2–3%**，
         > 而区间底部离突破点 ≈ 区间高度（**≈6%**）⇒ 止损 ≈ **3–4 个 ADR**，
         > **远超他明说的「≤1 个 ADR」**。
 
-        ⇒ **「≤1 个 ADR」这句话本身就在指认止损位**：只有**突破那根 K 线的底部**
-        （≈ 当日振幅 ≈ 1 ADR）才符合。
-        **把止损放宽不是"保守"，是偏离他的规则** —— 而偏离之后，
-        整个"窄止损换高赔率"的机制就没了（那是他系统的核心，§2.1）。
-
-        （实测佐证：用区间底部时，止损宽度这一条把 299 个候选砍到 **1** 个。）
+        ⇒ **「≤1 个 ADR」这句话本身就在指认止损位**。
+        实测佐证：用区间底部时，"止损宽度 ≤2×ADR"这一条把 299 个候选砍到 **1** 个。
         """
-        return panel.field("low")
+        basis = self.params["stop_basis"]
+        low = panel.field("low")
+        if basis == "breakout_low":
+            return low
+        if basis == "prior_low":
+            return low.shift(1)
+        prior_hi, prior_lo = self._range_edges(panel)
+        if basis == "range_bottom":
+            return prior_lo
+        if basis == "range_mid":
+            return (prior_hi + prior_lo) / 2.0
+        raise ValueError(
+            f"未知 stop_basis={basis!r}（可用：breakout_low / prior_low / "
+            f"range_bottom / range_mid）—— 承 P1：不静默兜底")
 
     def _masks(self, panel, factors: Mapping[str, pd.DataFrame],
                ) -> list[tuple[str, pd.DataFrame]]:
