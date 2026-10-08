@@ -49,6 +49,7 @@ import pandas as pd  # noqa: E402
 
 import backtest_config  # noqa: E402
 import factor.implementations  # noqa: E402
+import plateau  # noqa: E402
 import random_control  # noqa: E402
 import statistics as _stats  # noqa: E402
 import trade_metrics  # noqa: E402
@@ -511,6 +512,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="★ 净值曲线 + 逐年表现 + R 倍数分布")
     ap.add_argument("--free-params", action="store_true",
                     help="★★ **验我自创的近似**（入场时点 / 止损位 / 6 个阈值）会不会翻掉结论")
+    ap.add_argument("--plateau", action="store_true",
+                    help="★ **邻域稳定性**：扫一条参数轴，看「最好」是尖峰还是平台")
+    ap.add_argument("--plateau-metric", default="expectancy_r",
+                    help="看哪个指标（默认 expectancy_r）")
     ap.add_argument("--bh", action="store_true",
                     help="★ **多重检验校正**（BH）—— 同一数据上跑 N 个变体，必须报分母")
     ap.add_argument("--bh-alpha", type=float, default=0.05,
@@ -715,6 +720,61 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.trades:
         _dump_trades(result, args.trades)
+
+    if args.plateau:
+        # ★ **小样本下唯一能做的过拟合检验**：看「最好」的点周围是尖峰还是平台。
+        #
+        #   为什么不做 IS/OOS：实测 **29 笔**，切完每边 ~14 笔 ⇒ 那个「排名」是纯噪声。
+        #   （我第一版硬跑了 IS/OOS，**方向错了**，已删。）
+        #
+        #   ★★ 关键设计：**参数属于哪个对象，必须显式声明** ——
+        #      策略参数影响**候选**；`target_r` 属于**出场规则**；
+        #      `max_total_exposure` 属于**账户**。
+        #      混为一谈会让「改参数」变成空操作（第一版就是这么错的：
+        #      五行数值一模一样，看起来像「参数没影响」）。
+        from dataclasses import replace as _r4
+
+        axes: dict[str, tuple[str, tuple]] = {
+            "tight_range_max": ("strategy", (0.03, 0.045, 0.06, 0.075, 0.09)),
+            "stop_width_adr": ("strategy", (1.0, 1.25, 1.5, 2.0, 3.0)),
+            "target_r": ("exit", (2.0, 3.0, 4.0, 5.0, 6.0)),
+            "max_total_exposure": ("account", (0.5, 0.75, 1.0, 1.5, 2.0)),
+        }
+
+        def _build(params, _w):
+            # 只有「策略参数」才需要重算候选（其余三类候选不变）
+            prm = params if _w == "strategy" else {}
+            st = TugboatBreakout(entry_mode=args.entry_mode,
+                                 **{k: v for k, v in prm.items()
+                                    if k in DEFAULTS})
+            return st.candidates(panel, factors)
+
+        def _sim(candidates, params, _w):
+            key, val = next(iter(params.items()))
+            sparams = params if _w == "strategy" else {}
+            st = TugboatBreakout(entry_mode=args.entry_mode,
+                                 **{k: v for k, v in sparams.items()
+                                    if k in DEFAULTS})
+            ep, ac = strategy.exit_policy, account
+            if _w == "exit":
+                ep = _r4(ep, **{key: float(val)})
+            elif _w == "account":
+                ac = _r4(ac, **{key: float(val)})
+            return simulate(panel.dates, panel.symbols, bars, candidates,
+                            strategy_name=st.name, strategy_params=st.params,
+                            ma_exit_level=st.ma_exit_level(panel, factors),
+                            exit_policy=ep, account=ac, exposure=exposure)
+
+        for _name, (_where, _vals) in axes.items():
+            _res = plateau.scan(
+                _name, _vals,
+                build_candidates=lambda prm, w=_where: _build(prm, w),
+                simulate=lambda candidates, params, w=_where: _sim(candidates, params, w),
+                summarize=lambda r, benchmark=None: trade_metrics.summarize(
+                    r, benchmark=None),
+                metric=args.plateau_metric)
+            print(plateau.render_plateau(_res))
+        return 0
 
     if args.bh:
         # ★★ **多重检验校正**（复审第 2 条后半）。
