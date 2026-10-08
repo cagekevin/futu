@@ -1,6 +1,6 @@
 """M3 因子 —— `FactorSpec`（元信息）+ `FactorName`（命名规范）。
 
-## `FactorSpec` 六要素（承 A3：**必填、无默认**）
+## `FactorSpec` 七要素（承 A3：**必填、无默认**）
 
 | 要素 | 含义 | 缺了会怎样 |
 |---|---|---|
@@ -10,6 +10,24 @@
 | `frequency` | 频率 | 换周期时口径不明 |
 | `adjust` | 复权口径 | **除权日假跳变**（承 A3 / backtest D5、D8）|
 | `direction` | 先验看多方向 | 单调性符号错 → **有效因子被误判**（承 J5）|
+| **`role`** | **用途**（`alpha` / `screening`）| **筛选原料被当成 alpha 评估** → 产出一批假阳性（见下）|
+
+## ★ `role` 为什么必须有（2026-10-08 追加，PRD 01 的契约变更）
+
+本层后来要接**技术指标**（RSI / ATR / 均线值…）供筛选规则消费。
+但它们**不是同一类东西**：
+
+| role | 是什么 | 排序它有意义吗 | 拿去算 IC |
+|---|---|---|---|
+| **`alpha`** | **可独立评估的因子**（`ret20` / `ret60` / `vol20`…）| ✅ 有 | ✅ 应该评 |
+| **`screening`** | **筛选原料**（`rsi14` / `atr14` / `ema20` / `sma200`…）| ❌ **均线是价格的平滑，排序它 = 排序价格** | ❌ **会得到"显著有效"的假阳性**（价格本身有趋势）|
+
+⇒ 若不区分：评估脚本会把 `ema20` 当 alpha 跑，报告里冒出一堆
+「均线因子显著有效」——**这正是要防的"数字看着漂亮"**。
+
+⇒ **纪律**：**`run_factor` / 评估 / 报告默认只跑 `alpha`**；
+   `screening` 因子**只允许被选择规则（R1）消费**。
+   （`available_factors()` 保留全量；过滤由调用方显式声明 —— 见 `factor_registry.alpha_factors()`）
 
 ## `direction` 的语义（**先验**，不是结论）
 
@@ -39,6 +57,7 @@ from panel.panel_types import ADJUST_MODES
 __all__ = [
     "FactorSpec", "FactorName",
     "DIRECTION_LONG", "DIRECTION_SHORT", "DIRECTIONS",
+    "ROLE_ALPHA", "ROLE_SCREENING", "ROLES",
     "STANDARDIZED_PREFIX", "NEUTRALIZED_PREFIX",
 ]
 
@@ -47,6 +66,13 @@ DIRECTION_LONG = 1
 #: 看空方向：值越小越看多。
 DIRECTION_SHORT = -1
 DIRECTIONS = (DIRECTION_LONG, DIRECTION_SHORT)
+
+#: **可独立评估的因子** —— 排序它有意义，应该拿去算 IC。
+ROLE_ALPHA = "alpha"
+#: **筛选原料** —— 供选择规则消费；排序它无意义（均线 = 价格的平滑），
+#: 拿去算 IC 会产出假阳性。**不参与因子评估**。
+ROLE_SCREENING = "screening"
+ROLES = (ROLE_ALPHA, ROLE_SCREENING)
 
 #: 标准化后的因子名前缀（M4 产出）。
 STANDARDIZED_PREFIX = "z_"
@@ -58,7 +84,7 @@ _FREQUENCIES = ("1d",)
 
 @dataclass(frozen=True)
 class FactorSpec:
-    """因子元信息（六要素，**全部必填、无默认** —— 承 A3）。
+    """因子元信息（**七要素**，全部必填、无默认 —— 承 A3）。
 
     ⚠️ **构造时校验**（承 M4-T4 的同一判据）：非法参数在**构造时**报错，
        不等到运行时 —— 早报错 = 早发现 = 少返工。
@@ -70,6 +96,9 @@ class FactorSpec:
     frequency: str
     adjust: str
     direction: int
+    #: 用途（`ROLE_ALPHA` / `ROLE_SCREENING`）—— 见模块 docstring 的「role 为什么必须有」。
+    #: **必填无默认**：默认成 `alpha` 会让"筛选原料"悄悄混进评估（正是要防的）。
+    role: str
 
     def __post_init__(self) -> None:
         if not self.name or not isinstance(self.name, str):
@@ -107,6 +136,12 @@ class FactorSpec:
             raise ValueError(
                 f"因子 {self.name!r} 的 `direction` 非法：{self.direction!r}"
                 f"（可选 {DIRECTIONS}）"
+            )
+        if self.role not in ROLES:
+            raise ValueError(
+                f"因子 {self.name!r} 的 `role` 非法：{self.role!r}"
+                f"（可选 {ROLES}；**无默认** —— 承 A3：默认成 `{ROLE_ALPHA}` "
+                f"会让筛选原料悄悄混进因子评估）"
             )
 
 

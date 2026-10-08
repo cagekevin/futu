@@ -197,6 +197,9 @@ def judge_batch(entries: Sequence[JudgeEntry], *,
 
     ⚠️ 承 J3：每条输出**必含** `n_tests` 与校正后 p 值 —— 没有这两个数，
        "显著"是无法被复核的。
+
+    ⚠️ **第 4 条门槛（2026-10-08 审计补）**：扣成本后年化收益 ≥
+       `min_net_annual_return`。前三门只判"是不是真的"，不判"值不值得做"。
     """
     entries = list(entries)
     n_tests = len(entries)
@@ -211,11 +214,15 @@ def judge_batch(entries: Sequence[JudgeEntry], *,
     out: list[dict[str, Any]] = []
     for index, entry in enumerate(entries):
         bh_ok = passed.get(index, False)
+        cost = entry.turnover_mean * thresholds.cost_rate_per_turnover
+        net_annual = (entry.long_short_mean - cost) * thresholds.annualization_days
+        gross_annual = entry.long_short_mean * thresholds.annualization_days
         if not _testable(entry, thresholds):
             verdict = VERDICT_INSUFFICIENT
         elif (bh_ok
               and abs(entry.icir) >= thresholds.min_abs_icir
-              and abs(entry.monotonicity) >= thresholds.min_abs_monotonicity):
+              and abs(entry.monotonicity) >= thresholds.min_abs_monotonicity
+              and net_annual >= thresholds.min_net_annual_return):
             verdict = VERDICT_SIGNIFICANT
         else:
             verdict = VERDICT_NOT_SIGNIFICANT
@@ -235,5 +242,12 @@ def judge_batch(entries: Sequence[JudgeEntry], *,
             "min_abs_icir": float(thresholds.min_abs_icir),
             "monotonicity": float(entry.monotonicity),
             "min_abs_monotonicity": float(thresholds.min_abs_monotonicity),
+            # ★ 经济幅度门槛的实测值（复核用）—— 与上面四组同等待遇
+            "gross_annual_return": float(gross_annual),
+            "cost_annual_return": float(cost * thresholds.annualization_days),
+            "net_annual_return": float(net_annual),
+            "min_net_annual_return": float(thresholds.min_net_annual_return),
+            "cost_bps_per_turnover": float(thresholds.cost_bps_per_turnover),
+            "turnover_mean": float(entry.turnover_mean),
         })
     return out

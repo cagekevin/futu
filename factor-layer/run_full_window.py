@@ -13,7 +13,7 @@ import factor.implementations  # noqa: F401  —— 导入即注册
 from evaluate.evaluator import EvaluateConfig, evaluate_many
 from evaluate.judgement import JudgeThresholds
 from exposure.exposure_builder import read_exposures
-from factor.factor_registry import available_factors, run_factor
+from factor.factor_registry import alpha_factors, run_factor
 from panel.panel_builder import read_panel
 from panel.provide_reader import read_days, read_stocks
 from preprocess.preprocess_pipeline import PreprocessConfig, read_preprocessed_factor
@@ -25,8 +25,15 @@ PREPROCESS = PreprocessConfig(
 )
 EVALUATE = EvaluateConfig(
     bins=5, min_samples=30,
-    thresholds=JudgeThresholds(alpha=0.05, min_days=60,
-                               min_abs_icir=0.05, min_abs_monotonicity=0.3),
+    thresholds=JudgeThresholds(
+        alpha=0.05, min_days=60,
+        min_abs_icir=0.05, min_abs_monotonicity=0.3,
+        # ⚠️ 成本是**使用者的事实**，不是代码的默认值（承 Q4）——
+        #    这里 5bp 只是一个**示例假设**，换市场/换券商就该改它。
+        cost_bps_per_turnover=5.0,
+        min_net_annual_return=0.0,     # 至少要打平
+        annualization_days=250,
+    ),
 )
 
 
@@ -45,7 +52,7 @@ def run(n_days: int | None) -> list:
     t2 = time.time()
     prepared = [read_preprocessed_factor(run_factor(name, panel), exposures,
                                          PREPROCESS)
-                for name in available_factors()]
+                for name in alpha_factors()]         # 只跑 alpha（见 factor_spec 的 role）
     t3 = time.time()
     reports = evaluate_many(prepared, panel, config=EVALUATE)
     t4 = time.time()
@@ -55,12 +62,16 @@ def run(n_days: int | None) -> list:
     for report in reports:
         stats, verdict = report.ic_stats, report.judgement
         print(f"  {report.factor_name:14s} dir={report.direction:+d} "
-              f"ICIR={stats['icir']:+.3f} 胜率={stats['ic_win_rate']:.1%} "
-              f"p={stats['p_value']:.3g} 天={stats['n_days']:4d} "
-              f"单调={report.monotonicity:+.3f} "
-              f"多空(归一)={report.log['long_short_mean_normalized']:+.5f} "
-              f"换手={report.turnover['mean']:.3f} -> {verdict['verdict']}",
+              f"ICIR={stats['icir']:+.3f} p={stats['p_value']:.3g} "
+              f"天={stats['n_days']:4d} 单调={report.monotonicity:+.3f}",
               flush=True)
+        print(f"      经济面：毛年化={verdict['gross_annual_return']:+.2%} "
+              f"成本={verdict['cost_annual_return']:.2%} "
+              f"**净年化={verdict['net_annual_return']:+.2%}** "
+              f"(换手={verdict['turnover_mean']:.3f}/日, "
+              f"成本假设={verdict['cost_bps_per_turnover']:.1f}bp)",
+              flush=True)
+        print(f"      → {verdict['verdict']}", flush=True)
     universe = reports[0].universe
     print(f"  票池诊断：n_symbols_ever={universe['n_symbols_ever']} "
           f"n_ended_early={universe['n_ended_early']} "

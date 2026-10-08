@@ -100,6 +100,21 @@ def universe_diagnostics(panel: "CrossSectionPanel") -> dict[str, Any]:
        于是 `no_symbol_ever_left` 变 `False` → **漏报**（偏向说"没问题"）。
        所以 `no_symbol_ever_left is True` 是**强信号**，
        而 `False` 只说明"至少有标的提前结束"，不保证没有幸存者偏差。
+
+    ## ⚠️ 已知限制：结果**依赖窗口**（2026-10-08 实测，尚未修）
+
+    同一个库、同一个票池，**只改窗口长度**：
+
+    | 窗口 | `n_ended_early` | `no_symbol_ever_left` |
+    |---|---|---|
+    | 4478 天（全库）| **0** | **True** |
+    | 2000 天 | **40** | **False** |
+
+    **根因**：票池本身在 2019 年前只有 16–19 只（它是**逐步长大**的），
+    窗口一变，"谁算提前结束"就跟着变 —— 而 `dates[-1]` 两者相同。
+
+    ⇒ **读这个诊断时必须同时看窗口**。`no_symbol_ever_left is False`
+    在长窗口下**不等于**"没有幸存者偏差"。
     """
     dates = [str(d) for d in panel.dates]
     if not dates:

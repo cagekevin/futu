@@ -175,15 +175,24 @@ def evaluate_many(factors: Sequence[Any], panel: CrossSectionPanel, *,
             "quantile_mean": qmean, "quantile_counts": qcounts,
             "long_short": long_short, "monotonicity": mono, "turnover": turn,
             "skipped": skipped, "ic_stats_for_judge": ic_stats,
+            # ★ 经济幅度（2026-10-08 审计补）：判决要消费它们，不只报出来。
+            "long_short_normalized_mean": (
+                float(long_short.mean()) * direction if len(long_short)
+                else float("nan")),
+            "turnover_mean": float(turn.get("mean", float("nan"))),
         })
 
     # ── ★ 一次 BH 校正**整批**（承 Q5：单个 p 做 BH 在数学上是错的）──────
+    # ⚠️ `long_short_mean` 用**归一后**的（承 J5：与 IC / 单调性同一套符号）；
+    #    `turnover_mean` 是无方向的（换手不分多空），故不归一。
     verdicts = judge_batch(
         [JudgeEntry(name=p["name"],
                     p_value=float(p["ic_stats"].get("p_value", float("nan"))),
                     icir=float(p["ic_stats"].get("icir", float("nan"))),
                     n_days=int(p["ic_stats"].get("n_days", 0)),
-                    monotonicity=float(p["monotonicity"]))
+                    monotonicity=float(p["monotonicity"]),
+                    long_short_mean=p["long_short_normalized_mean"],
+                    turnover_mean=p["turnover_mean"])
          for p in prepared],
         thresholds=config.thresholds,
     )
@@ -221,11 +230,10 @@ def evaluate_many(factors: Sequence[Any], panel: CrossSectionPanel, *,
                 #    IC / 单调性已按 `direction` 归一（承 J5），若只给原始多空，
                 #    报告里会混用两套符号约定，读者会以为算错了。
                 "long_short_mean_raw": (
-                    float(item["long_short"].mean())
-                    if len(item["long_short"]) else float("nan")),
-                "long_short_mean_normalized": (
-                    float(item["long_short"].mean()) * item["direction"]
-                    if len(item["long_short"]) else float("nan")),
+                    item["long_short_normalized_mean"] / item["direction"]
+                    if item["direction"] else float("nan")),
+                "long_short_mean_normalized": item["long_short_normalized_mean"],
+                "turnover_mean": item["turnover_mean"],
             },
         )
         if not report.has_all_required_metrics():

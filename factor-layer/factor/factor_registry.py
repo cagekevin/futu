@@ -18,7 +18,7 @@ from factor.factor_spec import FactorSpec
 from panel.panel_types import CrossSectionPanel
 
 __all__ = [
-    "register_factor", "get_factor", "available_factors",
+    "register_factor", "get_factor", "available_factors", "alpha_factors",
     "factor_inputs", "run_factor",
 ]
 
@@ -53,8 +53,30 @@ def get_factor(name: str) -> Factor:
 
 
 def available_factors() -> list[str]:
-    """已注册的因子名（升序）。"""
+    """已注册的因子名（升序，**全量**：含 `screening` 类）。
+
+    ⚠️ 想要"可以拿去评估的因子"请用 `alpha_factors()` —— 见其 docstring。
+    """
     return sorted(_FACTOR_REGISTRY)
+
+
+def alpha_factors() -> list[str]:
+    """只返回 **`alpha` 类**的因子名（升序）—— 评估 / 报告应当用这个。
+
+    ## 为什么必须区分（承 `factor_spec` 的 role 契约变更）
+
+    `screening` 类因子（`rsi14` / `atr14` / `ema20` / `sma200`…）是**筛选原料**：
+    均线是**价格的平滑**，排序它等同于排序价格本身 ——
+    拿去算 IC 会得到一大批「**显著有效**」的假阳性（因为价格有趋势）。
+
+    ⇒ **评估只跑 `alpha`；`screening` 只允许被选择规则（R1）消费。**
+    """
+    from factor.factor_spec import ROLE_ALPHA
+
+    return sorted(
+        name for name, factor in _FACTOR_REGISTRY.items()
+        if getattr(getattr(factor, "spec", None), "role", None) == ROLE_ALPHA
+    )
 
 
 def factor_inputs(spec: FactorSpec, panel: CrossSectionPanel) -> FactorInput:

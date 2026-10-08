@@ -19,7 +19,7 @@ import pandas as pd
 
 from factor.factor_protocol import FactorInput
 from factor.factor_registry import register_factor
-from factor.factor_spec import DIRECTION_LONG, FactorSpec
+from factor.factor_spec import DIRECTION_LONG, FactorSpec, ROLE_ALPHA
 
 
 class Ret60Factor:
@@ -32,6 +32,7 @@ class Ret60Factor:
         frequency="1d",
         adjust="hfq",
         direction=DIRECTION_LONG,
+        role=ROLE_ALPHA,
     )
 
     def compute(self, data: FactorInput) -> pd.DataFrame:

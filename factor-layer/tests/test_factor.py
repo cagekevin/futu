@@ -27,8 +27,8 @@ from factor.factor_registry import (  # noqa: E402
     register_factor, run_factor,
 )
 from factor.factor_spec import (  # noqa: E402
-    DIRECTION_LONG, DIRECTION_SHORT, NEUTRALIZED_PREFIX, STANDARDIZED_PREFIX,
-    FactorName, FactorSpec,
+    DIRECTION_LONG, DIRECTION_SHORT, NEUTRALIZED_PREFIX, ROLE_ALPHA,
+    STANDARDIZED_PREFIX, FactorName, FactorSpec,
 )
 from panel.panel_types import CrossSectionPanel  # noqa: E402
 
@@ -43,7 +43,16 @@ def _dates(n: int) -> list[str]:
 
 def _make_panel(*, n_days: int = 80, symbols=SYMBOLS, adjust: str | None = "hfq",
                 closes=None) -> CrossSectionPanel:
-    """构造一个面板 —— `close` 默认是 `1, 2, 3, …`（便于手算断言）。"""
+    """构造一个面板 —— `close` 默认是 `1, 2, 3, …`（便于手算断言）。
+
+    ⚠️ **夹具必须覆盖所有因子声明过的字段**，否则「遍历注册表」的测试会 `KeyError`
+       —— 那会让"加因子零改动"被**夹具**卡住，而不是被代码卡住。当前需要：
+       `close`（多数）/ `volume`（`turn20`）/ `high` + `low`（`atr*` / `adr20` / `ma_dist_*`）。
+
+    `high = close + 1`、`low = close − 1` 的取法**不是随手挑的**：
+      `close` 每日 +1 ⇒ 真实波幅 `TR = max(2, |high−prev_close|, |low−prev_close|) ≡ 2`
+      ⇒ **`ATR(14) ≡ 2.0`**，手算断言最省事。
+    """
     dates = _dates(n_days)
     frames = {}
     for symbol in symbols:
@@ -51,7 +60,16 @@ def _make_panel(*, n_days: int = 80, symbols=SYMBOLS, adjust: str | None = "hfq"
         if series is None:
             series = [float(i + 1) for i in range(n_days)]
         frames[symbol] = series
-    fields = {"close": pd.DataFrame(frames, index=dates, dtype="float64")}
+    close = pd.DataFrame(frames, index=dates, dtype="float64")
+    fields = {
+        "close": close,
+        # 高低价：让 TR 恒为 2（⇒ ATR ≡ 2.0），且 high−low = 2
+        "high": close + 1.0,
+        "low": close - 1.0,
+        # 成交量：默认**恒定**（`turn20` = volume / 基线 = 1.0，便于断言）
+        "volume": pd.DataFrame({s: [1.0] * n_days for s in symbols},
+                               index=dates, dtype="float64"),
+    }
     return CrossSectionPanel(
         dates=tuple(dates), symbols=tuple(sorted(symbols)), fields=fields,
         universe_by_day={d: tuple(sorted(symbols)) for d in dates},
@@ -115,8 +133,26 @@ def test_a1_factor_values_bind_spec():
 # ── A2 注册表制 ─────────────────────────────────────────────────────────
 
 def test_a2_first_batch_registered():
-    """A2：首批三个因子都在注册表里。"""
-    assert available_factors() == ["ret20", "ret60", "vol20"]
+    """A2：注册表的**全量清单**（20 个）。
+
+    ⚠️ 这个列表**故意写死** —— 加因子必须同时改这里，逼作者确认"确实是有意加的"，
+       而不是被某个 import 顺带注册进来（承 A2：登记是显式动作）。
+
+    构成（2026-10-08）：
+      - 收益族：`ret5` / `ret20` / `ret60` / `ret150` / `ret260`
+      - 离底族：`off_low150` / `off_low260`
+      - 矩 / 极值 / 量能：`vol20` / `skew20` / `max20` / `turn20`
+      - 技术指标（11.5 的原料）：`rsi14` / `atr14` / `atr_pct14` / `adr20`
+      - 均线距离（`screening`，条件②）：`ma_dist_ema10/20/50`、`ma_dist_sma150/200`
+    """
+    assert available_factors() == [
+        "adr20", "atr14", "atr_pct14", "daily_range_pct",
+        "ma_dist_ema10", "ma_dist_ema20", "ma_dist_ema50",
+        "ma_dist_sma150", "ma_dist_sma200",
+        "max20", "near_52w_high", "off_low150", "off_low260",
+        "range_pct10", "ret150", "ret20", "ret260", "ret5", "ret60",
+        "rs_rank", "rsi14", "skew20", "turn20", "vol20", "vol_ratio10_50",
+    ]
 
 
 def test_a2_add_factor_is_one_file_plus_one_line():
@@ -128,7 +164,8 @@ def test_a2_add_factor_is_one_file_plus_one_line():
 def test_a2_duplicate_name_raises():
     """A2：重名 → **报错**，不静默覆盖（承 P2）。"""
     spec = FactorSpec(name="ret20", inputs=("close",), min_window=1,
-                      frequency="1d", adjust="hfq", direction=DIRECTION_LONG)
+                      frequency="1d", adjust="hfq", direction=DIRECTION_LONG,
+                      role=ROLE_ALPHA)
 
     class Dup:
         pass
@@ -165,14 +202,18 @@ def test_a2_registered_factor_has_spec():
     raise AssertionError("缺 spec 应报错（承 P2）")
 
 
-# ── A3 FactorSpec 六要素必填无默认 ──────────────────────────────────────
+# ── A3 FactorSpec 七要素必填无默认 ──────────────────────────────────────
 
-def test_a3_six_fields_all_required():
-    """A3：六要素缺任一 → `TypeError`（**无默认值**）。"""
+def test_a3_seven_fields_all_required():
+    """A3：**七要素**缺任一 → `TypeError`（**无默认值**）。
+
+    `role` 是 2026-10-08 追加的第七要素（见 `factor_spec` 的契约变更说明）：
+    默认成 `alpha` 会让**筛选原料**（均线 / RSI…）悄悄混进因子评估。
+    """
     base = dict(inputs=("close",), min_window=20, frequency="1d",
-                adjust="hfq", direction=DIRECTION_LONG)
+                adjust="hfq", direction=DIRECTION_LONG, role=ROLE_ALPHA)
     for missing in ("name", "inputs", "min_window", "frequency",
-                    "adjust", "direction"):
+                    "adjust", "direction", "role"):
         kwargs = {k: v for k, v in base.items() if k != missing}
         if missing == "name":
             continue                     # `name` 是位置参数，下面单测
@@ -186,12 +227,14 @@ def test_a3_six_fields_all_required():
 def test_a3_spec_rejects_bad_values():
     """A3：非法取值在**构造时**报错（不等到运行时）。"""
     good = dict(name="x1", inputs=("close",), min_window=20,
-                frequency="1d", adjust="hfq", direction=DIRECTION_LONG)
+                frequency="1d", adjust="hfq", direction=DIRECTION_LONG,
+                role=ROLE_ALPHA)
     bad_cases = [
         {"min_window": 0}, {"min_window": -1}, {"frequency": "1h"},
         {"adjust": "raw"}, {"adjust": None}, {"direction": 0},
         {"direction": 2}, {"inputs": ()}, {"inputs": ("close", "close")},
         {"inputs": ("not an identifier",)}, {"name": ""},
+        {"role": "unknown"}, {"role": None}, {"role": "raw"},
     ]
     for patch in bad_cases:
         try:
@@ -206,7 +249,8 @@ def test_a3_original_name_cannot_use_derived_prefix():
     for bad in (f"{STANDARDIZED_PREFIX}ret20", f"{NEUTRALIZED_PREFIX}ret20"):
         try:
             FactorSpec(name=bad, inputs=("close",), min_window=1,
-                       frequency="1d", adjust="hfq", direction=DIRECTION_LONG)
+                       frequency="1d", adjust="hfq", direction=DIRECTION_LONG,
+                       role=ROLE_ALPHA)
         except ValueError as e:
             assert "前缀" in str(e)
             continue
@@ -246,11 +290,20 @@ def test_a3_positive_control_matching_adjust_passes():
 
 # ── A4 min_window 显式 + warm-up 必须是 NaN ─────────────────────────────
 
-def test_a4_warmup_is_nan_for_all_factors():
-    """★ A4：前 `min_window` 行**必须全是 NaN**（不是 0、不是常数）。"""
-    panel = _make_panel(n_days=80)
-    for name, window in (("ret20", 20), ("ret60", 60), ("vol20", 20)):
+def test_a4_warmup_is_nan_for_every_registered_factor():
+    """★ A4：**每一个已注册因子**的前 `min_window` 行都必须全是 NaN。
+
+    ⚠️ 遍历注册表（不是写死三个）—— 新加的因子**自动**受这条约束，
+       不需要有人记得来补测试（承 A2：加因子零改动）。
+    """
+    # ⚠️ 面板长度**从注册表算出来**，不写死 —— 否则加一个长窗口因子
+    #    （如 `off_low260`）就会让本测试 `iloc[260]` 越界。
+    longest = max(get_factor(n).spec.min_window for n in available_factors())
+    panel = _make_panel(n_days=longest + 5)
+    for name in available_factors():
+        spec = get_factor(name).spec
         values = run_factor(name, panel)
+        window = spec.min_window
         head = values.values.iloc[:window]
         assert bool(head.isna().to_numpy().all()), (
             f"{name} 前 {window} 行不全是 NaN —— warm-up 期垃圾值会污染 IC（承 A4）"
@@ -351,6 +404,67 @@ def test_factor_input_rejects_undeclared():
     except KeyError:
         return
     raise AssertionError("未声明字段应报错（承 A3）")
+
+
+# ── role（2026-10-08 契约变更：七要素）──────────────────────────────────
+
+def test_role_split_isolates_moving_average_distances():
+    """★ role 的分界线：**均线距离 = `screening`，其余 = `alpha`**。
+
+    ⚠️ 本用例**替换**了上一版「首批应当没有 screening 因子」的断言 ——
+       那条的**前提**（因子只有收益 / 波动类）在 2026-10-08 加入技术指标后**不再成立**。
+       留着它只会让"加了一层正确的东西"看起来像失败。
+       ⇒ 改为断言**分界本身**，并且**不依赖测试执行顺序**（只看 `ma_dist_*` 那一族）。
+    """
+    from factor.factor_registry import alpha_factors
+
+    screening = set(available_factors()) - set(alpha_factors())
+    # ① 均线距离一族**必须**在 screening 里（排序它 = 排序价格 ⇒ 不得当 alpha 评）
+    ma_like = sorted(n for n in screening if n.startswith("ma_dist_"))
+    assert ma_like == [
+        "ma_dist_ema10", "ma_dist_ema20", "ma_dist_ema50",
+        "ma_dist_sma150", "ma_dist_sma200",
+    ], ma_like
+    # ② 应有的 screening 因子**必须都在**（写死 ⇒ 加 screening 因子必须来改这里）
+    #
+    # ⚠️ 这里**故意用子集而不是全等**：注册表是**全局**的，而本条之前
+    #    `test_role_screening_is_excluded_from_alpha_factors` 会往里面塞一个
+    #    测试用的 screening 因子。用全等会让本测试**依赖执行顺序** ——
+    #    那种绿是假的绿。（反过来说：**跨测试污染注册表**是这个套件的已知代价。）
+    expected_screening = {
+        "daily_range_pct",
+        "ma_dist_ema10", "ma_dist_ema20", "ma_dist_ema50",
+        "ma_dist_sma150", "ma_dist_sma200",
+        "range_pct10", "vol_ratio10_50",
+    }
+    assert expected_screening <= screening, sorted(expected_screening - screening)
+    # ③ 反向：alpha 里**不许**出现均线距离
+    assert all(not n.startswith("ma_dist_") for n in alpha_factors())
+
+
+def test_role_screening_is_excluded_from_alpha_factors():
+    """★ `screening` 类**不得**混进 `alpha_factors()`（评估只跑 alpha）。
+
+    否则均线这类"价格的平滑"会被当成 alpha 评估 ⇒ 产出一批假阳性
+    （价格本身有趋势）—— 这正是 role 要防的。
+    """
+    from factor.factor_registry import alpha_factors
+    from factor.factor_spec import ROLE_SCREENING
+
+    name = "ztest_screening_only"
+    assert name not in available_factors()
+
+    class ScreeningOnly:
+        spec = FactorSpec(name=name, inputs=("close",), min_window=5,
+                          frequency="1d", adjust="hfq",
+                          direction=DIRECTION_LONG, role=ROLE_SCREENING)
+
+        def compute(self, data):
+            return data.field("close")
+
+    register_factor(ScreeningOnly())
+    assert name in available_factors(), "全量清单里应当有它"
+    assert name not in alpha_factors(), "screening 不该出现在 alpha 清单里"
 
 
 if __name__ == "__main__":
