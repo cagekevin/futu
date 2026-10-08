@@ -95,12 +95,39 @@ def benjamini_hochberg(pvalues: Sequence[float], *, alpha: float) -> list[bool]:
 
 @dataclass(frozen=True)
 class JudgeThresholds:
-    """判决阈值 —— **全部必填、无默认**（承 Q4 / T4 的同一判据）。"""
+    """判决阈值 —— **全部必填、无默认**（承 Q4 / T4 的同一判据）。
+
+    ## ★ 经济幅度门槛（2026-10-08 审计补）
+
+    PRD §6.4 写换手必报的理由是「IC 显著但月换手 300% 的因子**扣成本后可能为负**」——
+    但初版判决**只报了换手，从未用它**，于是：
+
+    > **一个统计显著、但扣成本后为负的因子，会被判成「显著」。**
+
+    实测（全窗口 1108 个有效日）：`z_neu_vol20` 判为 `significant`，
+    但多空日均仅 **+0.00003**、日均换手 **0.144** ⇒ 保本成本只有 **2.1 bp**
+    —— 低于真实成本即**净亏损**。
+
+    同类的还有「**单调性对线性缩放不变**」：`z_neu_ret60` 的单调性是
+    **−1.000（完美）**，而 5 个分位的平均收益全距只有 **0.00015**（1.5 bp/日）。
+    只判形状不判幅度 ⇒ 空壳因子照样过。
+
+    ⇒ 新增门槛：**扣成本后年化收益 ≥ `min_net_annual_return`**。
+
+    ⚠️ **成本假设必须显式传入**（承 Q4：口径消耗必填）——
+       我不替使用者假设交易成本，那是**他的**事实，不是代码的默认值。
+    """
 
     alpha: float
     min_days: int
     min_abs_icir: float
     min_abs_monotonicity: float
+    #: 换手 1.0 的成本（**基点**，单边）。换手按 `Σ|Δw|` 计，见 `metrics/turnover.py`。
+    cost_bps_per_turnover: float
+    #: 扣成本后年化收益的下限（如 `0.0` = 至少要打平）。
+    min_net_annual_return: float
+    #: 年化天数（美股 ~250；不同市场不同 ⇒ 必填，不写死）。
+    annualization_days: int
 
     def __post_init__(self) -> None:
         if not (isinstance(self.alpha, (int, float)) and 0 < self.alpha < 1):
@@ -109,17 +136,38 @@ class JudgeThresholds:
             raise ValueError(f"min_days 必须是 ≥2 的整数：{self.min_days!r}")
         if self.min_abs_icir < 0 or self.min_abs_monotonicity < 0:
             raise ValueError("阈值不能为负")
+        if self.cost_bps_per_turnover < 0:
+            raise ValueError(
+                f"cost_bps_per_turnover 不能为负：{self.cost_bps_per_turnover!r}"
+            )
+        if not isinstance(self.annualization_days, int) or self.annualization_days < 1:
+            raise ValueError(
+                f"annualization_days 必须是 ≥1 的整数：{self.annualization_days!r}"
+            )
+
+    @property
+    def cost_rate_per_turnover(self) -> float:
+        """成本率（小数）—— `bps / 10000`，**只在这里换算一次**。"""
+        return self.cost_bps_per_turnover / 10000.0
 
 
 @dataclass(frozen=True)
 class JudgeEntry:
-    """一个待判决的因子 —— `judge_batch` 的输入单元。"""
+    """一个待判决的因子 —— `judge_batch` 的输入单元。
+
+    ⚠️ `long_short_mean` / `turnover_mean` 是**必填**（2026-10-08 审计补）：
+       经济幅度类指标必须进入判决，否则"统计显著但净亏损"会被判成显著。
+    """
 
     name: str
     p_value: float
     icir: float
     n_days: int
     monotonicity: float
+    #: 多空组合的**日均**收益（已按 `direction` 归一，见 `evaluator.py`）。
+    long_short_mean: float
+    #: **日均**换手（`Σ|Δw|`）。
+    turnover_mean: float
 
 
 def _testable(entry: JudgeEntry, thresholds: JudgeThresholds) -> bool:
