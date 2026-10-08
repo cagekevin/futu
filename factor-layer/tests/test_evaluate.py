@@ -25,8 +25,8 @@ import pandas as pd  # noqa: E402
 from evaluate.evaluator import EvaluateConfig, evaluate, evaluate_many  # noqa: E402
 from evaluate.forward_return import ENTRY_OFFSET, TARGET_HORIZON, forward_return  # noqa: E402
 from evaluate.judgement import (  # noqa: E402
-    JudgeEntry, JudgeThresholds, VERDICT_INSUFFICIENT,
-    benjamini_hochberg, judge_batch,
+    VERDICT_INSUFFICIENT, VERDICT_NOT_SIGNIFICANT, VERDICT_SIGNIFICANT,
+    JudgeEntry, JudgeThresholds, benjamini_hochberg, judge_batch,
 )
 from evaluate.metrics.ic import ic_statistics, rank_ic_series  # noqa: E402
 from evaluate.metrics.quantile_returns import monotonicity, quantile_returns  # noqa: E402
@@ -75,10 +75,7 @@ class _FakeFactor:
 
 
 def _config(**patch) -> EvaluateConfig:
-    base = dict(bins=5, min_samples=10,
-                thresholds=JudgeThresholds(alpha=0.05, min_days=10,
-                                           min_abs_icir=0.1,
-                                           min_abs_monotonicity=0.5))
+    base = dict(bins=5, min_samples=10, thresholds=_thresholds())
     return EvaluateConfig(**{**base, **patch})
 
 
@@ -230,15 +227,26 @@ def test_j2_equal_frequency_not_equal_width():
 # ── J3 判决必过 BH + 报检验次数 ─────────────────────────────────────────
 
 def _thresholds(**patch) -> JudgeThresholds:
+    """默认：**成本 0**（让只测统计性质的用例不受经济门槛影响）+ 经济门槛 0。"""
     base = dict(alpha=0.05, min_days=10, min_abs_icir=0.1,
-                min_abs_monotonicity=0.5)
+                min_abs_monotonicity=0.5,
+                cost_bps_per_turnover=0.0, min_net_annual_return=0.0,
+                annualization_days=250)
     return JudgeThresholds(**{**base, **patch})
+
+
+def _entry(**patch) -> JudgeEntry:
+    """默认：**统计上明显显著 + 经济上明显赚钱**（只测某一维时再单独覆盖）。"""
+    base = dict(name="f", p_value=0.001, icir=0.5, n_days=100,
+                monotonicity=0.9,
+                long_short_mean=0.001,      # 日均 10bp → 年化 25%
+                turnover_mean=0.0)          # 不换手 → 无成本
+    return JudgeEntry(**{**base, **patch})
 
 
 def test_j3_judgement_reports_n_tests_and_bh():
     """★ J3：判决输出**必含** `n_tests` 与校正结果 —— 否则"显著"无法复核。"""
-    entries = [JudgeEntry(name=f"f{i}", p_value=0.001, icir=0.5,
-                          n_days=100, monotonicity=0.9) for i in range(20)]
+    entries = [_entry(name=f"f{i}") for i in range(20)]
     out = judge_batch(entries, thresholds=_thresholds())
     assert len(out) == 20
     assert all(item["n_tests"] == 20 for item in out)
@@ -254,20 +262,12 @@ def test_j3_bh_correction_actually_changes_verdict():
        而真正的 BH（一批里混着好几个接近 α 的 p）会把弱因子挡掉。
     """
     thresholds = _thresholds()
-    alone = judge_batch([JudgeEntry(name="x", p_value=0.03, icir=0.5,
-                                    n_days=100, monotonicity=0.9)],
-                        thresholds=thresholds)
+    alone = judge_batch([_entry(name="x", p_value=0.03)], thresholds=thresholds)
     assert alone[0]["p_value_bh_significant"] is True      # m=1：不校正
 
     # 一批 4 个：0.01 / 0.03 / 0.04 / 0.9 → 只有排名 1 的过（0.01 ≤ 1/4×0.05）
-    batch = [JudgeEntry(name="a", p_value=0.01, icir=0.5, n_days=100,
-                        monotonicity=0.9),
-             JudgeEntry(name="b", p_value=0.03, icir=0.5, n_days=100,
-                        monotonicity=0.9),
-             JudgeEntry(name="c", p_value=0.04, icir=0.5, n_days=100,
-                        monotonicity=0.9),
-             JudgeEntry(name="d", p_value=0.9, icir=0.5, n_days=100,
-                        monotonicity=0.9)]
+    batch = [_entry(name="a", p_value=0.01), _entry(name="b", p_value=0.03),
+             _entry(name="c", p_value=0.04), _entry(name="d", p_value=0.9)]
     out = {item["name"]: item for item in judge_batch(batch, thresholds=thresholds)}
     assert out["a"]["p_value_bh_significant"] is True
     assert out["b"]["p_value_bh_significant"] is False, (
@@ -277,10 +277,102 @@ def test_j3_bh_correction_actually_changes_verdict():
 
 def test_j3_insufficient_data_is_its_own_verdict():
     """★ J3：有效天数不足 → `insufficient_data`（**不硬判**，也不假装"不显著"）。"""
-    out = judge_batch([JudgeEntry(name="x", p_value=1e-9, icir=5.0,
-                                  n_days=3, monotonicity=1.0)],
+    out = judge_batch([_entry(name="x", p_value=1e-9, icir=5.0, n_days=3,
+                              monotonicity=1.0)],
                       thresholds=_thresholds(min_days=60))
     assert out[0]["verdict"] == VERDICT_INSUFFICIENT
+
+
+# ── ★ 经济幅度门槛（2026-10-08 审计补）──────────────────────────────────
+
+def test_economic_threshold_blocks_statistically_significant_but_unprofitable():
+    """★★ 审计核心用例：**统计显著但扣成本后亏钱 → 必须判 not_significant**。
+
+    实测背景（全窗口 1108 个有效日）：`z_neu_vol20` 的 p = 0.0056（显著）、
+    单调性 +0.600，但多空日均仅 **+0.00003**、日均换手 **0.144**
+    ⇒ 保本成本只有 **2.1 bp**，低于真实成本即净亏损。
+    初版判决**不看这两个数** ⇒ 会把它判成「显著」。
+    """
+    thresholds = _thresholds(cost_bps_per_turnover=5.0,
+                             min_net_annual_return=0.0)
+    # 统计面：**前三门全过**；经济面：日均 0.3bp、换手 0.144 ⇒ 成本 0.072bp/日 ⇒ 净负
+    entry = _entry(name="vol20_like", p_value=0.005, icir=0.20,
+                   monotonicity=0.6, long_short_mean=0.00003,
+                   turnover_mean=0.144)
+    out = judge_batch([entry], thresholds=thresholds)[0]
+    # ★ 先证明"前三门确实都过了"—— 否则这条测试可能是被别的门槛挡下的（假通过）
+    assert out["p_value_bh_significant"] is True, "统计上确实显著"
+    assert abs(out["icir"]) >= out["min_abs_icir"], "ICIR 门槛已过"
+    assert abs(out["monotonicity"]) >= out["min_abs_monotonicity"], "单调性门槛已过"
+    # ★ 唯一的差异在经济面
+    assert out["net_annual_return"] < 0, out
+    assert out["verdict"] == VERDICT_NOT_SIGNIFICANT, (
+        "扣成本后年化为负，不该判显著（承 PRD §6.4 的意图）"
+    )
+
+
+def test_economic_threshold_lets_profitable_factor_pass():
+    """★ 阳性对照：**统计面完全相同**，只有经济面变好 → 必须判 significant。
+
+    没有这条，上一条可能只是"门槛把什么都挡掉了"。
+    """
+    thresholds = _thresholds(cost_bps_per_turnover=5.0,
+                             min_net_annual_return=0.0)
+    entry = _entry(name="good", p_value=0.005, icir=0.20, monotonicity=0.6,
+                   long_short_mean=0.001, turnover_mean=0.1)   # 25%/年 − 成本
+    out = judge_batch([entry], thresholds=thresholds)[0]
+    assert out["net_annual_return"] > 0, out
+    assert out["verdict"] == VERDICT_SIGNIFICANT
+
+
+def test_economic_threshold_is_the_only_difference_between_the_two():
+    """★ 隔离性：两条用例**除经济面外逐字段相同** —— 判决差异只可能来自它。"""
+    thresholds = _thresholds(cost_bps_per_turnover=5.0, min_net_annual_return=0.0)
+    common = dict(p_value=0.005, icir=0.20, monotonicity=0.6, n_days=100)
+    bad = judge_batch([_entry(name="x", long_short_mean=0.00003,
+                              turnover_mean=0.144, **common)],
+                      thresholds=thresholds)[0]
+    good = judge_batch([_entry(name="x", long_short_mean=0.001,
+                               turnover_mean=0.144, **common)],
+                       thresholds=thresholds)[0]
+    for key in ("p_value_raw", "p_value_bh_significant", "icir",
+                "monotonicity", "n_days", "turnover_mean"):
+        assert bad[key] == good[key], f"{key} 不该有差异 —— 隔离性被破坏"
+    assert bad["verdict"] != good["verdict"], "只有经济面不同，判决必须不同"
+
+
+def test_economic_threshold_reports_gross_cost_and_net():
+    """★ 三个数都要报出来（承 J3 的同一判据：门槛的实测值必须可复核）。"""
+    thresholds = _thresholds(cost_bps_per_turnover=10.0, annualization_days=250)
+    out = judge_batch([_entry(long_short_mean=0.001, turnover_mean=0.2)],
+                      thresholds=thresholds)[0]
+    assert math.isclose(out["gross_annual_return"], 0.001 * 250, rel_tol=1e-12)
+    assert math.isclose(out["cost_annual_return"], 0.2 * 0.0010 * 250, rel_tol=1e-12)
+    assert math.isclose(out["net_annual_return"],
+                        out["gross_annual_return"] - out["cost_annual_return"],
+                        rel_tol=1e-12)
+    assert out["cost_bps_per_turnover"] == 10.0
+
+
+def test_economic_threshold_is_required_and_validated():
+    """★ Q4：成本与年化天数**必填无默认**；非法值构造时报错。"""
+    for patch in ({"cost_bps_per_turnover": -1.0}, {"annualization_days": 0}):
+        try:
+            _thresholds(**patch)
+        except ValueError:
+            continue
+        raise AssertionError(f"非法阈值应报错：{patch}")
+    for missing in ("cost_bps_per_turnover", "min_net_annual_return",
+                    "annualization_days"):
+        kwargs = dict(alpha=0.05, min_days=10, min_abs_icir=0.1,
+                      min_abs_monotonicity=0.5, cost_bps_per_turnover=1.0,
+                      min_net_annual_return=0.0, annualization_days=250)
+        kwargs.pop(missing)
+        try:
+            JudgeThresholds(**kwargs)      # type: ignore[arg-type]
+        except TypeError:
+            continue
+        raise AssertionError(f"缺 {missing} 应 TypeError（承 Q4：必填无默认）")
 
 
 def test_j3_no_bare_judgement_path():
@@ -680,10 +772,8 @@ def test_thresholds_reject_bad_values():
     """Q4：判决阈值非法 → 构造时报错。"""
     for patch in ({"alpha": 0}, {"alpha": 1}, {"min_days": 1},
                   {"min_abs_icir": -1}):
-        kwargs = dict(alpha=0.05, min_days=10, min_abs_icir=0.1,
-                      min_abs_monotonicity=0.5)
         try:
-            JudgeThresholds(**{**kwargs, **patch})
+            _thresholds(**patch)
         except ValueError:
             continue
         raise AssertionError(f"非法阈值应报错：{patch}")
@@ -701,8 +791,8 @@ def test_judge_batch_nan_p_is_insufficient_not_not_significant():
        等于把「**没证据**」说成「**证据说无效**」。两者对研究决策的含义完全不同：
        前者该补数据，后者该放弃这个因子。
     """
-    entries = [JudgeEntry(name="flat_ic", p_value=float("nan"), icir=float("nan"),
-                          n_days=100, monotonicity=float("nan"))]
+    entries = [_entry(name="flat_ic", p_value=float("nan"), icir=float("nan"),
+                      n_days=100, monotonicity=float("nan"))]
     out = judge_batch(entries, thresholds=_thresholds())
     assert out[0]["verdict"] == VERDICT_INSUFFICIENT
     assert out[0]["p_value_bh_significant"] is False
@@ -745,10 +835,8 @@ def test_has_all_required_metrics_is_structural_only():
 def test_judge_batch_untestable_entries_stay_out_of_bh_family():
     """★ Q5：无法检验的条目**不进 BH family**（否则分母虚高，把别人拖下水）。"""
     entries = [
-        JudgeEntry(name="no_p", p_value=float("nan"), icir=0.5,
-                   n_days=100, monotonicity=0.9),
-        JudgeEntry(name="ok", p_value=0.01, icir=0.5,
-                   n_days=100, monotonicity=0.9),
+        _entry(name="no_p", p_value=float("nan")),
+        _entry(name="ok", p_value=0.01),
     ]
     out = {item["name"]: item for item in judge_batch(entries, thresholds=_thresholds())}
     assert out["no_p"]["verdict"] == VERDICT_INSUFFICIENT

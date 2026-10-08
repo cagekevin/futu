@@ -6,6 +6,28 @@
 
 ---
 
+## ★★★ 如果你的任务是"做一次验证/回测"
+
+**先读这一份，别自己摸路**：
+
+> ### [`docs/流程-如何做一次验证-2026-10-08.md`](docs/流程-如何做一次验证-2026-10-08.md)
+
+它是一条**实测过的操作路径**（所有命令都在 2026-10-08 跑过）：
+先决定走「**截面随机对照**」还是「**时序回测**」（**选错层 = 白干**）→ 更新数据 → 加因子 → 写规则
+→ 跑对照 → **怎么读报告** → 以及 **9 个已经踩过的坑**（含预热吃掉窗口、
+`stocks()` 静默返回 1 只、`backtest/statistics.py` 与标准库同名等）。
+
+**核心区分（下面这页也会提到，这里再钉一次）**：
+
+| 你要回答 | 走 |
+|---|---|
+| 选股规则是不是**比随机好** | `factor-layer/evaluate/placebo/`（**截面**对照）|
+| 交易策略赚不赚钱、扛不扛得住 | `backtest/`（**时序**回测）|
+
+**两者不能互相替代** —— 形状相反，失效模式不同。
+
+---
+
 ## 0. 一句话
 
 **本仓库 = 数据层 + 截面因子层 + 回测层 + 前端，四层并列。**
@@ -21,7 +43,26 @@ trading-desk/
 
 **数据层不做 UI、不做交易、不做筛选。** 下游（回测 / 前端 / 量化 / 研究）来拿数据就用。
 
+### ★ 先读各模块的 README（不必读源码）
+
+**每个模块都有一份 `README.md`，是「读一遍就知道它能做什么」的能力清单** ——
+含**接口签名 / 约束 / 陷阱 / 边界**（包括「已声明但未接通」的缝）。
+
+| 层 | 模块 README |
+|---|---|
+| 全仓 | [`README.md`](README.md)（总索引） |
+| **data-layer** | [`README.md`](data-layer/README.md) · [`store/`](data-layer/store/README.md) · [`fetch/`](data-layer/fetch/README.md) · [`engine/`](data-layer/engine/README.md) · ★[`provide/`](data-layer/provide/README.md)（**下游必读**） |
+| **factor-layer** | [`README.md`](factor-layer/README.md) · [`panel/`](factor-layer/panel/README.md) · [`exposure/`](factor-layer/exposure/README.md) · [`factor/`](factor-layer/factor/README.md) · [`preprocess/`](factor-layer/preprocess/README.md) · [`evaluate/`](factor-layer/evaluate/README.md) |
+| **backtest** | [`README.md`](backtest/README.md) |
+
+**纪律**：**改任何模块后同步更新它的 README** —— README 是给下一个 AI 的接口契约；
+不更新它，就等于让下一个人**重读源码**。
+
 - 数据层需求：`data-layer/docs/PRD/01-底层数据-PRD-2026-10-06.md`
+- **数据层扩展立项（基本面 / 事件 / 票池）：`data-layer/docs/PRD/02-数据层扩展立项-2026-10-08.md`**
+- **存储重构设计（kline 迁列式）：`data-layer/docs/PRD/03-存储重构-PRD-2026-10-08.md`**
+  —— 含**完整读写链路** + **21 条漏洞清单** + 迁移与验收（`02-立项` §3.3 是它的上游）
+  —— **状态：立项未实施**。触发原因：factor-layer 实测**量价维度已挖尽**（7 个因子全部不显著）
 - 数据层计划：`data-layer/docs/plan/01-底层数据-plan-2026-10-06.md`（含实施记录与验收）
 - **平台资料（富途怎么用）：`data-layer/docs/reference/futu/`**
 - **回测/验证系统设计：`backtest/docs/design/01-回测与验证系统-design-2026-10-06.md`**
@@ -282,8 +323,9 @@ data-layer/
 ```bash
 cd data-layer
 
-# 跑一天（取数→计算→入库）
-.venv/bin/python pipeline.py --symbols SPX SPY QQQ IWM
+# ★ 更新数据 —— **一条命令，跑完即最新**（目标日自动取"最后一个已收盘交易日"）
+.venv/bin/python pipeline.py --daily --skip-adjust   # 日常（约 15 秒）
+.venv/bin/python pipeline.py --daily                 # 每周一次（约 3 分钟，含复权因子）
 
 # 下游取数（只用 provide）
 .venv/bin/python -m provide.cli days
@@ -292,6 +334,8 @@ cd data-layer
 # 全部测试（每次改动都该跑；以全绿为准，不写数量 —— 会漂移）
 for t in tests/test_*.py; do .venv/bin/python "$t"; done
 ```
+
+> **更新数据的细节与耗时表**：`data-layer/README.md` §7（含"为什么复权因子最慢"）。
 
 ---
 
@@ -307,6 +351,10 @@ for t in tests/test_*.py; do .venv/bin/python "$t"; done
    - 反例：`api.py` / `_types.py` / `futu.py`（看不出干什么）
    - 正例：`fetch_api.py` / `fetch_types.py` / `opend_source.py`
    - 新文件一律照此。数据源放 `fetch/sources/`（**一个平台一处**，换平台只看这里）。
+8. **★ 改模块 ⇒ 同步改它的 `README.md`**（2026-10-08 定）。
+   README = **给下一个 AI 的接口契约**（能力 / 签名 / 约束 / 陷阱 / 未接通的缝）。
+   新增接口、改变语义、接通预留参数 —— **都要落在对应 README 里**。
+   不更新 = 让下一个人重读源码 = README 失去意义。
 
 ---
 

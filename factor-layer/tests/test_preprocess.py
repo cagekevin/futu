@@ -22,7 +22,9 @@ import pandas as pd  # noqa: E402
 
 from exposure.exposure_types import ExposureSet  # noqa: E402
 from factor.factor_protocol import FactorValues  # noqa: E402
-from factor.factor_spec import DIRECTION_SHORT, FactorSpec  # noqa: E402
+from factor.factor_spec import (  # noqa: E402
+    DIRECTION_SHORT, ROLE_ALPHA, FactorSpec,
+)
 from preprocess.factor_impute import impute  # noqa: E402
 from preprocess.factor_neutralize import neutralize  # noqa: E402
 from preprocess.factor_standardize import standardize  # noqa: E402
@@ -53,7 +55,8 @@ def _config(**patch) -> PreprocessConfig:
 def _values(data=None, *, symbols=SYMBOLS, dates=(DAY,)) -> FactorValues:
     rows = data if data is not None else FACTOR
     spec = FactorSpec(name="ret20", inputs=("close",), min_window=20,
-                      frequency="1d", adjust="hfq", direction=DIRECTION_SHORT)
+                      frequency="1d", adjust="hfq", direction=DIRECTION_SHORT,
+                      role=ROLE_ALPHA)
     return FactorValues(spec=spec, values=pd.DataFrame(
         {s: [float(rows[s]) for _d in dates] for s in symbols},
         index=list(dates)))
