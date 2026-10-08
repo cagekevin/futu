@@ -107,6 +107,10 @@ class ExitPolicy:
     partial_fraction: float = 0.5
     breakeven_after_partial: bool = True
     use_ma_exit: bool = True
+    #: **是否按止损出场**。`False` = 只把止损价拿去**定仓位**（股数照算），
+    #: 但**不真的止损** —— 用于做「**有框架 vs 无框架**」的对照臂：
+    #: 同一批入场、同样的股数，唯一差别就是"有没有那套出场规则"。
+    use_stop: bool = True
     no_progress_days: int = 5
     no_progress_min_r: float = 1.0
     max_hold_days: int = 60
@@ -491,7 +495,8 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                 p.peak_r = max(p.peak_r, (hi - p.entry_price) / p.risk_per_share)
 
             # ① 止损：★ 同一根 bar 止损与止盈都触时**判止损**（取对他不利的一侧）
-            if np.isfinite(lo) and lo <= p.stop:
+            #    `ep.use_stop=False` ⇒ 跳过（对照臂：只留仓位口径，不要出场规则）
+            if ep.use_stop and np.isfinite(lo) and lo <= p.stop:
                 px = min(p.stop, op) if np.isfinite(op) else p.stop
                 p.realized += (px - p.entry_price) * p.shares_left
                 notional = px * p.shares_left
@@ -539,6 +544,23 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                 p.took_partial = True
                 if ep.breakeven_after_partial:
                     p.stop = max(p.stop, p.entry_price)
+
+            # ②c ★ 部分止盈把**股数减到 0** ⇒ 这笔已经**平完了**，必须收尾。
+            #     ⚠️ 漏了这一步，仓位会**带着 0 股继续占着持仓位**，
+            #        一直挂到 `max_hold_days` ⇒ 后面的信号**根本进不来**。
+            #     （这个 bug 被敏感性扫描抓到：`partial_fraction=1.0` 那行
+            #      只有 26 笔、Sharpe 0.95 —— 看起来像"参数好"，其实是**没平仓**。）
+            if p.shares_left <= 1e-12:
+                trades.append(Trade(
+                    symbol=p.symbol, entry_day=p.entry_day,
+                    entry_price=p.entry_price, initial_stop=p.initial_stop,
+                    exit_day=day, exit_price=float(cl), shares=p.shares_initial,
+                    r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
+                    return_pct=(p.realized - p.cost_paid)
+                    / (p.shares_initial * p.entry_price),
+                    exit_reason=EXIT_TARGET_FINAL, hold_days=hold))
+                del positions[j]
+                continue
 
             # ③ 均线破坏（他"最后一段"的规则）
             if (ep.use_ma_exit and p.shares_left > 1e-12

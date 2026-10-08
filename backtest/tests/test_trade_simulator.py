@@ -435,6 +435,31 @@ def test_time_based_partial_takes_half_at_close() -> bool:
     return ok
 
 
+def test_full_partial_through_target_closes_the_position() -> bool:
+    """★ `partial_fraction=1.0`（到目标**全出**）⇒ 仓位必须**被平掉**。
+
+    ⚠️ 这个 bug 是**敏感性扫描**才暴露出来的：股数减到 0 之后仓位**没被删除**，
+       它带着 0 股继续占着持仓位、一直挂到 `max_hold_days` ⇒
+       **后面几十个信号根本进不来**。
+       症状极具欺骗性：那一行显示 26 笔 / Sharpe 0.95 / MDD −5.46%，
+       **看起来像"这个参数最好"**，其实是仓位没平。
+
+    这里：入场 100 / 止损 95（风险 5）/ 3R = 115。
+    d3 的 `high = 116 ≥ 115` ⇒ 应当**当天就收尾**（`target_final`），
+    而不是拖到 60 天上限。
+    """
+    bars = [(100, 100, 100, 100), (100, 100, 100, 100),
+            (100, 116, 100, 114)] + [(114, 114, 114, 114)] * 6
+    r = _run(bars, [("d1", SYM, 95.0)],
+             exit_policy=ExitPolicy(target_r=3.0, use_ma_exit=False,
+                                    partial_fraction=1.0, max_hold_days=60))
+    t = r.trades[0] if r.trades else None
+    ok = (t is not None and t.exit_reason == "target_final" and t.hold_days <= 2)
+    print(f"{'[PASS]' if ok else '[FAIL]'} 全出后仓位被平掉"
+          f"（{t.exit_reason if t else '无交易'}，持有 {t.hold_days if t else '-'} 天）")
+    return ok
+
+
 def test_static_exposure_is_the_default() -> bool:
     r = _run([(100, 100, 100, 100)] * 4, [("d1", SYM, 95.0)],
              exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=1))
