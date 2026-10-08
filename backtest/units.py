@@ -38,7 +38,10 @@ Python 没有单位系统，所以**不能靠类型**挡住它。
 """
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
+import pandas as pd
 
 __all__ = [
     "adr_multiple",
@@ -52,28 +55,51 @@ __all__ = [
 _RATIO_ABS_MAX = 5.0
 
 
-def pct_of_price(distance_dollars: float, close: float) -> float:
-    """价格距离（**美元**）→ **占股价的比例**（`0.03` = 3%）。"""
-    if close <= 0:
+def _div(a: Any, b: Any) -> Any:
+    """除法 —— 除零 / NaN **一律得 NaN**（标量与宽表都适用）。
+
+    ⚠️ 两个坑，都踩过：
+      1. `np.errstate` **只管 numpy 的告警**；`5.0 / 0.0` 这种 **Python 标量**
+         会直接抛 `ZeroDivisionError` ⇒ 要 `try`。
+      2. `if <DataFrame> <= 0` 会抛 `ValueError`（真值歧义）⇒ 判断必须**逐元素**。
+    """
+    try:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return a / b
+    except ZeroDivisionError:
         return float("nan")
-    return distance_dollars / close
 
 
-def adr_multiple(distance_dollars: float, close: float,
-                 adr_ratio: float) -> float:
+def _guard(out: Any, bad: Any) -> Any:
+    """把非法输入的位置置成 **NaN**（不是 inf）—— 标量与宽表都适用。"""
+    if isinstance(out, (pd.Series, pd.DataFrame)):
+        return out.mask(bad)
+    return float("nan") if bool(bad) else out
+
+
+def pct_of_price(distance_dollars: Any, close: Any) -> Any:
+    """价格距离（**美元**）→ **占股价的比例**（`0.03` = 3%）。
+
+    支持**标量**与 **pandas 宽表**（策略里传的是后者）。
+    """
+    return _guard(_div(distance_dollars, close), close <= 0)
+
+
+def adr_multiple(distance_dollars: Any, close: Any, adr_ratio: Any) -> Any:
     """价格距离（**美元**）→ **ADR 倍数**（无量纲）。
 
     ★ **这是"美元 → ADR 倍数"的唯一换算式。**
       他的原文口径（§10.6②）：「止损距离控制在 **1–1.5 倍 ADR** 之内」。
       `1.0` 表示"正好一个日均波幅"。
+
+    支持**标量**与 **pandas 宽表**。
     """
-    if close <= 0 or not np.isfinite(adr_ratio) or adr_ratio <= 0:
-        return float("nan")
-    return distance_dollars / close / adr_ratio
+    bad = (close <= 0) | (adr_ratio <= 0) | (~np.isfinite(adr_ratio))
+    return _guard(_div(_div(distance_dollars, close), adr_ratio), bad)
 
 
-def stop_distance_adr(entry_price: float, stop_price: float, close: float,
-                      adr_ratio: float) -> float:
+def stop_distance_adr(entry_price: Any, stop_price: Any, close: Any,
+                      adr_ratio: Any) -> Any:
     """**入场价到止损价**的距离，以 ADR 倍数计。
 
     单独一个函数（而不是让调用方自己拼）—— 因为**这是他的核心约束**，

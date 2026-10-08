@@ -108,6 +108,10 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
+import units
+from strategies.tugboat_rules import (
+    ALL_KEYS, RULESETS, check_coverage,
+)
 from trade_simulator import (
     EXIT_STOP, AccountState, ExitPolicy, ExposureSettings,
 )
@@ -135,7 +139,11 @@ DEFAULTS: Mapping[str, Any] = {
     "rise_12m_min": 0.50,            # 他「过去 12 个月至少涨过 50%」
     "no_dump_days": 3,               # ⚠️「最近几天没有高动能下跌」——天数我定
     "no_dump_adr": 2.0,              # ⚠️「高动能」的量级我定
-    "overextend_max": 0.15,          # ⚠️「不要太 Overextended」——数值我定
+    # ★ 「过度延伸」用 **§11.4 的原文口径**：距 50MA 的 **ATR 倍数**
+    #   （原文：「ATR% multiple from 50MA 超过 **10 倍 ATR** ⇒ 过度延伸」）
+    #   ⚠️ 我第一版写的是「距 50MA ≤ **15% 价格**」—— **那是另一个东西**
+    #      （ATR 倍数 vs 价格比例），单位都不对。见 `tugboat_rules.BASE`。
+    "overextend_max": 10.0,          # 单位：ATR 倍数（原文给的数）
     # ── VCP 六要点（§7.1）──
     "above_150ma": True,             # A1
     "rs_min": 0.90,                  # A2（他「90 以上」）
@@ -156,21 +164,39 @@ DEFAULTS: Mapping[str, Any] = {
     "anticipate_days": 5,            # ⚠️ 入场③ 的挂单有效期 —— **原文没给**，我取紧区间长度
     # 止损位取他**四个候选**里的哪一个（见 `_stop_series` 的说明）
     "stop_basis": "breakout_low",
-    # ── 止损宽度（B4）──
-    # ⚠️ **默认 `None` = 不设宽度上限** —— 这是一个**做不到**的显形，不是省略：
+    # ── 止损宽度（§10.6②）──
+    # ★★ **这里撤回一个结论。**
     #
-    #   他的原话是「止损**尽量不大于 1 个 ADR**」。但那条规则是**针对日内止损**的
-    #   （§6.1 入场：日内突破时买、**止损放"第一根阳线低点"**）。
-    #   我们的库里**只有日线** ⇒ 任何日线代理（突破那根 K 线的 low / 区间底部）
-    #   都比他的日内止损宽**几倍**：实测 299 个候选里只有 **3 个**落在 2×ADR 内。
+    #   我第一版写的是 `max_stop_adr: None`（不设上限），理由写的是：
+    #   「他的 ≤1 ADR 是**日内**口径，日线 low 天然宽几倍 ⇒ **日线做不到**」。
     #
-    #   ⇒ 硬套那个阈值 = **把"日内能做到的事"当成"日线必须做到的事"**，
-    #     结果是把整个系统筛空 —— 那是**假失败**，不是他的规则严格。
+    #   **那是错的，而且根因是我自己的一个 bug**：
+    #   ```python
+    #   width_ok = (close - stop) <= max_stop_adr * adr   # ✗ 美元 <= 比例
+    #   ```
+    #   左边是**美元**、右边是**比例**（`adr20` 中位 0.026）⇒ 阈值变成 **0.052 美元**
+    #   ⇒ 552 个候选只剩 **5** 个。**我把自己的量纲错读成了"日线做不到"。**
     #
-    #   ⇒ 处理：**默认不设上限**，但在报告里**报出止损宽度分布**（以 ADR 为单位），
-    #     让读者自己看"我们离他的 ≤1 ADR 有多远"。
-    #     想按某个上限跑，传 `max_stop_adr=2.0` 即可（声明为变体）。
-    "max_stop_adr": None,
+    #   正确的写法（`/close` 一次）下：
+    #     · `≤1.0×ADR` → 335 / 552 通过
+    #     · `≤1.5×ADR` → 490 / 552 通过
+    #   而**真实止损距离的中位是 0.88 倍 ADR** —— **他的规则日线完全做得到。**
+    #
+    #   ⇒ 现在默认 **1.5**（他原文「控制在 **1–1.5 倍 ADR** 之内」的上界），
+    #     且**单位换算只走 `units.stop_distance_adr()`**（结构上不可能再写错）。
+    "stop_width_adr": 1.5,
+    # ── 他的两个**选股过滤器**（第一版完全没实现）──
+    "adr_floor": 0.025,              # §10.6①「ADR% < 2.5% 直接排除」（原文）
+    # ── §7.1 VCP / §11.5 的其余阈值 ──
+    "volume_decline_max": 1.0,       # A6：缩量（`vol_ratio10_50 < 1`）
+    "rsi_change_max": 3.0,           # §11.5 条件①（RSI 3–4 日变化 < 3）
+    "atr_pct_min": 0.025,            # §11.5 条件④（ATR/收盘 > 2.5%）
+    "rsi_min": 50.0,                 # §11.5 条件⑤（RSI > 50）
+    # ── ★ 用**哪一套规则集**（并列，不是开关）──
+    #   `"base"`      = §6.1 通用条件 + §10.6① / §8.1 选股过滤器
+    #   `"vcp"`       = §7.1 VCP 六要点（**替代** base，不是叠加）
+    #   `"rsi_tight"` = §11.5 RSI 紧密盘整五条
+    "ruleset": "base",
 }
 
 #: 条件② 用到的五条均线距离（§11.5 原文口径）。
@@ -180,7 +206,9 @@ _MA_DIST = ("ma_dist_ema10", "ma_dist_ema20", "ma_dist_ema50",
 #: 本策略**需要**的因子（调用方按它取数）。
 REQUIRED_FACTORS: tuple[str, ...] = (
     "atr14", "adr20", "ret260", "rs_rank", "near_52w_high",
-    "range_pct10", "daily_range_pct", "vol_ratio10_50", *_MA_DIST,
+    "range_pct10", "daily_range_pct", "vol_ratio10_50",
+    "rsi14", "atr_pct14",                       # §11.5 那一套要用
+    *_MA_DIST,
 )
 
 
@@ -200,7 +228,19 @@ class TugboatBreakout:
         if overrides.get("entry_mode", DEFAULTS["entry_mode"]) not in ENTER_MODES:
             raise ValueError(f"entry_mode 必须是 {ENTER_MODES}")
         self.params: dict[str, Any] = {**DEFAULTS, **overrides}
+        # 兼容旧的 `vcp_filter` 布尔开关 ⇒ 映射到**并列的规则集**
+        # （布尔开关表达不了"二选一"，见 `tugboat_rules` 的教训 2）
+        if "vcp_filter" in overrides and "ruleset" not in overrides:
+            self.params["ruleset"] = "vcp" if overrides["vcp_filter"] else "base"
+        if self.params["ruleset"] not in RULESETS:
+            raise ValueError(
+                f"ruleset 必须是 {sorted(RULESETS)}，收到 {self.params['ruleset']!r}")
         self.exit_policy = exit_policy or ExitPolicy()
+
+    @property
+    def ruleset(self):
+        """当前用的那一套规则（**并列三选一**，不是 base + 开关）。"""
+        return RULESETS[self.params["ruleset"]]
 
     # ── 内部：从 `factors` 里取一张宽表（**缺就报错**，不静默兜底）──────
 
@@ -260,9 +300,25 @@ class TugboatBreakout:
             f"未知 stop_basis={basis!r}（可用：breakout_low / prior_low / "
             f"range_bottom / range_mid）—— 承 P1：不静默兜底")
 
-    def _masks(self, panel, factors: Mapping[str, pd.DataFrame],
-               ) -> list[tuple[str, pd.DataFrame]]:
-        """逐条条件的布尔掩码（**`candidates` 与 `diagnose` 共用** —— 防两处逻辑分叉）。"""
+    def _impl_masks(self, panel, factors: Mapping[str, pd.DataFrame],
+                    ) -> dict[str, pd.DataFrame]:
+        """算出**所有可能用到的**条件的掩码（**含今天**的版本，按 `key` 索引）。
+
+        ## ★ 两个刻意的设计
+
+        ### ① 「看今天 / 看昨天」**不在这里决定**
+
+        这里一律算**含今天**的版本；"看昨天"由 `Rule.as_of` 在 `_masks` 里
+        **统一** `shift(1)`。⇒ "这条看哪天"只有**一处**决定（登记表里），
+        不散在各处 `shift(1)` 里（散着写就是我出 F2 那类错的方式）。
+
+        ### ② 单位换算**只走 `units.py`**
+
+        `stop_width` 那条必须用 `units.stop_distance_adr()` ——
+        我写过一个 `(close - stop) <= max_stop_adr * adr`（**美元 ≤ 比例**），
+        把 552 个候选砍到 5 个，还**误读成"日线做不到"**。
+        ⇒ 现在唯一的换算式在 `units.py`，这里**只准调它**。
+        """
         p = self.params
         atr = self._get(factors, "atr14")
         adr = self._get(factors, "adr20")
@@ -272,137 +328,104 @@ class TugboatBreakout:
         rng = self._get(factors, "range_pct10")
         daily_rng = self._get(factors, "daily_range_pct")
         volr = self._get(factors, "vol_ratio10_50")
+        rsi = self._get(factors, "rsi14")
+        atr_pct = self._get(factors, "atr_pct14")
         ma = {n: self._get(factors, n) for n in _MA_DIST}
 
-        # `close` / `high` / `low` 用原始字段（**策略只用面板字段做"区间"这类几何量**）
         close, high_f, low_f = (panel.field("close"), panel.field("high"),
                                 panel.field("low"))
-
-        # ── T1：紧区间（★ **不含今天** —— 否则"突破"被算进"紧"里，自相矛盾）──
-        prior_hi, prior_lo = self._range_edges(panel)
-        prior_close = close.shift(1)
-        tight = (prior_hi - prior_lo) / prior_close <= float(p["tight_range_max"])
         stop = self._stop_series(panel)
 
-        # ── T2：均线平行**且收拢** ──
+        def wide(x) -> pd.DataFrame:
+            """常量 / 标量摊成同形状的宽表（否则 `&` 会广播出意外形状）。"""
+            if isinstance(x, pd.DataFrame):
+                return x
+            return pd.DataFrame(bool(x), index=close.index, columns=close.columns)
+
+        # ── 区间几何（**含今天**；"看昨天"交给 `Rule.as_of`）──
+        n = int(p["tight_days"])
+        hi_n, lo_n = high_f.rolling(n).max(), low_f.rolling(n).min()
+
+        # ── 均线 ──
         s10, s20 = close.rolling(10).mean(), close.rolling(20).mean()
-        flat = (s10 - s20).abs() / close <= float(p["ma_converge_max"])
-        # 收拢 = 均线间距比 `tight_days` 天前更小（他「平行**或开始收拢**」的后半句）
-        converging = ((s10 - s20).abs()
-                      <= (s10 - s20).abs().shift(int(p["tight_days"])))
-        t2 = flat & converging if p["require_converging"] else flat
-
-        # ── T3 / T8：200 日线之上，且 **200MA 本身**不向下 ──
-        t3 = ma["ma_dist_sma200"] > 0
-
-        # ★ T8 曾经写错（2026-10-08 由条件对账审计抓出）：
-        #   当时写的是 `ma_dist_sma200 >= ma_dist_sma200.shift(20)` ——
-        #   可那是「**离 200MA 的距离**（ATR 归一）不下降」，**不是 200MA 不下降**：
-        #   当 200MA 在**跌**而股价在**涨**时，这个距离**照样会上升** ⇒ 条件被放行 ✗
-        #   （审计实测：56% 的格子上两者结论不同。）
-        #   ⇒ 正确做法：从因子反推出 **200MA 本身**，再跟 20 天前比。
-        atr = self._get(factors, "atr14")
+        gap = (s10 - s20).abs()
+        # ★ 从 `ma_dist_sma200` 反推 **200MA 本身**（T8 曾经比的是"距离"，是错的）
         sma200 = close - ma["ma_dist_sma200"] * atr
-        t8 = sma200 >= sma200.shift(20)
 
-        # ── T4：贴近**任一**条均线（≤1 个 ATR）──
+        # ── §11.4 口径的"过度延伸"：距 50MA 的 **ATR 倍数** ──
+        #    （`ma_dist_ema50` 本身就是 ATR 归一距离 ⇒ 直接比，不用换算）
+        #    ⚠️ 我第一版写的是"距 50MA ≤15% 价格" —— **那是另一个东西**
+        overext = ma["ma_dist_ema50"]
+
+        # ── 距最近一条均线的 ATR 距离（T4 / §11.5 条件② 共用）──
         near = ma[_MA_DIST[0]].abs()
         for name in _MA_DIST[1:]:
             near = np.minimum(near, ma[name].abs())
-        t4 = near <= float(p["near_ma_max_atr"])
 
-        # ── T5：12 个月涨过 50% ──
-        t5 = ret260 >= float(p["rise_12m_min"])
+        # ── §11.5 条件①：RSI 3–4 日变化 < 3 且累计 ≤ 5 ──
+        rsi_chg = rsi.diff(3).abs()
 
-        # ── T6：近 N 日没有"高动能下跌" ──
-        daily_ret = close / close.shift(1) - 1.0
-        worst = daily_ret.rolling(int(p["no_dump_days"])).min()
-        t6 = worst > -float(p["no_dump_adr"]) * adr
-
-        # ── T7：不要太 Overextended ──
-        t7 = (close / close.rolling(50).mean() - 1.0) <= float(p["overextend_max"])
-
-        # ── A1：150 日线之上 ──
-        a1 = ma["ma_dist_sma150"] > 0 if p["above_150ma"] else True
-
-        # ── A2 / A3 ──
-        a2 = rs >= float(p["rs_min"])
-        a3 = near_high >= float(p["near_high_min"])
-
-        # ── A4：波幅**收缩 ≥3 次**（在同一条因子上取三个递减检查点）──
+        # ── VCP「收缩 ≥3 次」：在同一条因子上取 k 个递减检查点 ──
         step = int(p["contraction_step"])
         k = int(p["contractions_min"])
         shrinking = pd.DataFrame(True, index=rng.index, columns=rng.columns)
-        for i in range(k - 1):
-            shrinking &= rng.shift(i * step) < rng.shift((i + 1) * step)
+        for t in range(k - 1):
+            shrinking &= rng.shift(t * step) < rng.shift((t + 1) * step)
 
-        # ── A5：收缩到最后"股价波动 < 1%" = **当日振幅** ≤ 1%（见模块 docstring 的读法说明）──
-        #     A6：配合成交量下跌 ──
-        a5 = daily_rng <= float(p["final_range_max"])
-        a6 = (volr < 1.0) if p["require_volume_decline"] else True
+        lb = int(p["breakout_lookback"])
 
-        # ── 突破触发（他的方式①）──
-        lookback = int(p["breakout_lookback"])
-        breakout = close > high_f.shift(1).rolling(lookback).max()
+        return {
+            # ── §6.1 通用条件 ──
+            "tight_range": (hi_n - lo_n) / close <= float(p["tight_range_max"]),
+            "ma_converge": (gap / close <= float(p["ma_converge_max"]))
+                           & (gap <= gap.shift(n)),
+            "above_200ma": ma["ma_dist_sma200"] > 0,
+            "near_support": near <= float(p["near_ma_max_atr"]),
+            "rise_12m": ret260 >= float(p["rise_12m_min"]),
+            "no_dump": (close / close.shift(1) - 1.0).rolling(
+                int(p["no_dump_days"])).min() > -float(p["no_dump_adr"]) * adr,
+            "not_overextended": overext <= float(p["overextend_max"]),
+            "ma200_rising": sma200 >= sma200.shift(20),
+            # ── 他的两个**选股过滤器**（第一版完全没实现）──
+            "adr_floor": adr >= float(p["adr_floor"]),
+            "rs_rank": rs >= float(p["rs_min"]),
+            # ── 突破触发 ──
+            "breakout": close > high_f.shift(1).rolling(lb).max(),
+            # ── 止损宽度：★ **单位换算只走 `units.py`** ──
+            #    信号日用 `close` 近似入场价（成交在次日开盘）
+            "stop_width": units.stop_distance_adr(
+                close, stop, close, adr) <= float(p["stop_width_adr"]),
+            # ── §7.1 VCP 六要点 ──
+            "above_150ma": ma["ma_dist_sma150"] > 0,
+            "near_52w_high": near_high >= float(p["near_high_min"]),
+            "contractions": shrinking,
+            "final_range": daily_rng <= float(p["final_range_max"]),
+            "volume_decline": volr < float(p["volume_decline_max"]),
+            # ── §11.5 RSI 紧密盘整 ──
+            "rsi_change_3d": rsi_chg < float(p["rsi_change_max"]),
+            "atr_pct_floor": atr_pct > float(p["atr_pct_min"]),
+            "rsi_above_50": rsi > float(p["rsi_min"]),
+            "near_ma": wide(near <= float(p["near_ma_max_atr"])),
+        }
 
-        # ── 止损宽度（B4）── 默认不设上限（见 `DEFAULTS` 的说明：日线做不到他的日内止损）
-        #    信号日用 `close` 近似入场价
-        if p["max_stop_adr"] is None:
-            width_ok = pd.DataFrame(True, index=close.index, columns=close.columns)
-            width_label = "止损宽度(未设上限)"
-        else:
-            width_ok = (close - stop) <= float(p["max_stop_adr"]) * adr
-            width_label = f"止损宽度<={p['max_stop_adr']}ADR"
+    def _masks(self, panel, factors: Mapping[str, pd.DataFrame],
+               ruleset=None) -> list[tuple[str, pd.DataFrame]]:
+        """按 `RuleSet` 取条件掩码 —— **`candidates` 与 `diagnose` 共用**（防分叉）。
 
-        # 常量 `True` 一律摊成同形状的宽表（否则 `&` 会广播出意外形状）
-        def _wide(x):
-            return x if isinstance(x, pd.DataFrame) else pd.DataFrame(
-                bool(x), index=close.index, columns=close.columns)
-
-        # ★★ **形态类条件一律看"截至昨天"**（承他的原话：区间扩张**之前**出现紧密盘整）
-        #
-        # 为什么必须这样（**这是逻辑错，不是保守**）：
-        #   **信号日就是突破日**，而突破日必然"动了" ——
-        #   若把「收缩到最后，波动 < 1%」「均线收拢」这类**盘整态**条件放在**信号日**上算，
-        #   就等于**要求突破日不动** ⇒ **自相矛盾**。
-        #
-        # 实测佐证（改前）：14 条全过后剩 9 格，A5 一过就归零（9 → 0）。
-        #   —— 那 9 格正是"昨天还紧、今天突破了"的票，而它们的**今天**当然不紧。
-        #
-        # ⚠️ `tight`（T1）**不在此列**：它已经用 `shift(1)` 取"今天之前的 n 天"，
-        #    再 shift 一次会变成"前天之前"，**定义就错了**。
-        setup = [
-            ("T2 均线平行且收拢", t2),
-            ("T3 >200MA", t3),
-            ("T4 贴近某条均线", t4),
-            ("T5 12月涨>50%", t5),
-            ("T6 近3日无大跌", t6),
-            ("T7 不过度延伸", t7),
-            ("T8 200MA不向下", t8),
-        ]
-
-        # ★ VCP 六要点 —— **只在挑 VCP 形态时启用**（见模块 docstring：
-        #   它是 §6.1 三种形态之一的标准，**不是**四条件之上的追加过滤）
-        if p["vcp_filter"]:
-            setup += [
-                ("A1 >150MA", _wide(a1)),
-                ("A2 RS>=90", a2),
-                ("A3 近52周高点", a3),
-                ("A4 波幅收缩>=3次", shrinking),
-                ("A5 最后段<1%", a5),
-                ("A6 缩量", _wide(a6)),
-            ]
-
-        masks = [
-            ("T1 紧区间(不含今天)", tight),
-            *[(name, m.shift(1).fillna(False)) for name, m in setup],
-        ]
-        # ★ 他入场③「**偷步买**」（股价还在区间内就买）**不要求突破** ——
-        #   那是它的定义（**风险最高**，他原话）。
-        if p["entry_mode"] != ENTER_ANTICIPATE:
-            masks.append(("突破触发", breakout))    # ← 只有它看**今天**
-        masks.append((width_label, width_ok))
-        return masks
+        ★ **覆盖检查在这里**（承 R5：审计必须穷举）：
+          规则里声明了但没实现 ⇒ 报错；实现了但**任何规则集里都没登记** ⇒ 报错。
+          （上一版的对账工具用 `if k in prod` 静默跳过，**恰好漏掉唯一有 bug 的那条**。）
+        """
+        rs = ruleset if ruleset is not None else self.ruleset
+        impl = self._impl_masks(panel, factors)
+        check_coverage(rs, set(impl), all_declared=ALL_KEYS)
+        out = []
+        for r in rs.rules:
+            m = impl[r.key]
+            if r.as_of == "yesterday":
+                m = m.shift(1)          # ★ "看哪天"由登记表决定，只有这一处
+            out.append((r.label, m.fillna(False)))
+        return out
 
     def candidates(self, panel, factors: Mapping[str, pd.DataFrame],
                    ) -> pd.DataFrame:

@@ -34,7 +34,8 @@ from __future__ import annotations
 from rules import Rule, RuleSet, Source
 
 __all__ = [
-    "BASE", "RSI_TIGHT", "RULESETS", "VCP", "check_coverage", "rule_values",
+    "ALL_KEYS", "BASE", "RSI_TIGHT", "RULESETS", "VCP", "check_coverage",
+    "rule_values",
 ]
 
 _O = Source.ORIGINAL
@@ -94,10 +95,10 @@ BASE = RuleSet(
                   "参考系：**池内截面百分位**（与 MarketSmith 的"
                   "「全市场百分位」**不等价**，我们更严 —— 池子本身是强票）"),
         Rule(key="breakout", label="区间突破触发（收盘 > 前 5 日最高）",
-             source=_O, where="§6.1 行 470", unit="bool",
+             source=_O, where="§6.1 行 470", as_of="today", unit="bool",
              note="★ 入场③「偷步买」**不要求**这一条（那是它的定义）"),
         Rule(key="stop_width", label="止损距离 ≤ 1.5 倍 ADR",
-             source=_O, where="§10.6② 行 1448", unit="ADR倍数", value=1.5,
+             source=_O, where="§10.6② 行 1448", as_of="today", unit="ADR倍数", value=1.5,
              note="★ 原文：「止损距离：控制在 **1–1.5 倍 ADR** 之内」"
                   "（§8.1④「止损幅度不应该大于该股票的 ADR」同义）。"
                   "我第一版因为**量纲写错**（美元 ≤ 比例）而误判成"
@@ -138,7 +139,7 @@ VCP = RuleSet(
              source=_O, where="§7.1 行 708", unit="倍数", value=1.0,
              note="`vol_ratio10_50 < 1`（盘整末期缩量）"),
         Rule(key="breakout", label="区间突破触发",
-             source=_O, where="§6.1 行 470", unit="bool"),
+             source=_O, where="§6.1 行 470", as_of="today", unit="bool"),
     ),
 )
 
@@ -162,12 +163,19 @@ RSI_TIGHT = RuleSet(
         Rule(key="near_ma", label="② 贴近 5 条均线任一条（≤1 个 ATR）",
              source=_O, where="§11.5 条件②", unit="ATR倍数", value=1.0),
         Rule(key="breakout", label="区间突破触发",
-             source=_O, where="§6.1 行 470", unit="bool"),
+             source=_O, where="§6.1 行 470", as_of="today", unit="bool"),
     ),
 )
 
 #: 全部并列的规则集 —— **跑法是"选一个"**（不是给 base 加开关）。
 RULESETS: dict[str, RuleSet] = {r.name: r for r in (BASE, VCP, RSI_TIGHT)}
+
+#: **所有规则集里出现过的 key 的并集** —— 供 `check_coverage` 判"无出处的条件"。
+#:
+#: ⚠️ 实现里出现、但**任何规则集都没登记**的 key ⇒ 报错。
+#:    那种条件事后**没人能审它**（不知道它从哪来、阈值是谁定的）。
+ALL_KEYS: frozenset[str] = frozenset(
+    r.key for rs in RULESETS.values() for r in rs.rules)
 
 
 def rule_values(rs: RuleSet) -> dict[str, object]:
@@ -178,7 +186,8 @@ def rule_values(rs: RuleSet) -> dict[str, object]:
     return {r.key: r.value for r in rs.rules if r.value is not None}
 
 
-def check_coverage(rs: RuleSet, implemented: set[str]) -> None:
+def check_coverage(rs: RuleSet, implemented: set[str],
+                   *, all_declared: set[str] | None = None) -> None:
     """★ **审计必须穷举** —— 规则与实现必须一一对应。
 
     ## 为什么需要它（一次真实的教训）
@@ -197,14 +206,16 @@ def check_coverage(rs: RuleSet, implemented: set[str]) -> None:
     ⇒ 这里改成**缺一个就报错**。
     """
     declared = {r.key for r in rs.rules}
+    universe = all_declared if all_declared is not None else declared
     missing_impl = sorted(declared - implemented)
-    extra_impl = sorted(implemented - declared)
     if missing_impl:
         raise ValueError(
             f"规则集 {rs.name!r} 里这些规则**没有实现**：{missing_impl}\n"
             f"承 R5：审计必须穷举 —— 审不了就报错，**不许静默跳过**"
             f"（上一版就是靠 `if k in prod` 跳过了唯一有 bug 的那条）")
-    if extra_impl:
+    unknown = sorted(implemented - universe)
+    if unknown:
         raise ValueError(
-            f"实现里有这些 key **没在规则集里登记**：{extra_impl}\n"
-            f"⇒ 要么补进 {rs.name!r}，要么从实现里删掉 —— 不许有'无出处的条件'")
+            f"实现里有这些 key **在任何规则集里都没登记**：{unknown}\n"
+            f"⇒ 要么补登记（连同出处），要么从实现里删掉 —— "
+            f"不许有「无出处的条件」（那种条件事后没人能审它）")
