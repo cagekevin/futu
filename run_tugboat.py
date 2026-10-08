@@ -63,6 +63,13 @@ from trade_simulator import (  # noqa: E402
 #: 票池跳到 287 只那天 —— 比它更早的日子只有 16 只，构不成截面。
 DEFAULT_START = "2022-05-03"
 
+#: 评估窗口之前**多吃多少个交易日**作因子预热。
+#:
+#: 最长窗口是 `ret260` / `near_52w_high`（250–260 天），再留一点余量。
+#: ⚠️ 不吃这一段，预热就落在**窗口内部** ⇒ 前 ~13 个月没有信号
+#: ⇒ 有效样本从 4.4 年缩到 ~3.4 年（检出下限 0.93 → 1.06）。
+WARMUP_DAYS = 300
+
 
 def _pick_stock_day(days: list[str], requested: str | None) -> str:
     """取一个**真有快照**的交易日（否则 `stocks()` 会静默返回 1 只）。"""
@@ -76,6 +83,29 @@ def _pick_stock_day(days: list[str], requested: str | None) -> str:
     raise SystemExit(f"找不到有像样票池的交易日（试过 {requested or days[-1]}）")
 
 
+class _WindowedPanel:
+    """把面板**切到评估窗口** —— 预热只用来喂因子，**不进评估**。
+
+    ## 为什么要有这个包装（而不是在各处 `.loc[window]`）
+
+    面板要多吃 `WARMUP_DAYS` 天（否则因子预热落在窗口内部，见那里的说明），
+    但**下游每一个消费者**（策略 / 敏感性 / 矩阵 / 对照臂 / 模拟器）都只该看窗口。
+
+    如果靠"每个调用点自己记得切"，那就必然有**某一个变体忘了切** ⇒ 分叉。
+    ⇒ 用包装对象一次切好，下游拿到的是**同一个窗口**。
+
+    只实现下游真正用到的那三个成员（`dates` / `symbols` / `field`）。
+    """
+
+    def __init__(self, panel, window) -> None:
+        self._panel = panel
+        self.dates = tuple(window)
+        self.symbols = panel.symbols
+
+    def field(self, name: str) -> pd.DataFrame:
+        return self._panel.field(name).loc[list(self.dates)]
+
+
 def _market_state(panel, spy_panel) -> pd.DataFrame:
     """按日的市场状态（**四阶段曝险的输入**，见规格 §11.1 的 A2/A3）。
 
@@ -85,18 +115,39 @@ def _market_state(panel, spy_panel) -> pd.DataFrame:
     |---|---|---|
     | `breadth` | 票池里 **`close > SMA50` 的比例** | 他 §7.3 条件④ 原话「50 日线以上比例 < 20% ⇒ 可能反转」|
     | `index_dist_200ma` | **SPY 距 200 日线的偏离** | 他「大环境：大盘在 30 周均线之上」的连续版 |
+
+    ## ★★ 整条序列必须 `shift(1)` —— 这里曾经是**一天前视**
+
+    曝险是在**当日开盘之前**定档的（模拟器日循环的**步骤 ⓪**），
+    而它拿去放行的是**当日开盘**的入场单。
+
+    ⇒ 所以状态只能用**截至昨天收盘**的值。第一版我按**当日 `close`** 算
+      ⇒ **用今天收盘的宽度，去决定今天开盘下多少注** —— 真前视。
+
+    （这个 bug 是**外部独立复审**抓到的：它跳出了"文档划定的检查范围"去查，
+      而 `test_causality` 当时**根本不覆盖 Tugboat**，所以测试没挡住。）
+
+    ⚠️ **实现上为什么用 `shift(1)` 而不是 `AtOpen`**：本函数是**整条序列一次性算好**
+       再注入的（向量化）；`AtOpen` 那个对象是给"逐日循环里取数"用的。
+       两者表达的是同一件事：**开盘前看不到今天**。
     """
     close = panel.field("close")
     above = close > close.rolling(50).mean()
-    breadth = above.sum(axis=1) / above.notna().sum(axis=1).replace(0, np.nan)
+    # ⚠️ 分母**必须是"当天真有数据的标的数"**。
+    #    `above` 是**布尔表** ⇒ `above.notna()` **恒为真** ⇒ 分母恒等于列数，
+    #    未上市/无数据的票会被算进"不在 50 日线上方" ⇒ **早期宽度被系统性低估**
+    #    （更容易误判成"疑似见底"档）。第一版那句 `.replace(0, np.nan)` 是**死代码**。
+    valid = close.notna() & close.rolling(50).mean().notna()
+    breadth = above.sum(axis=1) / valid.sum(axis=1).replace(0, np.nan)
 
     spy_close = spy_panel.field("close")["SPY"]
     dist = spy_close / spy_close.rolling(200).mean() - 1.0
 
+    # ★ **整条后移一天**：开盘前能看到的只有截至昨天的状态
     return pd.DataFrame({
         "breadth": breadth.reindex(panel.dates),
         "index_dist_200ma": dist.reindex(panel.dates),
-    })
+    }).shift(1)
 
 
 def _load_entries(path: str, panel) -> pd.DataFrame:
@@ -397,12 +448,39 @@ def main(argv: list[str] | None = None) -> int:
           f"四阶段曝险: {not args.no_exposure}")
     print()
 
-    panel = read_panel(symbols, days=window, stocks_day=stock_day)
-    spy_panel = read_panel(["SPY"], days=window, stocks_day=stock_day)
-    print(f"面板   : {len(panel.dates)} 天 × {len(panel.symbols)} 只")
+    # ★★ **面板必须多吃一段预热** —— 否则因子预热落在**评估窗口内部**。
+    #
+    #   因子要 250–260 个交易日（`ret260` / `sma200` / `near_52w_high`），
+    #   若面板正好从窗口起点开始，**前 ~13 个月一笔信号都不会有**：
+    #   实测旧版第一笔成交在 **2023-05-19**（距窗口起点 2022-05-03 约 13 个月）。
+    #
+    #   ⇒ 于是"可用历史"实际是 **~3.4 年**，不是文档里反复用的 **4.4 年**，
+    #     检出下限应是 `1.96/√3.4 ≈ 1.06`，不是 **0.93**。
+    #
+    #   库里 2022-05-03 之前有 **3,367 天**可用（最早到 1987-06-16）——
+    #   **够得很**，之前只是没用。
+    warmup = [d for d in days_all if d < args.start][-WARMUP_DAYS:]
+    panel = read_panel(symbols, days=warmup + window, stocks_day=stock_day)
+    spy_panel = read_panel(["SPY"], days=warmup + window, stocks_day=stock_day)
+    # ⚠️ 面板**不一定**给出 `read_days()` 里的每一天（**末日常缺** —— 那天的 K 线
+    #    还没落库）⇒ 窗口取**交集**，否则 `factors.loc[window]` 会 `KeyError`。
+    #    （这也解释了文档里"→ 2026-10-08"与面板实际到 10-07 的矛盾。）
+    have = set(panel.dates)
+    dropped = [d for d in window if d not in have]
+    window = [d for d in window if d in have]
+    if dropped:
+        print(f"⚠️ 面板缺这些日子，已从窗口剔除：{dropped}")
+    if not window:
+        raise SystemExit("窗口与面板没有交集 —— 检查 --start")
+    print(f"面板   : {len(panel.dates)} 天 × {len(panel.symbols)} 只"
+          f"（含 **{len(warmup)} 天预热**，评估窗口 {len(window)} 天）")
 
     strategy = TugboatBreakout(entry_mode=args.entry_mode, vcp_filter=args.vcp)
-    factors = {n: run_factor(n, panel).values for n in REQUIRED_FACTORS}
+    # ★ 因子在**长面板**上算（吃满预热），再把**因子与面板一起切到窗口**
+    factors = {n: run_factor(n, panel).values.loc[list(window)]
+               for n in REQUIRED_FACTORS}
+    market_state = _market_state(panel, spy_panel)      # 也要**在长面板上算**
+    panel = _WindowedPanel(panel, window)               # ⇒ 下游自动只看窗口
 
     if args.entries:
         # ★ 用**你自己的入场** —— 机器不选股，只套框架
@@ -427,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
     exposure = StaticExposure()
     if not args.no_exposure:
         exposure = TugboatExposure()
-        exposure.attach_market_state(_market_state(panel, spy_panel))
+        exposure.attach_market_state(market_state)
 
     from trade_simulator import AccountPolicy
     account = AccountPolicy(cost_rate=backtest_config.COST_RATE)
@@ -458,12 +536,33 @@ def main(argv: list[str] | None = None) -> int:
 
     report = trade_metrics.summarize(result, benchmark=bench)
     mc = trade_metrics.monte_carlo(result, iterations=args.iterations)
+
+    # ★ **有效样本**从**首个信号**算起，不是从窗口起点 ——
+    #   窗口前段虽然因子已经预热好了，但**一条信号都没有**（条件太稀），
+    #   拿"窗口长度"当样本长度会**高估检出能力**（这正是复审 C 指出的）。
+    entries = sorted(t.entry_day for t in result.trades)
+    first_signal = entries[0] if entries else "（无成交）"
+    if entries and first_signal in panel.dates:
+        used = len(panel.dates) - panel.dates.index(first_signal)
+    else:
+        used = len(panel.dates)
+    eff_years = max(used / 252.0, 1e-9)
+
     footer = (
-        "\n⚠️ 签三个已经显形的偏差（规格 §11.4）：\n"
+        "\n⚠️ 签四个已经显形的偏差（规格 §11.4）：\n"
         "  ① 催化剂/叙事**测不了** —— 那是他称「最核心」的筛选条件 ⇒ 对他不利\n"
         "  ② 日内入场**测不了**（无分钟数据）⇒ 入场与止损都用日线近似\n"
         "  ③ 四阶段的市场状态只能用「票池宽度 + 指数偏离」代理（情绪无数据）\n"
-        "\n⚠️ 检出下限：4.4 年样本只能证明 Sharpe ≥ 1.96/√4.4 ≈ 0.93 的策略\n"
+        "  ④ ★ **幸存者偏差** —— 票池是「这几年券商 App 上的热门股」快照回溯使用，\n"
+        "     **不是当年的时点名单**（池内有 2024–26 才上市的票）⇒ 方向是**高估**。\n"
+        "     实测池子等权买入持有 **+443.91%** vs SPY +86.66%。\n"
+        "     ⚠️ **它不污染「真实 vs 随机」那个对照**（两侧共用同一个池子）\n"
+        "        ⇒ 那个对照是整份工作里**最抗偏差**的证据。\n"
+        f"\n⚠️ 检出下限：**{eff_years:.1f} 年**（不是窗口的 {len(window) / 252:.1f} 年）\n"
+        f"    —— 因子预热 {WARMUP_DAYS} 天落在窗口外，但**首个信号**在\n"
+        f"    {first_signal}，此后才有交易 ⇒ 有效样本从那时算。\n"
+        f"    能证明的最小 Sharpe ≈ **1.96/√{eff_years:.1f} ≈ "
+        f"{1.96 / np.sqrt(eff_years):.2f}**\n"
         "    ⇒ 中等优势**测不出来**，「说不清」不等于「没优势」（规格 §0.5）\n"
     )
     text = trade_metrics.render_report(

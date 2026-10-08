@@ -236,6 +236,8 @@ def monte_carlo(result, *, iterations: int = 2000, seed: int = 20261008,
     peaks = np.maximum.accumulate(paths, axis=1)
     dds = (paths - peaks).min(axis=1)
     return {
+        #: 实际跑的迭代次数 —— 报告里要印它，**不许硬编码**（复审 G）
+        "iterations": float(iterations),
         "n": float(n),
         "p05": float(np.percentile(finals, 5)),
         "p50": float(np.percentile(finals, 50)),
@@ -335,7 +337,10 @@ def render_report(report: dict[str, Any], mc: dict[str, float] | None = None,
     if mc:
         lines += [
             "",
-            "  ── 蒙特卡洛（bootstrap 重采样 2,000 次）──",
+            # ⚠️ 次数**从 `mc` 里取**，不许硬编码 ——
+            #    第一版写死"2,000 次"，`--iterations` 传别的值照样印 2000（复审 G）
+            f"  ── 蒙特卡洛（bootstrap 重采样 "
+            f"{int(mc.get('iterations', 0)) or '?'} 次）──",
             f"  最终总 R：p05 {num(mc['p05'], 1)} | **中位 {num(mc['p50'], 1)}** | "
             f"p95 {num(mc['p95'], 1)}",
             f"  **重采样后仍赚钱的比例：{pct(mc['p_profit'], 1)}**"
