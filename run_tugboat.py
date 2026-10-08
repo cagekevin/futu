@@ -52,7 +52,7 @@ import factor.implementations  # noqa: E402
 import trade_metrics  # noqa: E402
 from factor.factor_registry import run_factor  # noqa: E402
 from panel.panel_builder import read_panel  # noqa: E402
-from panel.provide_reader import read_days, read_stocks  # noqa: E402
+from panel.provide_reader import read_days, read_snapshot, read_stocks  # noqa: E402
 from strategies.tugboat_breakout import (  # noqa: E402
     ENTER_MODES, REQUIRED_FACTORS, TugboatBreakout, TugboatExposure,
 )
@@ -188,6 +188,123 @@ def _dump_trades(result, path: str) -> None:
     print(f"逐笔清单: {path}（{len(result.trades)} 笔）")
 
 
+def _attach_labels(trades, cand: pd.DataFrame, panel, stocks_day: str) -> pd.DataFrame:
+    """给每笔交易贴上**信号日 / 形态 / 行业**。
+
+    ⚠️ 两个坑：
+    1. **`Trade.entry_day` 是成交日，不是信号日**（市价单晚一天、限价单可能晚两天）
+       ⇒ 用"同标的、信号日 < 成交日、且最近的那一条"去匹配，**不能直接按日相等 join**。
+    2. **行业只有快照那 1–2 天有** ⇒ 只能拿**今天**的行业贴到四年前的交易上。
+       对"半导体/软件"这种**不怎么变的**够用；对**改过主业**的会错。
+       ⇒ **这条必须显形**（下面打印时会写）。
+    """
+    if not trades:
+        return pd.DataFrame()
+    # 信号日 → 该日各标的的形态
+    form_of = {(r.day, r.symbol): r.form for r in cand.itertuples(index=False)}
+    order = {d: i for i, d in enumerate(panel.dates)}
+    rows = []
+    for t in trades:
+        ei = order.get(t.entry_day)
+        form = ""
+        if ei is not None:                       # 往回找最近的一条同标的候选
+            for k in range(ei - 1, max(ei - 6, -1), -1):
+                if (panel.dates[k], t.symbol) in form_of:
+                    form = form_of[(panel.dates[k], t.symbol)]
+                    break
+        rows.append({"symbol": t.symbol, "entry_day": t.entry_day,
+                     "form": form, "r": t.r_multiple,
+                     "reason": t.exit_reason, "hold": t.hold_days,
+                     "win": t.r_multiple > 0})
+    out = pd.DataFrame(rows)
+    try:
+        snap = read_snapshot(stocks_day)["value"]["rows"]
+        ind = {r["symbol"]: (r.get("industry") or "?") for r in snap}
+    except Exception:                            # noqa: BLE001
+        ind = {}
+    out["industry"] = out["symbol"].map(ind).fillna("?")
+    return out
+
+
+def _group_table(df: pd.DataFrame, by: str, *, top: int = 12) -> list[str]:
+    """分组统计：笔数 / 胜率 / 平均 R / 总 R。**样本小的组必须显形**。"""
+    lines = [f"  {'分组':26s}{'笔数':>6s}{'胜率':>8s}{'平均R':>9s}{'总R':>9s}{'占比':>8s}"]
+    total_r = float(df["r"].sum())
+    g = (df.groupby(by)
+           .agg(n=("r", "size"), win=("win", "mean"),
+                avg=("r", "mean"), tot=("r", "sum"))
+           .sort_values("tot", ascending=False))
+    for name, row in g.head(top).iterrows():
+        flag = "  ⚠️样本小" if row["n"] < 10 else ""
+        lines.append(
+            f"  {str(name)[:26]:26s}{int(row['n']):>6d}{row['win'] * 100:>7.1f}%"
+            f"{row['avg']:>9.3f}{row['tot']:>9.1f}"
+            f"{(row['tot'] / total_r * 100 if total_r else 0):>7.1f}%{flag}")
+    if len(g) > top:
+        lines.append(f"  （还有 {len(g) - top} 组未列出）")
+    return lines
+
+
+def _render_curve(result, bench_rets, spy_close) -> str:
+    """净值曲线（按季取样）+ **逐年表现** + R 倍数分布。"""
+    eq = np.asarray(result.equity_values, dtype=float)
+    days = list(result.equity_days)
+    out: list[str] = []
+
+    # ── 逐年：策略 vs 基准（**这是"哪一年挣的"最直接的答案**）──
+    out.append(f"  {'年份':8s}{'策略':>10s}{'基准(SPY)':>11s}{'笔数':>6s}"
+               f"{'胜率':>8s}{'总R':>9s}{'年内最大回撤':>13s}")
+    years = sorted({d[:4] for d in days})
+    trades = result.trades
+    for y in years:
+        idx = [i for i, d in enumerate(days) if d.startswith(y)]
+        if len(idx) < 2:
+            continue
+        i0, i1 = idx[0], idx[-1]
+        strat = eq[i1] / eq[i0] - 1.0
+        # 基准：同区间（用 SPY 收盘，与净值日对齐）
+        spy = spy_close.to_numpy(dtype=float)
+        base = float("nan")
+        if np.isfinite(spy[i0]) and np.isfinite(spy[i1]) and spy[i0] > 0:
+            base = spy[i1] / spy[i0] - 1.0
+        seg = eq[i0:i1 + 1]
+        dd = float((seg / np.maximum.accumulate(seg) - 1.0).min())
+        ty = [t for t in trades if t.exit_day.startswith(y)]
+        rs = np.array([t.r_multiple for t in ty], dtype=float)
+        out.append(
+            f"  {y:8s}{strat * 100:>9.2f}%{base * 100:>10.2f}%{len(ty):>6d}"
+            f"{(rs > 0).mean() * 100 if rs.size else float('nan'):>7.1f}%"
+            f"{rs.sum():>9.1f}{dd * 100:>12.2f}%")
+
+    # ── 净值曲线（按季取样，画成柱状）──
+    out.append("")
+    out.append("  净值曲线（每季末，柱长按当季末净值 / 初始资金 − 1）")
+    q_idx = [i for i, d in enumerate(days)
+             if i == len(days) - 1 or (d[5:7] in ("03", "06", "09", "12")
+                                       and days[i + 1][5:7] != d[5:7])]
+    base0 = eq[0] if eq[0] else 1.0
+    for i in q_idx:
+        rel = eq[i] / base0 - 1.0
+        bar = "█" * max(0, int(round(rel * 40))) if rel >= 0 else ""
+        bar = ("·" * max(0, int(round(-rel * 40))) + "█") if rel < 0 else bar
+        out.append(f"  {days[i]}  {eq[i] / 1e6:6.3f}M  {rel * 100:+7.2f}%  {bar}")
+
+    # ── R 倍数分布（直方图）──
+    rs = np.array([t.r_multiple for t in trades], dtype=float)
+    out.append("")
+    out.append("  R 倍数分布（每笔）")
+    bins = [(-1e9, -2), (-2, -1.5), (-1.5, -1), (-1, -0.5), (-0.5, 0),
+            (0, 0.5), (0.5, 1), (1, 2), (2, 3), (3, 5), (5, 1e9)]
+    for lo, hi in bins:
+        n = int(((rs > lo) & (rs <= hi)).sum())
+        label = (f"≤{hi:.0f}" if lo < -1e8 else f"{lo:.1f} ~ {hi:.0f}"
+                 if hi < 1e8 else f">{lo:.0f}")
+        out.append(f"  {label:>12s}  {n:>4d}  {'▇' * min(n, 60)}")
+    out.append(f"  {'合计':>12s}  {rs.size:>4d}｜平均 {rs.mean():+.3f}R｜"
+               f"中位 {np.median(rs):+.3f}R｜最好 {rs.max():+.2f}R｜最差 {rs.min():+.2f}R")
+    return "\n".join(out)
+
+
 def sensitivity(base_params: dict, hold: int) -> list[tuple[str, dict, dict, int]]:
     """要扫的参数（**一次只动一个**）—— 回答"哪个参数最要紧"。
 
@@ -223,6 +340,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="把**逐笔交易清单**写成 CSV（给这个路径）")
     ap.add_argument("--sensitivity", action="store_true",
                     help="★ 一次只动一个参数，看**哪个最要紧**")
+    ap.add_argument("--breakdown", action="store_true",
+                    help="★ 把成交按 形态 / 行业 / 出场原因 / 持有期 分组，看钱是哪类挣的")
+    ap.add_argument("--matrix", action="store_true",
+                    help="★ 把 入场×曝险×VCP 的组合**全跑完**（一次不留尾巴）")
+    ap.add_argument("--curve", action="store_true",
+                    help="★ 净值曲线 + 逐年表现 + R 倍数分布")
     ap.add_argument("--vcp", action="store_true",
                     help="变体：只挑 VCP 那一个形态（§7.1 六要点）")
     ap.add_argument("--no-exposure", action="store_true",
@@ -325,6 +448,78 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.trades:
         _dump_trades(result, args.trades)
+
+    if args.curve:
+        print()
+        print("═" * 70)
+        print("★ 净值曲线 / 逐年 / R 分布")
+        print("─" * 70)
+        print(_render_curve(result, bench, spy_close))
+        print("─" * 70)
+        print("  ⚠️ **逐年看**很重要：某一年特别赚，往往说明那一年行情适合这类策略，")
+        print("     而不是策略本身强（`qsx` 的「近期持续性」告警就是查这个）。")
+        return 0
+
+    if args.matrix:
+        from dataclasses import replace as _replace
+
+        print()
+        print("══ 全组合矩阵（入场 × 曝险 × VCP）══")
+        print(f"  {'组合':40s}{'候选':>6s}{'笔数':>6s}{'总收益':>10s}"
+              f"{'Sharpe':>9s}{'MDD':>10s}{'每笔R':>9s}{'IR剥离':>9s}")
+        for mode in ENTER_MODES:
+            for vcp in (False, True):
+                for exp_on in (True, False):
+                    st = TugboatBreakout(entry_mode=mode, vcp_filter=vcp)
+                    c = st.candidates(panel, factors)
+                    tag = (f"{mode}｜VCP={'开' if vcp else '关'}｜"
+                           f"四阶段={'开' if exp_on else '关'}")
+                    if c.empty:
+                        print(f"  {tag:40s}{0:>6d}      —— 候选 0")
+                        continue
+                    ex = exposure if exp_on else StaticExposure()
+                    rr = simulate(
+                        panel.dates, panel.symbols, bars, c,
+                        strategy_name=st.name, strategy_params=st.params,
+                        ma_exit_level=st.ma_exit_level(panel, factors),
+                        exit_policy=st.exit_policy, account=account, exposure=ex)
+                    mm = trade_metrics.summarize(rr, benchmark=bench)
+                    print(f"  {tag:40s}{len(c):>6d}{mm['n_trades']:>6d}"
+                          f"{mm['total_return'] * 100:>9.2f}%{mm['sharpe']:>9.2f}"
+                          f"{mm['max_drawdown'] * 100:>9.2f}%"
+                          f"{mm['expectancy_r']:>9.3f}{mm['ir_stripped']:>9.2f}")
+        print("  ⚠️ 这是**同一份数据上的多个变体** —— 按预注册纪律，")
+        print("     若要挑一个「最好」的，p 值必须**一起过 BH 校正**。")
+        print("  ⚠️ 候选 0 的组合 = **该变体在本票池/本时段没出现过**，不是「测出来无效」。")
+        return 0
+
+    if args.breakdown:
+        lab = _attach_labels(result.trades, cand, panel, stock_day)
+        if lab.empty:
+            print("\n（没有成交，分组无意义）")
+            return 0
+        print()
+        print("═" * 70)
+        print("★ 分组：钱是哪一类挣的")
+        print("─" * 70)
+        for by, title in (("form", "按**形态**（他 §6.1 的三种）"),
+                          ("industry", "按**行业**"),
+                          ("reason", "按**出场原因**"),
+                          ("hold_bucket", "按**持有天数**")):
+            if by == "hold_bucket":
+                lab["hold_bucket"] = pd.cut(
+                    lab["hold"], bins=[-1, 2, 5, 10, 20, 10 ** 6],
+                    labels=["≤2 天", "3–5 天", "6–10 天", "11–20 天", ">20 天"])
+            print(f"\n{title}：")
+            print("\n".join(_group_table(lab, by)))
+        print()
+        print("─" * 70)
+        print("  ⚠️ **这是事后切片（exploratory），不是预先注册的检验** ——")
+        print("     分组一多，总有一组「看起来最赚」。它只能用来**生成假设**，")
+        print("     不能当成「这一类有优势」的证据。要当真，得**另开一次预注册实验**。")
+        print("  ⚠️ 行业来自**今天的快照**，贴到四年前的成交上 ——")
+        print("     「半导体 / 软件」这种够用，**改过主业的会贴错**。")
+        return 0
 
     if args.sensitivity:
         # ★ 一次只动一个参数 ⇒ 回答「**哪个参数最要紧**」
