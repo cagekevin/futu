@@ -151,7 +151,9 @@ DEFAULTS: Mapping[str, Any] = {
     "vcp_filter": False,
     # ── 突破触发 ──
     "breakout_lookback": 5,          # 他「区间突破」——回看长度我定
-    "entry_mode": ENTER_BREAKOUT,    # 他的三种之①
+    "entry_mode": ENTER_BREAKOUT,    # 他的三种之①（②③ 见 `ENTER_MODES`）
+    "pullback_days": 2,              # 他入场②：「**当天或第二天**，超过两天没回撤 ⇒ 放弃」
+    "anticipate_days": 5,            # ⚠️ 入场③ 的挂单有效期 —— **原文没给**，我取紧区间长度
     # ── 止损宽度（B4）──
     # ⚠️ **默认 `None` = 不设宽度上限** —— 这是一个**做不到**的显形，不是省略：
     #
@@ -210,6 +212,16 @@ class TugboatBreakout:
 
     # ── 每日选股（**全部向量化 + 只用 ≤ 当日的信息**）────────────────────
 
+    def _range_edges(self, panel):
+        """紧区间的**上下沿**（都取**今天之前**的 `tight_days` 天）—— 两处共用，防分叉。
+
+        · 上沿 = 「区间突破」的基准线（也作入场②的**回踩挂单价**）
+        · 下沿 = **止损位**的候选之一（也作入场③的**偷步挂单价**）
+        """
+        n = int(self.params["tight_days"])
+        high, low = panel.field("high"), panel.field("low")
+        return (high.shift(1).rolling(n).max(), low.shift(1).rolling(n).min())
+
     @staticmethod
     def _stop_series(panel) -> pd.DataFrame:
         """止损位 —— **他四个候选里的第一个**：「**确认突破那根 K 线的底部**」。
@@ -254,9 +266,7 @@ class TugboatBreakout:
                                 panel.field("low"))
 
         # ── T1：紧区间（★ **不含今天** —— 否则"突破"被算进"紧"里，自相矛盾）──
-        n = int(p["tight_days"])
-        prior_hi = high_f.shift(1).rolling(n).max()
-        prior_lo = low_f.shift(1).rolling(n).min()
+        prior_hi, prior_lo = self._range_edges(panel)
         prior_close = close.shift(1)
         tight = (prior_hi - prior_lo) / prior_close <= float(p["tight_range_max"])
         stop = self._stop_series(panel)
@@ -264,7 +274,9 @@ class TugboatBreakout:
         # ── T2：均线平行**且收拢** ──
         s10, s20 = close.rolling(10).mean(), close.rolling(20).mean()
         flat = (s10 - s20).abs() / close <= float(p["ma_converge_max"])
-        converging = (s10 - s20).abs() <= (s10 - s20).abs().shift(n)
+        # 收拢 = 均线间距比 `tight_days` 天前更小（他「平行**或开始收拢**」的后半句）
+        converging = ((s10 - s20).abs()
+                      <= (s10 - s20).abs().shift(int(p["tight_days"])))
         t2 = flat & converging if p["require_converging"] else flat
 
         # ── T3 / T8：200 日线之上，且 200MA 不向下 ──
@@ -359,16 +371,32 @@ class TugboatBreakout:
                 ("A6 缩量", _wide(a6)),
             ]
 
-        return [
+        masks = [
             ("T1 紧区间(不含今天)", tight),
             *[(name, m.shift(1).fillna(False)) for name, m in setup],
-            ("突破触发", breakout),                 # ← 只有它看**今天**
-            (width_label, width_ok),
         ]
+        # ★ 他入场③「**偷步买**」（股价还在区间内就买）**不要求突破** ——
+        #   那是它的定义（**风险最高**，他原话）。
+        if p["entry_mode"] != ENTER_ANTICIPATE:
+            masks.append(("突破触发", breakout))    # ← 只有它看**今天**
+        masks.append((width_label, width_ok))
+        return masks
 
     def candidates(self, panel, factors: Mapping[str, pd.DataFrame],
                    ) -> pd.DataFrame:
-        """返回 `day, symbol, stop_price, form`（`day` = **信号日**，次日开盘成交）。"""
+        """返回 `day, symbol, stop_price, form, limit_price, valid_days`。
+
+        `day` = **信号日**；成交方式由 `entry_mode` 决定（他的三种入场）：
+
+        | `entry_mode` | 怎么成交 | 出处 |
+        |---|---|---|
+        | `breakout`（默认）| **市价**，次日开盘 | 他入场①「日线波幅扩张突破时入场」|
+        | `pullback` | **限价挂在上沿**，有效期 `pullback_days`（**2**）| 他入场②：「突破后回踩买…**超过两天没回撤 ⇒ 放弃**」|
+        | `anticipate` | **限价挂在下沿**（还在区间内就买），有效期 `anticipate_days` | 他入场③「偷步买」（**他明说这方式风险最高**）|
+
+        ⚠️ **三种是"备选"，不是"叠加"** —— 同时开三种会把**同一笔设置数三次**。
+        """
+        p = self.params
         masks = self._masks(panel, factors)
         cond = masks[0][1]
         for _name, m in masks[1:]:
@@ -377,6 +405,7 @@ class TugboatBreakout:
         close = panel.field("close")
         stop = self._stop_series(panel)
         near_high = self._get(factors, "near_52w_high")
+        prior_hi, prior_lo = self._range_edges(panel)
 
         # ── 形态分类（B1）：按"离 52 周高点多近" ──
         form = pd.DataFrame(FORM_MID, index=close.index, columns=close.columns)
@@ -385,13 +414,29 @@ class TugboatBreakout:
 
         stack = cond.stack()
         hit = stack[stack.fillna(False)]
+        cols = ["day", "symbol", "stop_price", "form",
+                "limit_price", "valid_days"]
         if hit.empty:
-            return pd.DataFrame(columns=["day", "symbol", "stop_price", "form"])
+            return pd.DataFrame(columns=cols)
+
+        mode = p["entry_mode"]
+        if mode == ENTER_PULLBACK:
+            limit_src = prior_hi
+            valid = int(p["pullback_days"])
+        elif mode == ENTER_ANTICIPATE:
+            limit_src = prior_lo
+            valid = int(p["anticipate_days"])
+        else:
+            limit_src, valid = None, 1        # 市价（`valid_days` 被模拟器忽略）
+
         return pd.DataFrame({
             "day": [d for d, _ in hit.index],
             "symbol": [s for _, s in hit.index],
             "stop_price": [float(stop.loc[d, s]) for d, s in hit.index],
             "form": [form.loc[d, s] for d, s in hit.index],
+            "limit_price": [None if limit_src is None
+                            else float(limit_src.loc[d, s]) for d, s in hit.index],
+            "valid_days": [valid] * len(hit),
         })
 
     def diagnose(self, panel, factors: Mapping[str, pd.DataFrame]) -> dict[str, int]:
