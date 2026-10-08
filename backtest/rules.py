@@ -40,7 +40,22 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Iterator
 
-__all__ = ["Rule", "RuleSet", "Source", "render_rule_table"]
+__all__ = ["ALLOWED_UNITS", "Rule", "RuleSet", "Source", "render_rule_table"]
+
+#: 允许的单位 —— **必须显式**（承 R1：裸数字没有单位是本项目最贵的一类错）。
+#:
+#: | 单位 | 含义 |
+#: |---|---|
+#: | `bool` | 布尔条件（无阈值）|
+#: | `美元` | 价格 / 价格距离 |
+#: | `比例` | `0.026` = 2.6%（ADR%、区间幅度、涨幅…）|
+#: | `ATR倍数` | 以 `atr14` 为单位 |
+#: | `ADR倍数` | 以 `adr_pct20` 为单位（他的止损口径）|
+#: | `倍数` | 无量纲比值（缩量比、RSI 值…）|
+#: | `百分位` | `0`–`1` 的截面排名 |
+ALLOWED_UNITS: tuple[str, ...] = (
+    "bool", "美元", "比例", "ATR倍数", "ADR倍数", "倍数", "百分位",
+)
 
 
 class Source(StrEnum):
@@ -80,7 +95,7 @@ class Rule:
             raise RuleError(
                 f"规则 {self.key!r} 标为「我定」⇒ **必须**给 `value`（我定的数是多少）。"
                 f"否则报告里说不清'到底哪个数是我编的'")
-        if self.unit not in ("bool", "比例", "ADR倍数", "美元", "倍数", "百分位"):
+        if self.unit not in ALLOWED_UNITS:
             raise RuleError(
                 f"规则 {self.key!r} 的 unit={self.unit!r} 不在允许清单里 —— "
                 f"承 R1：单位必须显式，不许留白")
