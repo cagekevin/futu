@@ -401,6 +401,19 @@ def reconcile(result: SimulationResult, cost_rate: float) -> dict[str, Any]:
             "max_abs_diff": worst, "examples": examples, "skipped": skipped}
 
 
+#: `reconcile_fills` 能**独立反推**成交价的出场原因（"收盘结算"类：③均线 / ④超时 / 末尾强平）。
+#: 它们的成交价规则就是 `close[出场日]` —— 简单、无需复制模拟器的路径逻辑。
+_CLOSE_SETTLED = (EXIT_MA_BREAK, EXIT_NO_PROGRESS, EXIT_TIME_CAP, EXIT_END_OF_DATA)
+
+#: **不能**独立反推的出场原因 ⇒ **显形**，不假装覆盖（承 R5：审不了要报错／报出，不许静默跳过）。
+_UNVERIFIABLE_FILLS: dict[str, str] = {
+    EXIT_TARGET_FINAL: (
+        "部分止盈把股数卖到 0 的收尾价 = 最后一次实际成交价；"
+        "而「部分止盈是哪一天成交的」不在 `Trade` 记录里（只有价与股数）"
+        "⇒ 无法从 bar 独立反推（反推需要复制模拟器的路径分支 = 第二份实现）"),
+}
+
+
 def reconcile_fills(result: SimulationResult, dates, symbols, bars: Mapping[str, Any],
                     *, trade_on_close: bool = False) -> dict[str, Any]:
     """★ **成交逻辑**对账 —— 从 bar **独立反推**每一笔的成交价，跟记录比。
@@ -421,19 +434,34 @@ def reconcile_fills(result: SimulationResult, dates, symbols, bars: Mapping[str,
     | 限价 vs 开盘取优 | 取错就高估 |
     | `trade_on_close` 当天不判出场 | 我**刚修过**的一个真 bug |
 
+    ## 覆盖面：**穷举 + 未覆盖显形**（2026-10-09 改，治 TD-05-11）
+
+    第一版只对**入场价**与**止损价**两处 —— 而 `EXIT_*` 是**封闭枚举（7 个）**。
+    「覆盖 2/7 而说『成交对账通过』」正是本仓反复出事的形态（**审不了就静默跳过**）。
+
+    ⇒ 现在：
+
+    | 类 | 出场原因 | 怎么对 |
+    |---|---|---|
+    | **可反推** | 入场 / `EXIT_STOP` | 见下两行 |
+    | **可反推** | `EXIT_MA_BREAK` / `EXIT_NO_PROGRESS` / `EXIT_TIME_CAP` / `EXIT_END_OF_DATA` | 成交价 = **出场日收盘** |
+    | **不可反推（显形）** | `EXIT_TARGET_FINAL` | 见 `_UNVERIFIABLE_FILLS` 的理由 —— **报出条数，不假装覆盖** |
+    | **穷举守卫** | 任何**不在上表**的出场原因 | **`raise`** —— 新增出场原因时不会静默漏对账 |
+
     ## 本函数独立重算什么
 
     对**每一笔**，从 `bars` 里取那几天的行情，**按规则重推**成交价：
 
     ```
-    入场价  = 入场日的 open（`trade_on_close` 时 = close）
-    止损出场 = 出场日 low ≤ 该笔止损 ⇒ 成交价 = min(该笔止损, 出场日 open)
+    入场价    = 入场日的 open（`trade_on_close` 时 = close）
+    止损出场   = 出场日 low ≤ 该笔止损 ⇒ 成交价 = min(该笔止损, 出场日 open)
+    收盘结算类 = 出场日 close
     ```
 
     止损位怎么推：**没做过部分止盈** ⇒ `initial_stop`；
     **做过** ⇒ `max(initial_stop, entry_price)`（部分止盈后移到保本）。
 
-    ⇒ 这两条正是"跳空"与"保本止损"的落点，也是最容易写错的地方。
+    ⇒ 前两条正是"跳空"与"保本止损"的落点，也是最容易写错的地方。
     """
     import numpy as _np
 
@@ -443,7 +471,18 @@ def reconcile_fills(result: SimulationResult, dates, symbols, bars: Mapping[str,
     di = {d: i for i, d in enumerate(dates)}
     si = {s: j for j, s in enumerate(symbols)}
 
+    # ★ **穷举守卫**：出场原因是封闭枚举；出现没进任何一张表的，**报错**而不是静默漏对账。
+    _known = {EXIT_STOP, *_CLOSE_SETTLED, *_UNVERIFIABLE_FILLS}
+    _unknown = sorted({t.exit_reason for t in result.trades} - _known)
+    if _unknown:
+        raise ValueError(
+            f"`reconcile_fills` 不认识这些出场原因：{_unknown}\n"
+            f"⇒ 新增出场原因必须**同时**进 `_CLOSE_SETTLED`（可反推）或 "
+            f"`_UNVERIFIABLE_FILLS`（显形）—— 承 R5：审不了要报错，不许静默跳过")
+
     bad_entry = bad_stop = checked_entry = checked_stop = 0
+    checked_close = bad_close = 0
+    unverifiable: dict[str, int] = {}
     examples: list[str] = []
     for t in result.trades:
         i, j = di.get(t.entry_day), si.get(t.symbol)
@@ -459,29 +498,45 @@ def reconcile_fills(result: SimulationResult, dates, symbols, bars: Mapping[str,
                     examples.append(
                         f"{t.symbol} {t.entry_day} 入场：记录 {t.entry_price:.6f}"
                         f" vs 按规则 {float(want):.6f}")
-        # ── 止损出场的成交价 ──
-        if t.exit_reason != EXIT_STOP:
-            continue
         k = di.get(t.exit_day)
-        if k is None:
-            continue
-        stop = t.initial_stop
-        if t.took_partial:
-            stop = max(stop, t.entry_price)          # 部分止盈后移到保本
-        if not (_np.isfinite(lo[k, j]) and _np.isfinite(o[k, j])):
-            continue
-        if lo[k, j] <= stop:                          # 真的打到了
-            expect = min(stop, float(o[k, j]))        # ★ 跳空 ⇒ 取更差的
-            checked_stop += 1
+        # ── 止损出场的成交价 ──
+        if t.exit_reason == EXIT_STOP:
+            if k is None:
+                continue
+            stop = t.initial_stop
+            if t.took_partial:
+                stop = max(stop, t.entry_price)      # 部分止盈后移到保本
+            if not (_np.isfinite(lo[k, j]) and _np.isfinite(o[k, j])):
+                continue
+            if lo[k, j] <= stop:                      # 真的打到了
+                expect = min(stop, float(o[k, j]))    # ★ 跳空 ⇒ 取更差的
+                checked_stop += 1
+                if abs(expect - t.exit_price) > 1e-9:
+                    bad_stop += 1
+                    if len(examples) < 5:
+                        examples.append(
+                            f"{t.symbol} {t.exit_day} 止损：记录 {t.exit_price:.6f}"
+                            f" vs 按规则 {expect:.6f}")
+        # ── "收盘结算"类（③均线 / ④超时 / 末尾强平）：成交价 = **出场日收盘** ──
+        elif t.exit_reason in _CLOSE_SETTLED:
+            if k is None or not _np.isfinite(c[k, j]):
+                continue
+            expect = float(c[k, j])
+            checked_close += 1
             if abs(expect - t.exit_price) > 1e-9:
-                bad_stop += 1
+                bad_close += 1
                 if len(examples) < 5:
                     examples.append(
-                        f"{t.symbol} {t.exit_day} 止损：记录 {t.exit_price:.6f}"
-                        f" vs 按规则 {expect:.6f}")
+                        f"{t.symbol} {t.exit_day} {t.exit_reason}：记录 "
+                        f"{t.exit_price:.6f} vs 按规则（收盘）{expect:.6f}")
+        # ── 不可独立反推 ⇒ **显形**（不假装覆盖）──
+        else:
+            unverifiable[t.exit_reason] = unverifiable.get(t.exit_reason, 0) + 1
     return {"checked_entry": checked_entry, "bad_entry": bad_entry,
             "checked_stop": checked_stop, "bad_stop": bad_stop,
-            "bad": bad_entry + bad_stop, "examples": examples}
+            "checked_close": checked_close, "bad_close": bad_close,
+            "unverifiable": unverifiable,
+            "bad": bad_entry + bad_stop + bad_close, "examples": examples}
 
 
 @dataclass

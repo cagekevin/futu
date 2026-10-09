@@ -18,10 +18,12 @@ BH 的分母是「**这一批试了多少个因子**」。只拿一个 p 值做"
 （这是本模块写码时被测试抓到的真 bug：`test_j3_bh_correction_actually_changes_verdict`。）
 ⇒ 唯一正确的做法是**收齐全批的 p 值，一次校正**。
 
-## 为什么本层自带一份 BH（不 import `backtest/statistics.py`）
+## 为什么本层自带一份 BH（不 import `backtest/panel_statistics.py`）
 
-承 PRD §二 E6：`backtest/statistics.py` 的真实 fan-in = **1（仅自测）** ——
-主链路从未用过它；且它与 **Python 标准库同名**，跨目录 import 有歧义风险。
+承 PRD §二 E6：`backtest/panel_statistics.py` 的 fan-in **曾是 1（仅自测）** ——
+主链路从未用过它。（**2026-10-09 起两点变化**：① 它已被 `run_tugboat.py` 接线；
+② 它**已改名** —— 原 `statistics.py`，与 Python 标准库同名的歧义**已消除**，见 TD-05-18。
+但本层**仍不 import 它**，理由不变：承 §7.2「并列下游互不 import」。）
 按 §7.2（并列下游互不 import），本层自带一份，一致性由**跨层契约测试**锁死。
 """
 from __future__ import annotations
@@ -56,7 +58,7 @@ def benjamini_hochberg(pvalues: Sequence[float], *, alpha: float) -> list[bool]:
 
     初版对 `NaN` 是**静默跳过**（当作"不拒绝"）。审计发现两处问题：
 
-    1. **与 `backtest/statistics.py::benjamini_hochberg` 语义分歧** ——
+    1. **与 `backtest/panel_statistics.py::benjamini_hochberg` 语义分歧** ——
        那边对 NaN **raise**（原文：「缺失/NaN 必须显形，不许静默丢弃（承 P5）」）。
        两处同名函数、语义不同 = **两份真相**。
     2. **掩盖了一类真实的"无法检验"** —— `p = NaN` 意味着"检验做不了"

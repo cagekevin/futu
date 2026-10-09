@@ -8,7 +8,7 @@ RSI_t = 100 − 100 / (1 + avg_gain / avg_loss)
 
 ## 它为什么是"筛选原料"里最核心的一个
 
-出处：`关于策略/9-资料-TradingTugboat.md` §10.8。
+出处：`关于策略/Tugboat/9-资料-TradingTugboat.md` §10.8。
 
 原文的关键洞察是 **RSI 的"指数化 / 标准化"特性**：
 > SNDK 单日涨 **8.25%** 和 FTNT 涨 **2.35%**，**RSI 的单日变化都是 ≈ 4.3**

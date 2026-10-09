@@ -195,7 +195,7 @@ python3 run_backtest.py --synthetic --symbols SPY --strategy regime_gated_moment
 
 ---
 
-## 4. ★ `statistics.py` —— **已实现，但主链路零引用**
+## 4. ★ `panel_statistics.py` —— **簇级区间 / 多重检验工具（已被 Tugboat 线接线）**
 
 > **这是本层能力最丰富、却尚未接线的模块。** 纯标准库、纯函数、零 IO。
 > 当前主链路**只做点估计 + 8 条硬判定**，**未使用任何置信区间或显著性校正**。
@@ -235,7 +235,7 @@ python3 run_backtest.py --synthetic --symbols SPY --strategy regime_gated_moment
 
 | # | 位置 | 状态 |
 |---|---|---|
-| 1 | **`statistics.py`** | 主链路零引用（见 §4）—— **placebo / 簇级区间 / BH 都没接** |
+| 1 | **`panel_statistics.py`** | ✅ **已接线**（`run_tugboat.py` 用 `effective_sample_size` / `benjamini_hochberg`）；**placebo 仍未接** |
 | 2 | `MarketFacts.extra` | 已声明契约，**未接通** |
 | 3 | `data_source.align_daily_items` | **直接 `raise NotImplementedError`** |
 | 4 | **无 placebo 对照**（V10） | `docs/design/01` §12 列为**第一优先级扩展**，未实现 |
@@ -278,4 +278,4 @@ python3 run_backtest.py --synthetic --symbols SPY --strategy regime_gated_moment
 | **为什么这么设计**（B/D/R/V/E 全编号） | `docs/design/01-回测与验证系统-design-2026-10-06.md` |
 | 可执行步骤（**注意：初版手册，实现已分叉，以代码为准**） | `docs/design/02-回测与验证系统-实施手册-2026-10-06.md` |
 | 全仓分层与铁律 | `../Agent.md` |
-| 数据能测什么 | `../factor-layer/关于策略/11-验证-数据体检报告-2026-10-08.md` |
+| 数据能测什么 | `../关于策略/Tugboat/11-验证-数据体检报告-2026-10-08.md` |

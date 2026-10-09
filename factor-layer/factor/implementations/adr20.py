@@ -4,7 +4,7 @@
 ADR%_t = mean( (high − low) / close , 过去 20 天 )
 ```
 
-口径出处：`关于策略/9-资料-TradingTugboat.md` §10.6 ——
+口径出处：`关于策略/Tugboat/9-资料-TradingTugboat.md` §10.6 ——
 **他认为最被忽略的一个指标**，原文给的三档用法：
 
 | 用法 | 规则 |

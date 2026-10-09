@@ -52,11 +52,13 @@ SKIP = {"run_all.py", "__init__.py"}
 
 #: ★ 让 `backtest/` 进 `sys.path`。
 #:
-#: 为什么必须：`backtest/statistics.py` 与**标准库同名**。
-#: `discover -s tests` 只把 `tests/` 放进 path ⇒ `import statistics` 命中**标准库**
-#: ⇒ `ImportError: cannot import name 'SINGLE_SERIES_IN_CLUSTER'`。
-#: （表现是"discover 下能过、直接跑不能过" —— 这种**换种跑法就红**的测试
-#:  最容易被当成绿。）
+#: 为什么必须：**直接跑 `python tests/test_x.py` 时 `sys.path[0]` 是 `tests/`**，
+#: 于是本层的 `import trade_simulator` / `import backtest_config` **全部解析不到**。
+#: （`discover -s tests -t .` 恰好把 `backtest/` 放进了 path ⇒
+#:  "**换种跑法就红**" —— 这类测试最容易被当成绿。）
+#:
+#: ⚠️ 这里**曾经**还有第二个理由：`backtest/statistics.py` 与**标准库同名**。
+#: 该文件已于 2026-10-09 改名 `panel_statistics.py`（TD-05-18）⇒ **同名问题已消除**。
 if str(HERE.parent) not in sys.path:
     sys.path.insert(0, str(HERE.parent))
 

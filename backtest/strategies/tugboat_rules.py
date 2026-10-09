@@ -151,11 +151,14 @@ RSI_TIGHT = RuleSet(
     name="rsi_tight",
     label="§11.5 RSI 紧密盘整（第三方工具口径，他说「可以直接抄」）",
     note=("★ 我第一版**完全没实现**这一套。它已在 `evaluate/placebo/` 里单独做过"
-          "随机对照（见 `关于策略/12`：排位 53.2%，无可辨识优势）—— "
+          "随机对照（曾单独测过：排位 53.2%，无可辨识优势；过程文档已删）—— "
           "这里把它作为**并列的第三个 RuleSet** 接进来。"),
     rules=(
-        Rule(key="rsi_change_3d", label="① RSI 3–4 日变化 < 3 且累计 ≤ 5",
-             source=_O, where="§11.5 条件①", unit="倍数", value=3.0),
+        Rule(key="rsi_change_daily", label="①a RSI **每日**变化 < 3（最近 3 天）",
+             source=_O, where="§11.5 条件①", unit="倍数", value=3.0,
+             note="★ 原文是**两个条件**，第一版只实现了「累计」那一半（治 TD-05-09）"),
+        Rule(key="rsi_change_cum", label="①b RSI **累计**变化 ≤ 5（3 天）",
+             source=_O, where="§11.5 条件①", unit="倍数", value=5.0),
         Rule(key="atr_pct_floor", label="④ ATR / 收盘 > 2.5%",
              source=_O, where="§11.5 条件④", unit="比例", value=0.025),
         Rule(key="rsi_above_50", label="⑤ RSI > 50",

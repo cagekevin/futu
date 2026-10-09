@@ -148,6 +148,54 @@ def map_module(mod: str, file_pkg: list[str], old_mod: str, new_mod: str) -> str
     return None
 
 
+def _split_trailing_comment(line: str) -> tuple[str, str]:
+    """把一行拆成「代码」与「行尾注释」。没有注释 → `(原文, "")`。
+
+    ★ 为什么需要（**TD-05-27**）：第一版拿**整行**去匹配 `^import\\s+(.+?)$`，
+    于是 `import statistics as _stats  # noqa: E402` 里的 `# noqa` 让 `IMPORT_ITEM`
+    **匹配失败** ⇒ 该行被**静默漏改**。实测漏掉的正是本仓入口真正在用的
+    `run_tugboat.py:56`（`--dry` 列表里根本没有它）。
+
+    ⚠️ 只按**第一个 `#`** 切：Python 的 import 行里不存在含 `#` 的字符串字面量。
+    """
+    i = line.find("#")
+    if i < 0:
+        return line, ""
+    return line[:i].rstrip(), line[i:]
+
+
+def edge_can_resolve_to(edge: str, importer: Path | None, target: Path) -> bool:
+    """`edge`（**绝对点分模块名**）解析到的**是不是 `target` 这个文件**？
+
+    ## 为什么需要它（**TD-05-26**：一次真实的"改坏无关文件"）
+
+    第一版只做**文本相等**（`mod == old_mod`）⇒ `data-layer/engine/industry.py` 的
+    `import statistics`（**标准库**）被当成 `backtest/panel_statistics.py`；
+    `--dry` 显示改名会把**两个无关文件**一起改坏。
+    （`factor-layer/docs/PRD/02` 记过这个误报，但一直没修。）
+
+    ## 判据：顶层段只在**导入方自己的模块根**里解析
+
+    Python 只把"导入方所在的源根"放进 `sys.path` ⇒
+    `X`（或 `X.y.z`）的**顶层段** `X` 只在 importer 自己的根里有意义：
+
+    | 导入方 | 能解析到 `backtest/panel_statistics.py` 吗 |
+    |---|---|
+    | `backtest/entry_quality.py`（根 = `backtest`）| ✅ 同根 |
+    | `data-layer/engine/industry.py`（根 = `data-layer`）| ❌ 不同根（那是**标准库**）|
+    | `factor-layer/panel/stock_universe.py`（有自己的根，只是不在 `MODULE_ROOTS`）| ❌ 不同根 |
+    | `run_tugboat.py`（**直接躺在仓库根**的跨层组装点，会 `sys.path.insert`）| ✅ **保守认** |
+
+    ⇒ **宁可多改一行，也不漏真引用**；但"不同根"一律不认（那是假引用）。
+    """
+    if not edge or edge.startswith("."):
+        return False
+    imp_root = module_root_of(importer) if importer is not None else None
+    if imp_root is not None:
+        return imp_root == module_root_of(target)
+    return importer is not None and importer.parent == ROOT
+
+
 def line_edges(line: str, file_pkg: list[str]) -> set[str]:
     """一行 import 语句 → 它引用的**绝对点分模块名集合**。
 
@@ -156,6 +204,7 @@ def line_edges(line: str, file_pkg: list[str]) -> set[str]:
       · `from . import read as _read` —— 相对形式引用子模块 ⇒ 记 `<pkg>.read`。
     """
     edges: set[str] = set()
+    line, _cmt = _split_trailing_comment(line)   # ★ 行尾注释不能挡住匹配（TD-05-27）
     m = IMPORT_FROM.match(line)
     if m:
         mod, names = m.group(2), m.group(3)
@@ -179,21 +228,33 @@ def line_edges(line: str, file_pkg: list[str]) -> set[str]:
     return edges
 
 
-def rewrite_content(text: str, file_pkg: list[str], old_mod: str, new_mod: str):
-    """改写一份文件的 import；返回 (新文本, [(行号, 旧行, 新行)…])。"""
+def rewrite_content(text: str, file_pkg: list[str], old_mod: str, new_mod: str,
+                    *, importer: Path | None = None, target: Path | None = None):
+    """改写一份文件的 import；返回 (新文本, [(行号, 旧行, 新行)…])。
+
+    `importer` / `target` 给定时，**只改"真的解析到 target"的那些**
+    （`edge_can_resolve_to`）—— 这是"同名但不是它"（TD-05-26）的落点。
+
+    ★ 匹配前先**拆出行尾注释**（TD-05-27）：`import x as y  # noqa` 不能被漏掉。
+    """
     lines = text.split("\n")
     changes = []
-    for i, line in enumerate(lines):
+    for i, raw in enumerate(lines):
+        line, _cmt = _split_trailing_comment(raw)
+        cmt = f"  {_cmt}" if _cmt else ""
         m = IMPORT_FROM.match(line)
         if m:
             indent, mod, names = m.groups()
             base = resolve_relative(mod, file_pkg) if mod.startswith(".") else mod
             if not base:
                 continue
+            if (importer is not None and target is not None
+                    and not edge_can_resolve_to(base, importer, target)):
+                continue
             # 情形①：`from X import …` 的 X 本身搬了
             new = map_module(mod, file_pkg, old_mod, new_mod)
             if new is not None and new != mod:
-                lines[i] = f"{indent}from {new} import {names}"
+                lines[i] = f"{indent}from {new} import {names}{cmt}"
                 changes.append((i + 1, line, lines[i]))
                 continue
             # 情形②：`from X import sub` 里被导入的 **子模块** sub 搬了（如 `from . import read as _read`）
@@ -216,7 +277,7 @@ def rewrite_content(text: str, file_pkg: list[str], old_mod: str, new_mod: str):
                     names2 = kept + [f"{a[len(base)+1:]}{s}" for a, s in under]
                     out.append(f"{indent}from {base_disp} import {', '.join(names2)}")
                 out += [f"{indent}import {a}{s}" for a, s in outside]
-                lines[i] = "\n".join(out)
+                lines[i] = "\n".join(out) + cmt
                 changes.append((i + 1, line, lines[i]))
             continue
         m = IMPORT_PLAIN.match(line)
@@ -229,6 +290,10 @@ def rewrite_content(text: str, file_pkg: list[str], old_mod: str, new_mod: str):
                     new_parts.append(p)
                     continue
                 mod, as_ = mm.group(1), mm.group(2) or ""
+                if (importer is not None and target is not None
+                        and not edge_can_resolve_to(mod, importer, target)):
+                    new_parts.append(p)
+                    continue
                 new = map_module(mod, file_pkg, old_mod, new_mod)
                 if new is not None and new != mod:
                     changed = True
@@ -236,7 +301,7 @@ def rewrite_content(text: str, file_pkg: list[str], old_mod: str, new_mod: str):
                 else:
                     new_parts.append(p)
             if changed:
-                lines[i] = f"{indent}import {', '.join(new_parts)}"
+                lines[i] = f"{indent}import {', '.join(new_parts)}{cmt}"
                 changes.append((i + 1, line, lines[i]))
     return "\n".join(lines), changes
 
@@ -266,7 +331,12 @@ def cmd_refs(args: list[str]) -> None:
             fpkg = package_of(f)
             for i, line in enumerate(text.split("\n"), 1):
                 if line.strip().startswith(("import ", "from ")):
-                    if old_mod and any(e == old_mod or e.startswith(old_mod + ".") for e in line_edges(line, fpkg)):
+                    # ★ 与 `rename` **共用同一个谓词**：只认"真的解析到 tf"的那些
+                    #   （`data-layer` 里的标准库 `statistics` **不是** `backtest/panel_statistics.py`）。
+                    if old_mod and any(
+                            (e == old_mod or e.startswith(old_mod + "."))
+                            and edge_can_resolve_to(e, f, tf)
+                            for e in line_edges(line, fpkg)):
                         imports.append((rel(f), i, line.strip()))
                     continue
                 # 字符串残留：只认**模块点分名**或**文件名**（不含裸词干 —— 那会大面积误报）
@@ -301,7 +371,7 @@ def inbound_map() -> dict[str, list[tuple[str, int]]]:
             if not line.strip().startswith(("import ", "from ")):
                 continue
             for e in line_edges(line, fpkg):
-                if e in inbound and mods[e] != f:
+                if e in inbound and mods[e] != f and edge_can_resolve_to(e, f, mods[e]):
                     inbound[e].append((rel(f), i))
     return inbound
 
@@ -378,10 +448,12 @@ def do_move(old: Path, new: Path) -> None:
 def apply_rewrites(mapping: dict[Path, Path], dry: bool) -> int:
     """mapping: 旧文件 → 新文件。Plan（内存）→ Move（物理）→ Commit（刷盘）。返回改写的 import 处数。"""
     old_to_new: dict[str, str] = {}
+    old_mod_to_path: dict[str, Path] = {}
     for old, new in mapping.items():
         om, nm = module_of(old), module_of(new)
         if not om or not nm:
             fail(f"文件不在模块根下（{rel(old)} → {rel(new)}）：无法计算模块名")
+        old_mod_to_path[om] = old
         if om != nm:
             old_to_new[om] = nm
     move_of = {o.resolve(): n for o, n in mapping.items()}
@@ -397,7 +469,10 @@ def apply_rewrites(mapping: dict[Path, Path], dry: bool) -> int:
                 continue
             cur, all_changes = text, []
             for om, nm in old_to_new.items():
-                cur, ch = rewrite_content(cur, package_of(target), om, nm)
+                # ★ `importer=f`（引用**来自哪个文件**）+ `target=`（判"解析到的是不是它"）
+                #   —— 少一个，就是 TD-05-26 那类"改坏无关文件"。
+                cur, ch = rewrite_content(cur, package_of(target), om, nm,
+                                          importer=f, target=old_mod_to_path[om])
                 all_changes += ch
             if all_changes:
                 edited[target] = (cur, all_changes)

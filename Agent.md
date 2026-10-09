@@ -15,7 +15,7 @@
 它是一条**实测过的操作路径**（所有命令都在 2026-10-08 跑过）：
 先决定走「**截面随机对照**」还是「**时序回测**」（**选错层 = 白干**）→ 更新数据 → 加因子 → 写规则
 → 跑对照 → **怎么读报告** → 以及 **9 个已经踩过的坑**（含预热吃掉窗口、
-`stocks()` 静默返回 1 只、`backtest/statistics.py` 与标准库同名等）。
+`stocks()` 静默返回 1 只、门禁口径必须带 `-t .` 否则函数式测试全在门外等）。
 
 **核心区分（下面这页也会提到，这里再钉一次）**：
 
@@ -355,6 +355,11 @@ for t in tests/test_*.py; do .venv/bin/python "$t"; done
    README = **给下一个 AI 的接口契约**（能力 / 签名 / 约束 / 陷阱 / 未接通的缝）。
    新增接口、改变语义、接通预留参数 —— **都要落在对应 README 里**。
    不更新 = 让下一个人重读源码 = README 失去意义。
+9. **★ 文档引用只写「`关于策略/<主题>/<文件名>`」**（2026-10-09 定）。
+   **不写主题内部的物理层级** —— "哪个主题"是逻辑分区（稳定），
+   主题内部怎么嵌套 **不进引用**，否则一搬就漂。
+   **改 / 搬引用一律走 `scripts/sync_doc_refs.py`，禁手改**（同纪律 2 的文档版）。
+   例：`关于策略/Tugboat/19-最终结论-2026-10-09.md`、`关于策略/我/4-设计-在场机制.md`
 
 ---
 
@@ -368,6 +373,7 @@ for t in tests/test_*.py; do .venv/bin/python "$t"; done
 | `scripts/adr.py` | `docs/adr/`（判据本体 + `README.md` 索引是**产物**） | ADR 读写唯一入口（`list/show/search/add/status/audit/hygiene/refs/doctor`） | `ADR守护者.md` |
 | `scripts/debt.py` | `daily/架构日志/债务.md`（待办）+ `债务-归档.md`（已完成） | 债务账本读写唯一入口（`list/area/search/show/add/resolve/archive/audit/fix/stats`） | `债务登记5步法.md` |
 | `scripts/mv_sync_refs.py` | 全仓 `.py` | 改名/移动/目录搬运 + **全库同步 import**；`refs`（fan-in）/ `find-dead`（孤儿） | `写代码4步法` · `架构5步法` · `债务登记5步法` · `系统治理5步法` · `排查5步法` |
+| `scripts/sync_doc_refs.py` | 全仓 `.md` / `.py` 注释 / `.txt` | **文档引用的批量同步**（`mv_sync_refs.py` 只扫 `.py`，文档侧一直是空白 —— 本工具补上）；吃一张映射表，默认 dry-run，`--apply` 才写盘 | 改 / 搬文档引用时 |
 | `scripts/probe.py` | `scripts/.probe/`（journal） | **先红后绿**探针（注入→跑→断言→**无条件还原**） | `架构师改码7步法` §7.1 |
 
 **判据的分工**（防两份真相）：

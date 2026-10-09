@@ -37,7 +37,7 @@ from factor.factor_registry import run_factor
 from panel.panel_builder import read_panel
 from panel.provide_reader import read_days, read_stocks
 
-#: 宽面板起点 —— 票池在这一天从 16 只跳到 **287 只**（见 `关于策略/11-验证-数据体检报告`）。
+#: 宽面板起点 —— 票池在这一天从 16 只跳到 **287 只**（见 `关于策略/Tugboat/11-验证-数据体检报告-2026-10-08.md`）。
 #: 再往前票池太窄，不构成截面。
 PANEL_START = "2022-05-03"
 

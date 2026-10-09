@@ -8,7 +8,7 @@
 
 | 名字 | 规则 | 出处 |
 |---|---|---|
-| `rsi_tight_consolidation` | **RSI 紧密盘整**（5 个技术条件）| `关于策略/9-资料-TradingTugboat.md` §11.5 |
+| `rsi_tight_consolidation` | **RSI 紧密盘整**（5 个技术条件）| `关于策略/Tugboat/9-资料-TradingTugboat.md` §11.5 |
 
 ⚠️ 该规则的 `name` 默认是 `rsi_tight_consolidation`；
 跑**参数变体**时要显式给别的 `name`（注册表需要不同的键），

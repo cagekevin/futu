@@ -42,11 +42,13 @@ SKIP = {"run_all.py", "__init__.py"}
 
 #: ★ 子进程的 `PYTHONPATH` 必须**先有 `backtest/`**。
 #:
-#: 为什么：`backtest/statistics.py` 与**标准库同名**。直接跑 `test_statistics.py` 时
-#: `sys.path[0]` 是 `tests/`，于是 `import statistics` 命中**标准库**
-#: ⇒ `ImportError: cannot import name 'SINGLE_SERIES_IN_CLUSTER'`。
-#: （`unittest discover` 恰好把它放进了 path，所以 discover 下能过、直接跑不能过 ——
+#: 为什么：直接跑 `python tests/test_x.py` 时 `sys.path[0]` 是 `tests/`，
+#: 本层的 `import trade_simulator` / `import backtest_config` **全部解析不到**。
+#: （`unittest discover` 恰好把它放进了 path ⇒ discover 下能过、直接跑不能过 ——
 #:  这种"换种跑法就红"的测试最容易被误当成绿。）
+#:
+#: ⚠️ 这里**曾经**还有第二个理由：`backtest/statistics.py` 与**标准库同名**。
+#: 该文件已于 2026-10-09 改名 `panel_statistics.py`（TD-05-18）⇒ **同名问题已消除**。
 _ENV = {**os.environ,
         "PYTHONPATH": os.pathsep.join(
             [str(HERE.parent), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}

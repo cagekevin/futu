@@ -22,7 +22,8 @@
 | `high`+`low`+`close` | `atr14` | 真实波幅（**价格单位**）|
 | `high`+`low`+`close` | `atr_pct14` | 真实波幅 / 收盘（**含跳空**）|
 | `high`+`low`+`close` | `adr20` | 日均波幅 / 收盘（**不含跳空**，§10.6 的过滤器）|
-| `close` | **`rs_rank`** | **池内截面相对强度百分位**（§7.1 VCP 第 2 条「RS ≥ 90」）|
+| `close` | **`rs_rank`** | **池内截面相对强度百分位**（§7.1 VCP 第 2 条「RS ≥ 90」；**IBD 加权 3/6/9/12 月**）|
+| `close` | **`rs_rank_1m`** / **`rs_rank_6m`** | **同上的另两档口径** —— 他**按场合选**：筛 VCP 用 **1M**（§11.4）、大市值用 **6M**（§8.1）|
 | `high`+`close` | **`near_52w_high`** | **距 52 周新高**（§7.1 VCP 第 3 条「不低于 15%」）|
 
 ### `role = screening`：**筛选原料**（**不参与 IC 评估**）
@@ -57,6 +58,8 @@ from . import (  # noqa: F401
     ret150,
     ret260,
     rs_rank,
+    rs_rank_1m,
+    rs_rank_6m,
     rsi14,
     skew20,
     turn20,
@@ -76,7 +79,7 @@ __all__ = [
     # alpha
     "adr20", "atr14", "atr_pct14", "max20", "near_52w_high",
     "off_low150", "off_low260", "ret5", "ret20", "ret60", "ret150",
-    "ret260", "rs_rank", "rsi14", "skew20", "turn20", "vol20",
+    "ret260", "rs_rank", "rs_rank_1m", "rs_rank_6m", "rsi14", "skew20", "turn20", "vol20",
     # screening
     "daily_range_pct", "ma_dist_ema10", "ma_dist_ema20", "ma_dist_ema50",
     "ma_dist_sma150", "ma_dist_sma200", "range_pct10", "vol_ratio10_50",

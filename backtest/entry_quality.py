@@ -39,7 +39,7 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
-import statistics as _stats
+import panel_statistics as _stats
 
 __all__ = ["FeatureResult", "ScreenResult", "render_screen", "screen"]
 

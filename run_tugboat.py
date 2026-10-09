@@ -53,7 +53,7 @@ import entry_quality  # noqa: E402
 import units  # noqa: E402
 import plateau  # noqa: E402
 import random_control  # noqa: E402
-import statistics as _stats  # noqa: E402
+import panel_statistics as _stats  # noqa: E402
 import trade_metrics  # noqa: E402
 import verdict  # noqa: E402
 from factor.factor_registry import run_factor  # noqa: E402
@@ -72,8 +72,11 @@ DEFAULT_START = "2022-05-03"
 #: 评估窗口之前**多吃多少个交易日**作因子预热。
 #:
 #: 最长窗口是 `ret260` / `near_52w_high`（250–260 天），再留一点余量。
-#: ⚠️ 不吃这一段，预热就落在**窗口内部** ⇒ 前 ~13 个月没有信号
-#: ⇒ 有效样本从 4.4 年缩到 ~3.4 年（检出下限 0.93 → 1.06）。
+#: ⚠️ 不吃这一段，预热就落在**窗口内部** ⇒ 前 ~13 个月没有信号。
+#:
+#: ★ **有效样本与检出下限不在这里写死** —— 由页脚按「**首个信号 → 末尾**」实算
+#:   （`eff_years` 与 `1.96/√eff_years`）。这里**曾经**写死「3.4 年 / 1.06」，
+#:   与结论文档的「1.04」对不上 ⇒ 治 TD-05-22：**口径数字只留一处**。
 WARMUP_DAYS = 300
 
 
@@ -588,6 +591,10 @@ def main(argv: list[str] | None = None) -> int:
           f"（含 **{len(warmup)} 天预热**，评估窗口 {len(window)} 天）")
 
     strategy = TugboatBreakout(entry_mode=args.entry_mode, vcp_filter=args.vcp)
+    # ★ **出处分布从数据生成**（承 R3：出处只有一处 ⇒ 不可能漂移）——
+    #   `RuleSet.summary()` 是 `rules.py` 里**早就有的**能力，这里只是**接线**。
+    #   ⇒ 手写「几个阈值是我定的」那类声明**全部作废**，以这一行为准（治 TD-05-21）。
+    print(f"规则集 : {strategy.ruleset.name}｜{strategy.ruleset.summary()}")
     # ★ 因子在**长面板**上算（吃满预热），再把**因子与面板一起切到窗口**
     factors = {n: run_factor(n, panel).values.loc[list(window)]
                for n in REQUIRED_FACTORS}
@@ -649,13 +656,21 @@ def main(argv: list[str] | None = None) -> int:
                            trade_on_close=account.trade_on_close)
     if chk2["bad"]:
         print(f"\n⛔ **成交逻辑对账失败**：入场 {chk2['bad_entry']} 笔 / "
-              f"止损 {chk2['bad_stop']} 笔与按规则重推不符")
+              f"止损 {chk2['bad_stop']} 笔 / 收盘结算 {chk2['bad_close']} 笔"
+              f"与按规则重推不符")
         for line in chk2["examples"]:
             print("   ", line)
         print("   ⇒ 成交价与规则不符 ⇒ 报告不可信 —— 已中止。")
         return 2
-    print(f"成交对账: 入场 {chk2['checked_entry']} 笔 / "
-          f"止损出场 {chk2['checked_stop']} 笔，**全部与规则一致**")
+    print(f"成交对账: 入场 {chk2['checked_entry']} 笔 / 止损 {chk2['checked_stop']} 笔 / "
+          f"收盘结算 {chk2['checked_close']} 笔，**全部与规则一致**")
+    # ★ **未覆盖必须显形**（治 TD-05-11）：不许用"对账通过"盖过"有一类没对"。
+    _unver = chk2.get("unverifiable") or {}
+    if _unver:
+        _txt = " / ".join(f"{k} {v} 笔" for k, v in sorted(_unver.items()))
+        print(f"成交对账: ⚠️ **未覆盖 {sum(_unver.values())} 笔**（{_txt}）"
+              f" —— 这几类的成交价**无法从 bar 独立反推**"
+              f"（理由见 `trade_simulator._UNVERIFIABLE_FILLS`）")
     print()
 
     spy_close = spy_panel.field("close")["SPY"].reindex(panel.dates)
@@ -676,7 +691,7 @@ def main(argv: list[str] | None = None) -> int:
     eff_years = max(used / 252.0, 1e-9)
 
     footer = (
-        "\n⚠️ 签四个已经显形的偏差（规格 §11.4）：\n"
+        "\n⚠️ 签五个已经显形的偏差（规格 §11.4）：\n"
         "  ① 催化剂/叙事**测不了** —— 那是他称「最核心」的筛选条件 ⇒ 对他不利\n"
         "  ② 日内入场**测不了**（无分钟数据）⇒ 入场与止损都用日线近似\n"
         "  ③ 四阶段的市场状态只能用「票池宽度 + 指数偏离」代理（情绪无数据）\n"
@@ -685,6 +700,10 @@ def main(argv: list[str] | None = None) -> int:
         "     实测池子等权买入持有 **+443.91%** vs SPY +86.66%。\n"
         "     ⚠️ **它不污染「真实 vs 随机」那个对照**（两侧共用同一个池子）\n"
         "        ⇒ 那个对照是整份工作里**最抗偏差**的证据。\n"
+        "  ⑤ ★★ **没有样本外** —— 阈值与出场参数都是**在同一段数据上**定的；\n"
+        "     `walk_forward_validation` 只做「分段一致性」（`train` 段从不被使用、\n"
+        "     `gap` 是空操作，见其文件头）⇒ 本报告里**任何一个「最好的参数」\n"
+        "     都不是样本外结论**（治 TD-05-13）。\n"
         f"\n⚠️ 检出下限：**{eff_years:.1f} 年**（不是窗口的 {len(window) / 252:.1f} 年）\n"
         f"    —— 因子预热 {WARMUP_DAYS} 天落在窗口外，但**首个信号**在\n"
         f"    {first_signal}，此后才有交易 ⇒ 有效样本从那时算。\n"
@@ -710,9 +729,33 @@ def main(argv: list[str] | None = None) -> int:
                   account=_ac2, exposure=exposure)
     cost2x_ok = float(trade_metrics.summarize(
         r2, benchmark=bench)["total_return"]) > 0.0
+    # ★ **判据只有一个来源**：`walk_forward_validation.judge_verdict`。
+    #   `independent_audit`（`run_backtest.py` 那条路）吃**逐 bar 仓位**，
+    #   本路径吃**交易级结果** ⇒ 两条入口**形态不同**，但**共用同一个判据**。
+    #   ⇒ TD-05-12 的「未接线」**不构成缺陷** —— 那不是"应该接"，是"形态不同"。
     v = verdict.run_verdict(result, report, side_ratio=side_ratio,
                             cost2x_profitable=cost2x_ok)
     print(verdict.render_verdict(v))
+
+    # ── ★ 目标价口径**同报两个**（治 TD-05-25）────────────────────────────
+    #   `target_r` 用的是**我们自己的 R 刻度**（R = 入场价 − **初始**止损价）；
+    #   他的止盈口径是「**至少 2–3 倍 ADR**」（§10.6③）—— **两者不等价**。
+    #   ⇒ 同报，谁也不假装是另一个（换算唯一实现 = `units.target_price_from_adr`）。
+    if result.trades:
+        _adr, _cls = factors["adr20"], panel.field("close")
+        _ratios = []
+        for _t in result.trades:
+            if _t.entry_day in _adr.index and _t.symbol in _adr.columns:
+                _a, _c = _adr.loc[_t.entry_day, _t.symbol], _cls.loc[_t.entry_day, _t.symbol]
+                if np.isfinite(_a) and np.isfinite(_c) and _a > 0:
+                    _ratios.append((_t.entry_price - _t.initial_stop) / (_a * _c))
+        if _ratios:
+            _m = float(np.median(_ratios))
+            print("  ── ★ 目标价口径（治 TD-05-25）──")
+            print(f"  `target_r` 用**我们的 R 刻度**（R = 入场价 − 初始止损价）；"
+                  f"他的口径是「至少 2–3 倍 ADR」（§10.6③）。")
+            print(f"  ⇒ 两者**不等价**：本样本 R / (1×ADR) 的**中位比 = {_m:.2f}**"
+                  f"（1.00 才是恰好等价）。**同报，不混用**。")
 
     # ★ **默认就出**这两张表 —— 它们最能把问题暴露出来，不该藏在开关后面
     print()

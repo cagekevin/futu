@@ -413,7 +413,7 @@ def test_bh_nan_raises_not_silently_skipped():
     """★ BH：`NaN` 的 p 值 → **报错**（承 P5：缺就是缺，不许静默丢弃）。
 
     ⚠️ 审计修正（2026-10-07）：初版是**静默跳过**（当作"不拒绝"）——
-       那与 `backtest/statistics.py` 的同名函数**语义分歧**（那边 raise），
+       那与 `backtest/panel_statistics.py` 的同名函数**语义分歧**（那边 raise），
        且把"检验做不了"混成了"检验没通过"。
     """
     try:
@@ -444,7 +444,7 @@ def test_bh_alpha_must_be_explicit_and_legal():
 
 
 def test_cross_layer_benjamini_hochberg_matches_backtest():
-    """★ 跨层契约：本层 `benjamini_hochberg` 与 `backtest/statistics.py` 的同名函数
+    """★ 跨层契约：本层 `benjamini_hochberg` 与 `backtest/panel_statistics.py` 的同名函数
     **数值一致 + NaN 语义一致**。
 
     ⚠️ **审计补的测试（2026-10-07）**：`judgement.py` 的注释写着
@@ -453,7 +453,7 @@ def test_cross_layer_benjamini_hochberg_matches_backtest():
     """
     import importlib.util  # noqa: PLC0415
 
-    path = FACTOR_LAYER.parent / "backtest" / "statistics.py"
+    path = FACTOR_LAYER.parent / "backtest" / "panel_statistics.py"
     spec = importlib.util.spec_from_file_location("backtest_statistics", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

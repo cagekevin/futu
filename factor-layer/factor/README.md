@@ -70,6 +70,7 @@ run_factor(name: str, panel: CrossSectionPanel) -> FactorValues   # ★唯一入
 | `atr_pct14` | 真实波幅 / 收盘（**含跳空**）| `high`,`low`,`close` | 14 | **−1** |
 | `adr20` | 日均波幅 / 收盘（**不含跳空**，§10.6 的过滤器）| `high`,`low`,`close` | 20 | **−1** |
 | `rs_rank` | **池内截面相对强度百分位**（IBD 加权 3/6/9/12 月）| `close` | 252 | **+1** |
+| `rs_rank_1m` / `rs_rank_6m` | **同上，但口径是「纯 1 个月」/「纯 6 个月」**（他按场合选：筛 VCP 用 1M、大市值用 6M）| `close` | 21 / 126 | **+1** |
 | `near_52w_high` | `close / 过去 250 天最高价`（**距 52 周新高**）| `high`,`close` | 250 | **+1** |
 
 ### `role = screening`（7 个）—— **筛选原料**，**不参与 IC 评估**

@@ -4,7 +4,7 @@
 
 import pathlib
 
-D = pathlib.Path(r"C:\Users\xinye\Downloads\股股\原始字幕-Tugboat")
+D = pathlib.Path(__file__).resolve().parent.parent / "素材" / "Tugboat字幕"
 
 parts = []
 for f in sorted(D.glob("*.txt")):

@@ -179,7 +179,7 @@ def adr_percent(high: pd.DataFrame, low: pd.DataFrame, close: pd.DataFrame,
     ADR%_t = mean( (high − low) / close , 过去 window 天 )
     ```
 
-    口径出处：`关于策略/9-资料-TradingTugboat.md` §10.6
+    口径出处：`关于策略/Tugboat/9-资料-TradingTugboat.md` §10.6
     （"过去 20 天，每天 `(最高 − 最低) / 收盘`，再取平均"），
     他的**选股过滤器**用它：`< 2.5% → 直接排除`。
 

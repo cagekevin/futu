@@ -685,6 +685,77 @@ def test_reconcile_fills_uses_breakeven_stop_after_partial() -> bool:
     return ok
 
 
+def test_reconcile_fills_covers_close_settled_exits() -> bool:
+    """★ **"收盘结算"类出场也要被对账**（治 TD-05-11）。
+
+    第一版 `reconcile_fills` 只对**入场**与**止损** —— 而 `EXIT_*` 是**封闭枚举**。
+    "覆盖 2/7 却报『成交对账通过』"正是本仓反复出事的形态
+    （同源：`audit_conditions` 的 `if k in prod` 静默跳过）。
+
+    这里造一笔**跌破均线**出场：d3 `close = 95 < ma_exit_level = 98`
+    ⇒ `EXIT_MA_BREAK`，按规则成交价 = **当日收盘 95**（不是开盘 98、不是均线值 98）。
+    """
+    from trade_simulator import reconcile_fills
+
+    bars = [(100, 100, 100, 100),      # d1 信号（止损 95）
+            (100, 101, 99, 100),       # d2 入场 @100
+            (98, 99, 97, 95),          # d3 收盘 95 跌破均线 98 ⇒ 按收盘 95 成交
+            (95, 96, 94, 95)]
+    dates, syms, frames = _make(bars)
+    ma = pd.DataFrame(np.nan, index=list(dates), columns=list(syms))
+    ma.loc[dates[2], SYM] = 98.0                    # 只有 d3 有均线值
+    r = simulate(dates, syms, frames,
+                 pd.DataFrame([("d1", SYM, 95.0)],
+                              columns=["day", "symbol", "stop_price"]),
+                 strategy_name="t", strategy_params={}, ma_exit_level=ma,
+                 exit_policy=ExitPolicy(use_ma_exit=True, target_r=99,
+                                        max_hold_days=9),
+                 account=AccountPolicy(cost_rate=COST))
+    chk = reconcile_fills(r, dates, syms, frames)
+    kinds = [t.exit_reason for t in r.trades]
+    ok = (chk["bad"] == 0 and chk["checked_close"] >= 1
+          and kinds == ["ma_break"]
+          and abs(r.trades[0].exit_price - 95.0) < 1e-9)
+    print(f"{'[PASS]' if ok else '[FAIL]'} 收盘结算类出场也被对账"
+          f"（出场 {kinds}，收盘对账 {chk['checked_close']} 笔，不符 {chk['bad']}）")
+    return ok
+
+
+def test_reconcile_fills_rejects_unknown_exit_reason() -> bool:
+    """★ **穷举守卫**（治 TD-05-11）：出现没登记的出场原因 ⇒ **报错**，不许静默漏对账。
+
+    为什么必须有这条：第一版的病根就是"审不了就静默跳过"。
+    ⇒ 以后新增出场原因时，**强制**作者把它归类到
+      `_CLOSE_SETTLED`（可反推）或 `_UNVERIFIABLE_FILLS`（显形）—— 漏了就跑不动。
+    """
+    from dataclasses import replace as _replace
+
+    from trade_simulator import reconcile_fills
+
+    bars = [(100, 100, 100, 100),      # d1 信号（止损 95）
+            (100, 101, 99, 100),       # d2 入场 @100
+            (90, 92, 88, 91)]          # d3 跳空 ⇒ 止损出场
+    dates, syms, frames = _make(bars)
+    r = simulate(dates, syms, frames,
+                 pd.DataFrame([("d1", SYM, 95.0)],
+                              columns=["day", "symbol", "stop_price"]),
+                 strategy_name="t", strategy_params={},
+                 ma_exit_level=pd.DataFrame(np.nan, index=list(dates),
+                                            columns=list(syms)),
+                 exit_policy=ExitPolicy(use_ma_exit=False, target_r=99,
+                                        max_hold_days=3),
+                 account=AccountPolicy(cost_rate=COST))
+    bogus = _replace(r, trades=[_replace(r.trades[0], exit_reason="bogus")])
+    try:
+        reconcile_fills(bogus, dates, syms, frames)
+    except ValueError as e:
+        ok = "不认识" in str(e)
+        print(f"{'[PASS]' if ok else '[FAIL]'} 未知出场原因 ⇒ 报错（不静默漏对账）")
+        return ok
+    print("[FAIL] 未知出场原因 ⇒ 竟然没报错（静默漏对账）")
+    return False
+
+
 if __name__ == "__main__":
     import traceback
 

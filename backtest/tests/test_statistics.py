@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import unittest
 
-from statistics import (
+from panel_statistics import (
     SINGLE_SERIES_IN_CLUSTER,
     benjamini_hochberg,
     clustered_cmh,

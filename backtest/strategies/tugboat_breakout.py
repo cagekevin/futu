@@ -128,7 +128,10 @@ ENTER_ANTICIPATE = "anticipate"
 ENTER_MODES = (ENTER_BREAKOUT, ENTER_PULLBACK, ENTER_ANTICIPATE)
 
 #: 全部阈值（**默认值就是预注册那一套**；改它 = 开新实验）。
-#: 带 ⚠️ 的是**原文没给数、由我定**的 —— 报告里必须显形。
+#:
+#: ⚠️ **「哪几条是我定的」不在这里手写** —— 出处是 `rules.py::Rule.source`（**数据**），
+#:    报告里由 `RuleSet.summary()` **自动打印**（`run_tugboat.py` 的「规则集」那一行）。
+#:    （这里**曾经**手写「6 个阈值我定的」，而实际只有 1 个 —— 治 TD-05-21。）
 DEFAULTS: Mapping[str, Any] = {
     # ── 他的四条件（§6.1）──
     "tight_days": 5,                 # 他「一般 5 天或以上」
@@ -189,7 +192,12 @@ DEFAULTS: Mapping[str, Any] = {
     "adr_floor": 0.025,              # §10.6①「ADR% < 2.5% 直接排除」（原文）
     # ── §7.1 VCP / §11.5 的其余阈值 ──
     "volume_decline_max": 1.0,       # A6：缩量（`vol_ratio10_50 < 1`）
-    "rsi_change_max": 3.0,           # §11.5 条件①（RSI 3–4 日变化 < 3）
+    # ── §11.5 条件①：**两个条件**（治 TD-05-09）──
+    #   原文：「最近 **3–4 天** RSI **每日**变化 < 3，**且累计** ≤ 5」
+    #   第一版**只写了一个**：`rsi.diff(3).abs() < 3`（= 3 日**累计** < 3）——
+    #   既漏了"每日"那一半，又把"累计 ≤ 5"记成了"累计 < 3"（**比原文更严**）。
+    "rsi_daily_change_max": 3.0,     # 「每日变化 < 3」
+    "rsi_cum_change_max": 5.0,       # 「累计变化 ≤ 5」
     "atr_pct_min": 0.025,            # §11.5 条件④（ATR/收盘 > 2.5%）
     "rsi_min": 50.0,                 # §11.5 条件⑤（RSI > 50）
     # ── ★ 用**哪一套规则集**（并列，不是开关）──
@@ -362,8 +370,10 @@ class TugboatBreakout:
         for name in _MA_DIST[1:]:
             near = np.minimum(near, ma[name].abs())
 
-        # ── §11.5 条件①：RSI 3–4 日变化 < 3 且累计 ≤ 5 ──
-        rsi_chg = rsi.diff(3).abs()
+        # ── §11.5 条件①（**照原文拆成两条**，治 TD-05-09）──
+        #   「最近 3–4 天 RSI **每日**变化 < 3，**且累计** ≤ 5」
+        rsi_chg_daily = rsi.diff(1).abs().rolling(3).max()   # 最近 3 天的**最大单日**变化
+        rsi_chg_cum = rsi.diff(3).abs()                      # 3 日**累计**变化
 
         # ── VCP「收缩 ≥3 次」：在同一条因子上取 k 个递减检查点 ──
         step = int(p["contraction_step"])
@@ -402,7 +412,8 @@ class TugboatBreakout:
             "final_range": daily_rng <= float(p["final_range_max"]),
             "volume_decline": volr < float(p["volume_decline_max"]),
             # ── §11.5 RSI 紧密盘整 ──
-            "rsi_change_3d": rsi_chg < float(p["rsi_change_max"]),
+            "rsi_change_daily": rsi_chg_daily < float(p["rsi_daily_change_max"]),
+            "rsi_change_cum": rsi_chg_cum <= float(p["rsi_cum_change_max"]),
             "atr_pct_floor": atr_pct > float(p["atr_pct_min"]),
             "rsi_above_50": rsi > float(p["rsi_min"]),
             "near_ma": wide(near <= float(p["near_ma_max_atr"])),

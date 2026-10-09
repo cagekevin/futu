@@ -1,6 +1,6 @@
 """
 把 yt-dlp 下载的 .srt 自动字幕，转成干净文本（去时间轴 / 去滚动重复）。
-用法：python 8-工具-srt转文本.py <字幕目录>
+用法：python srt转文本.py <字幕目录>
 """
 
 import sys

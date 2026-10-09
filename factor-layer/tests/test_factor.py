@@ -151,7 +151,8 @@ def test_a2_first_batch_registered():
         "ma_dist_sma150", "ma_dist_sma200",
         "max20", "near_52w_high", "off_low150", "off_low260",
         "range_pct10", "ret150", "ret20", "ret260", "ret5", "ret60",
-        "rs_rank", "rsi14", "skew20", "turn20", "vol20", "vol_ratio10_50",
+        "rs_rank", "rs_rank_1m", "rs_rank_6m",
+        "rsi14", "skew20", "turn20", "vol20", "vol_ratio10_50",
     ]
 
 
