@@ -217,6 +217,11 @@ DEFAULTS: Mapping[str, Any] = {
     #   ⚠️ `ExitPolicy` 的默认是 `None`（关闭），由 `run_tugboat` 用本值显式打开
     #      （见 `trade_simulator.ExitPolicy.early_drop_adr` 的理由：别静默改单测夹具）。
     "early_drop_adr": 2.0,
+    # ── ★ §6.1 提前离场**第 4 条**：「大盘或所在行业发生集体性显著回撤」（治 TD-05-32）──
+    #   判据 = §7.1 方法①②**同时不成立**（`spy_above_20ma <= 0` 且 `net4 < 0`）
+    #   ⇒ **没有我拍的数**（「集体性」= 广度、「显著」= 跌破 20MA，两个词各对一个条件）。
+    #   ⚠️ 「所在行业」那一半**测不了**（票池无行业分类）⇒ 显形，只做「大盘」。
+    "market_exit": True,
     # ── ★ 用**哪一套规则集**（并列，不是开关）──
     #   `"base"`      = §6.1 通用条件 + §10.6① / §8.1 选股过滤器
     #   `"vcp"`       = §7.1 VCP 六要点（**替代** base，不是叠加）
@@ -267,6 +272,10 @@ class TugboatBreakout:
         _ep = exit_policy or ExitPolicy()
         if _ep.early_drop_adr is None:
             _ep = replace(_ep, early_drop_adr=float(self.params["early_drop_adr"]))
+        if not _ep.market_exit:
+            # ★ §6.1 提前离场第 4 条：**大盘集体性显著回撤 ⇒ 离场**（治 TD-05-32）。
+            #   同样"调用方给了就尊重它"（`--sensitivity` 等诊断臂不会被静默改掉）。
+            _ep = replace(_ep, market_exit=bool(self.params["market_exit"]))
         self.exit_policy = _ep
         #: 按日的**大市动能**（列含 `net4` / `spy_above_20ma`）—— **由调用方注入**
         #: （`attach_market_state`），保证本文件不依赖因子层（与 `TugboatExposure` 同款）。

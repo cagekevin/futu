@@ -85,6 +85,9 @@ EXIT_STOP = "stop"
 #: ★ 他 §6.1 提前离场**第 1 条**：「单日大动能下跌（突兀走势）」（行 570）。
 #: 成交价 = **出场日收盘**（与 `_CLOSE_SETTLED` 同款 ⇒ 可反推）。
 EXIT_EARLY_DROP = "early_drop"
+#: ★ 他 §6.1 提前离场**第 4 条**：「**大盘或所在行业发生集体性显著回撤**」（行 573）。
+#: 成交价 = **出场日收盘**（与 `_CLOSE_SETTLED` 同款 ⇒ 可反推）。
+EXIT_MARKET = "market"
 EXIT_TARGET_PARTIAL = "target_partial"
 EXIT_TARGET_FINAL = "target_final"
 EXIT_MA_BREAK = "ma_break"
@@ -177,6 +180,18 @@ class ExitPolicy:
     #:    默认打开会**静默改变它们的夹具语义**。`run_tugboat` 会显式打开
     #:    （值来自 `DEFAULTS["early_drop_adr"]`，**我定的数**，进报告指纹）。
     early_drop_adr: float | None = None
+    #: ★ **大盘集体性显著回撤 ⇒ 离场**（他 §6.1 提前离场**第 4 条**，行 573：
+    #: 「**大盘或所在行业发生集体性显著回撤**」；他的例子：买了核能股 **BWXT**，
+    #: 第三天**整个核能行业集体回调** ⇒ 他先离场）。
+    #:
+    #: 判据 = **§7.1 方法①②同时不成立** —— `spy_above_20ma <= 0`（标普跌破 20 日线）
+    #: **且** `net4 < 0`（跌超 4% 的家数多于升超的）。
+    #: 「**集体性**」= 广度差（`net4`）；「**显著**」= 指数跌破 20MA ⇒ 两个词各对应一个条件，
+    #: **没有我拍的数**。它与入场门槛（`market_gate`）的判据**正好互补**。
+    #:
+    #: ⚠️ **「所在行业」那一半测不了**（票池没有行业分类）⇒ 显形，只做了「大盘」那一半。
+    #: ⚠️ 默认 `False`（理由同 `early_drop_adr`：别静默改单测夹具）。
+    market_exit: bool = False
 
 
 @dataclass(frozen=True)
@@ -460,7 +475,7 @@ def reconcile(result: SimulationResult, cost_rate: float) -> dict[str, Any]:
 #: `reconcile_fills` 能**独立反推**成交价的出场原因（"收盘结算"类：③均线 / ④超时 / 末尾强平）。
 #: 它们的成交价规则就是 `close[出场日]` —— 简单、无需复制模拟器的路径逻辑。
 _CLOSE_SETTLED = (EXIT_MA_BREAK, EXIT_NO_PROGRESS, EXIT_TIME_CAP, EXIT_END_OF_DATA,
-                  EXIT_EARLY_DROP)
+                  EXIT_EARLY_DROP, EXIT_MARKET)
 
 #: **不能**独立反推的出场原因 ⇒ **显形**，不假装覆盖（承 R5：审不了要报错／报出，不许静默跳过）。
 _UNVERIFIABLE_FILLS: dict[str, str] = {
@@ -619,6 +634,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
              ma_exit_level: pd.DataFrame, exit_policy: ExitPolicy,
              account: AccountPolicy,
              adr_ratio: "pd.DataFrame | None" = None,
+             market_state: "pd.DataFrame | None" = None,
              exposure: ExposurePolicy | None = None) -> SimulationResult:
     """跑一次组合模拟。返回交易清单 + 净值曲线 + 跳过计数。
 
@@ -682,6 +698,23 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
         adr_arr = adr_ratio.to_numpy(dtype=float)
     else:
         adr_arr = None
+    # ★ **大盘集体性显著回撤**（§6.1 提前离场**第 4 条**，行 573）—— 与 `adr_ratio` 同款注入。
+    #   判据与入场门槛**互补**：`market_ok = (spy_above_20ma > 0) & (net4 >= 0)`
+    #   ⇒ 离场条件 = **两者同时不成立**（「集体性」= 广度差、「显著」= 跌破 20MA）。
+    if exit_policy.market_exit and market_state is None:
+        raise ValueError(
+            "exit_policy.market_exit 打开了，但没传 `market_state` "
+            "—— 承 P1：不静默兜底")
+    if market_state is not None:
+        miss = [c for c in ("net4", "spy_above_20ma")
+                if c not in market_state.columns]
+        if miss:
+            raise ValueError(f"market_state 缺列 {miss}（承 P1：不静默兜底）")
+        market_ok = ((market_state["spy_above_20ma"] > 0)
+                     & (market_state["net4"] >= 0)
+                     ).reindex(dates).fillna(False).to_numpy(dtype=bool)
+    else:
+        market_ok = None
 
     # 候选 → 入场单（**按 `(arrive, symbol_idx)` 排序** ⇒ 可复现，不依赖行序）
     has_limit = "limit_price" in candidates.columns
@@ -935,6 +968,32 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                         exit_reason=EXIT_EARLY_DROP, hold_days=hold))
                     del positions[j]
                     continue
+
+            # ①c ★ **大盘集体性显著回撤 ⇒ 离场**（他 §6.1 提前离场**第 4 条**，行 573）
+            #   「**大盘或所在行业发生集体性显著回撤**」—— 他的例子：买了核能股 **BWXT**，
+            #   第三天**整个核能行业集体回调** ⇒ 他先离场。
+            #   ⚠️ **「所在行业」那一半测不了**（票池没有行业分类）⇒ 只做了「大盘」那一半。
+            #   ⚠️ 放在止损与单日大跌**之后**：系统性风险是"主动离场"，不是"被打中"。
+            if (p.shares_left > 1e-12 and ep.market_exit and market_ok is not None
+                    and not market_ok[i]):
+                p.realized += (cl - p.entry_price) * p.shares_left
+                notional = cl * p.shares_left
+                c = cost_of(notional)
+                p.cost_paid += c
+                cash += notional - c
+                trades.append(Trade(
+                    symbol=p.symbol, entry_day=p.entry_day,
+                    entry_price=p.entry_price, initial_stop=p.initial_stop,
+                    exit_day=day, exit_price=float(cl), shares=p.shares_initial,
+                    took_partial=p.took_partial,
+                    partial_price=p.partial_price,
+                    partial_shares=p.partial_shares,
+                    r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
+                    return_pct=(p.realized - p.cost_paid)
+                    / (p.shares_initial * p.entry_price),
+                    exit_reason=EXIT_MARKET, hold_days=hold))
+                del positions[j]
+                continue
 
             # ② 止盈（部分）：跳空高开则用**更有利**的开盘价成交
             #    `ep` = 当日适用的出场规则（曝险策略可逐日改它 —— 他阶段④的"2–3 天部分获利"）

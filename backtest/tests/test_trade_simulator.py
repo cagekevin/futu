@@ -23,7 +23,7 @@ import pandas as pd  # noqa: E402
 
 import pnl_engine  # noqa: E402
 from trade_simulator import (  # noqa: E402
-    EXIT_EARLY_DROP, EXIT_STOP, AccountPolicy, ExitPolicy, simulate,
+    EXIT_EARLY_DROP, EXIT_MARKET, EXIT_STOP, AccountPolicy, ExitPolicy, simulate,
 )
 
 COST = 0.0003
@@ -43,7 +43,7 @@ def _make(bars, symbols=(SYM,)):
 
 
 def _run(bars, candidates, *, exit_policy=None, account=None, ma=None,
-         symbols=(SYM,), exposure=None, adr=None):
+         symbols=(SYM,), exposure=None, adr=None, market_state=None):
     dates, syms, frames = _make(bars, symbols)
     if candidates and isinstance(candidates[0], dict):
         frame = pd.DataFrame(candidates)          # 含 limit_price / valid_days
@@ -57,6 +57,7 @@ def _run(bars, candidates, *, exit_policy=None, account=None, ma=None,
         exit_policy=exit_policy or ExitPolicy(),
         account=account or AccountPolicy(cost_rate=COST),
         adr_ratio=adr,
+        market_state=market_state,
         exposure=exposure,
     )
 
@@ -915,6 +916,45 @@ def test_early_drop_requires_adr_ratio() -> bool:
     except ValueError as e:
         raised = "adr_ratio" in str(e)
     print(f"{'[PASS]' if raised else '[FAIL]'} 缺 adr_ratio 时报错而不是静默跳过"
+          f"（raised={raised}）")
+    return raised
+
+
+def test_market_drawdown_exits_position() -> bool:
+    """★ 他 §6.1 提前离场**第 4 条**：「**大盘或所在行业发生集体性显著回撤**」（行 573）。
+
+    判据 = §7.1 方法①②**同时不成立**：`spy_above_20ma <= 0` **且** `net4 < 0`
+    （「集体性」= 广度差；「显著」= 指数跌破 20MA）⇒ **没有我拍的数**。
+
+    判据：把这个分支删掉 ⇒ 本条**必红**（会一直持有到超时）。
+    """
+    bars = [(100, 100, 100, 100)] * 4
+    dates = [f"d{i + 1}" for i in range(len(bars))]
+    ms = pd.DataFrame({"net4": [1.0, 1.0, -1.0, -1.0],
+                       "spy_above_20ma": [1.0, 1.0, 0.0, 0.0]}, index=dates)
+    r = _run(bars, [("d1", SYM, 95.0)], market_state=ms,
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99,
+                                    max_hold_days=9, market_exit=True))
+    got = r.trades[0].exit_reason if r.trades else "?"
+    ok = (len(r.trades) == 1 and got == EXIT_MARKET
+          and r.trades[0].exit_day == "d3")
+    print(f"{'[PASS]' if ok else '[FAIL]'} 大盘集体回撤 ⇒ 离场"
+          f"（原因 {got}，应 {EXIT_MARKET}；出场日 "
+          f"{r.trades[0].exit_day if r.trades else '?'}，应 d3）")
+    return ok
+
+
+def test_market_exit_requires_market_state() -> bool:
+    """★ 打开了「大盘回撤离场」却没传 `market_state` ⇒ **报错**（承 P1：不静默兜底）。"""
+    bars = [(100, 100, 100, 100)] * 3
+    raised = False
+    try:
+        _run(bars, [("d1", SYM, 95.0)],
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99,
+                                    max_hold_days=2, market_exit=True))
+    except ValueError as e:
+        raised = "market_state" in str(e)
+    print(f"{'[PASS]' if raised else '[FAIL]'} 缺 market_state 时报错而不是静默跳过"
           f"（raised={raised}）")
     return raised
 
