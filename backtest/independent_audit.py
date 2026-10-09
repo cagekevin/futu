@@ -38,10 +38,14 @@ def audit_strategy(positions: Sequence[float], target_returns: Sequence[float],
     if n - warmup < 2:
         raise ValueError(f"样本 {n} 根不足以评估（warm-up={warmup}）（承 P1）")
 
-    # ① 基准成本 / ② 成本压力 2x（承 V4）—— 先在**全样本**上算，再统一切到评估区间
+    # ① 基准成本 / ② 成本压力（承 V4）—— 先在**全样本**上算，再统一切到评估区间
+    # ★ 判据档**不在本文件写数字**（治 TD-05-24 的一归面）：
+    #   原来这里与 `run_tugboat` **各写一个 `2.0`** ⇒ 改一处漏一处。
+    #   真源 = `backtest_config.COST_STRESS_JUDGE_MULTIPLE`（V4 的可验证标准原文）。
     full_pnl = pnl_engine.per_bar_pnl(positions, target_returns, backtest_config.COST_RATE)
     full_pnl_2x = pnl_engine.per_bar_pnl(
-        positions, target_returns, backtest_config.COST_RATE * 2.0
+        positions, target_returns,
+        backtest_config.COST_RATE * backtest_config.COST_STRESS_JUDGE_MULTIPLE
     )
 
     # ★ 唯一的评估区间：前 warmup 根不参与任何统计

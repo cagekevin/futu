@@ -64,6 +64,7 @@ import backtest_config
 
 __all__ = [
     "RECENT_TRADES_WINDOW",
+    "SKIP_REASONS",
     "AccountPolicy",
     "AccountState",
     "EntryRequest",
@@ -87,6 +88,48 @@ EXIT_MA_BREAK = "ma_break"
 EXIT_NO_PROGRESS = "no_progress"
 EXIT_TIME_CAP = "time_cap"
 EXIT_END_OF_DATA = "end_of_data"
+
+#: ★ **跳过原因（封闭枚举 + 中文标签）** —— `SimulationResult.skipped` 的合法键集。
+#:
+#: ## 为什么是一张表（治 TD-05-17）
+#:
+#: 原来这里是**四个独立的计数字段**（`skipped_no_slot` / `skipped_exposure` /
+#: `skipped_expired` / `skipped_after_end`），而它们的**口径、单位、展示顺序**
+#: 在生产者（本文件）与消费者（`trade_metrics.render_report`）**各写一份** ⇒
+#: 并排读的时候「重复或漏计」看不出来：
+#:
+#: · **重复**：一张限价单先被"仓位满"挡住（计入 `no_slot`），挂到有效期结束时
+#:   又计一次"限价到期" ⇒ **同一张单被数两次**，四个数相加 ≠ 被跳过的信号数；
+#: · **漏计**：`i >= expire` 且**已持有该标的**的那条路径**直接 `continue`**，
+#:   哪个计数都不进；开盘已跌破止损、价格缺失两条路径同样静默丢弃。
+#:
+#: ⇒ 现在：**唯一记账点** `_skip()` ＋ 一张**穷举**的原因表。
+#:   记账时机 = **这张单离开 `live` 且没成交的那一刻**（不是"被挡的那一天"）：
+#:   被挡住但后来又成交的单**不算跳过**（原来那种"记了又成交"就是重复的来源）。
+#:
+#: ## 谁读这张表
+#:
+#: 生产者给全（键 + 中文标签 + 顺序），消费者**只转发**、按它渲染 —— 承 Step 4 铁律②：
+#: 消费端不许自己拼文案、不许自己决定顺序。
+SKIP_NO_SLOT = "no_slot"
+SKIP_EXPOSURE = "exposure"
+SKIP_EXPIRED = "expired"
+SKIP_HELD = "held"
+SKIP_INVALIDATED = "invalidated"
+SKIP_NO_PRICE = "no_price"
+SKIP_BAD_CANDIDATE = "bad_candidate"
+SKIP_AFTER_END = "after_end"
+
+SKIP_REASONS: Mapping[str, str] = {
+    SKIP_NO_SLOT: "仓位已满",
+    SKIP_EXPOSURE: "总曝险上限",
+    SKIP_EXPIRED: "限价到期未成交",
+    SKIP_HELD: "已有同标的持仓",
+    SKIP_INVALIDATED: "开盘已跌破止损（设置失效）",
+    SKIP_NO_PRICE: "价格缺失或非正",
+    SKIP_BAD_CANDIDATE: "候选无效（不在面板内／止损非有限）",
+    SKIP_AFTER_END: "末日信号（等不到成交）",
+}
 
 
 @dataclass(frozen=True)
@@ -321,14 +364,13 @@ class SimulationResult:
     trades: tuple[Trade, ...]
     equity_days: tuple[str, ...]
     equity_values: tuple[float, ...]
-    skipped_no_slot: int
-    skipped_exposure: int
+    #: ★ **被跳过的信号** —— `原因 → 笔数`，**按信号（订单）计、互斥**。
+    #:
+    #: 键的合法集合 = `SKIP_REASONS`（**穷举**：未知原因会报错，见 `_skip()`）；
+    #: 每张单**恰好计入一个**类别 ⇒ 各项相加 = 被跳过的信号总数（治 TD-05-17）。
+    #: 中文标签也在 `SKIP_REASONS` 里（生产者给全 ⇒ 消费者只转发）。
+    skipped: Mapping[str, int] = field(default_factory=dict)
     daily_exposure: tuple[float, ...] = field(default=())
-    #: 限价单到期没成交的笔数（他的入场②「**超过两天没回撤 ⇒ 放弃**」）。
-    skipped_expired: int = 0
-    #: ★ **末日的信号**：`arrive` 越过数据末尾 ⇒ 永远等不到成交。
-    #: 原来**静默丢弃、不计入任何计数**（复审 G3）⇒ 现在显式报出来。
-    skipped_after_end: int = 0
     #: 每天适用的曝险档位名（供报告画时间序列 —— 承规格 §11.1 的 A6'）。
     stages: tuple[str, ...] = ()
 
@@ -543,11 +585,10 @@ def reconcile_fills(result: SimulationResult, dates, symbols, bars: Mapping[str,
 class _Order:
     """一张活的入场单（市价只能当日成交；限价可挂 `valid_days` 天）。
 
-    `counted`：**这张单是否已经被计入某个 skipped 计数**。
-    ⚠️ 为什么需要它（复审 10.3）：`skipped_no_slot` / `skipped_exposure` 原来写在
-       **日循环里**，而限价单被挡住后会**挂到有效期结束** ⇒ 同一张单会被**记 N 次**，
-       而 `skipped_expired` 是**按单**记的 ⇒ 报告里并排的三个数**口径不同**。
-       ⇒ 现在一律**按单**记一次。
+    ★ **不再需要 `counted` 标记**（治 TD-05-17）：
+    记账时机改成「**离开 `live` 且没成交的那一刻**」—— 一张单只会在那一天
+    离开一次，所以"恰好计入一个类别"是**结构上成立**的，不靠一个布尔标记来兜。
+    （原来记在"被挡住的那一天"，于是同一张单会被记 N 次、且"记了又成交"。）
     """
 
     symbol_idx: int
@@ -555,7 +596,6 @@ class _Order:
     expire: int
     stop: float
     limit: float | None
-    counted: bool = False
 
 
 def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
@@ -612,14 +652,36 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
     has_limit = "limit_price" in candidates.columns
     has_valid = "valid_days" in candidates.columns
     orders: list[_Order] = []
-    #: ★ 末日的信号（`arrive` 越过数据末尾）—— 原来**静默丢弃**（复审 G3）。
-    #: ⚠️ 必须在**订单循环之前**初始化（循环里就要用它计数）。
-    skipped_after_end = 0
+
+    #: ★ **被跳过的信号**（`原因 → 笔数`）—— **唯一记账点**在 `_skip()`（治 TD-05-17）。
+    skipped: dict[str, int] = {k: 0 for k in SKIP_REASONS}
+
+    def _skip(reason: str) -> None:
+        """★ **唯一的跳过记账点** —— 一个信号**恰好**计入一个类别。
+
+        治 TD-05-17 的两种形态：
+        · **重复**：原来记在「被挡住的那一天」⇒ 同一张限价单先被「仓位已满」记一次、
+          挂到有效期结束时又被「限价到期」记一次；而且**记过之后又成交**的单
+          也留在"被跳过"里。现在只在**离开 `live` 且没成交**的那一刻记一次。
+        · **漏计**：`continue` 掉的路径（已持有该标的／开盘已跌破止损／价格缺失／
+          候选越界）原来哪个计数都不进 ⇒ 现在**每条离场路径都必须**在这里分类。
+
+        未知 `reason` ⇒ **报错**（穷举守卫，承 P1：不静默兜底）——
+        与 `reconcile_fills` 里「未知出场原因 ⇒ raise」同款。
+        """
+        if reason not in SKIP_REASONS:
+            raise ValueError(
+                f"未知跳过原因 {reason!r}（合法：{sorted(SKIP_REASONS)}）"
+                "—— 穷举守卫：新增离场路径必须同时在这里分类")
+        skipped[reason] += 1
+
     for row in candidates.itertuples(index=False):
         day, symbol = getattr(row, "day"), getattr(row, "symbol")
         stop = getattr(row, "stop_price")
         i, j = day_idx.get(day), sym_idx.get(symbol)
         if i is None or j is None or not np.isfinite(stop):
+            # ⚠️ 候选越界 / 止损非有限 ⇒ 原来**静默 `continue`**（哪个计数都不进）。
+            _skip(SKIP_BAD_CANDIDATE)
             continue
         limit = getattr(row, "limit_price", None) if has_limit else None
         if limit is not None and not np.isfinite(limit):
@@ -633,9 +695,8 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
         arrive = i if (limit is None and account.trade_on_close) else i + 1
         # ★ **末日的信号永远等不到成交**（复审 G3）：`arrive` 已经越过数据末尾，
         #   主循环不会处理它 —— 原来**静默丢弃、且不计入任何 skipped 计数**。
-        #   ⇒ 显式计数（承 P1：不许静默丢东西）。
         if arrive >= len(dates):
-            skipped_after_end += 1
+            _skip(SKIP_AFTER_END)
             continue
         orders.append(_Order(symbol_idx=j, arrive=arrive, expire=arrive + valid - 1,
                              stop=float(stop),
@@ -653,7 +714,6 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
     equity_days: list[str] = []
     equity_values: list[float] = []
     exposures: list[float] = []
-    skipped_no_slot = skipped_exposure = skipped_expired = 0
     live: list[_Order] = []
     stage_by_day: list[str] = []
     default_settings = ExposureSettings(
@@ -702,18 +762,22 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
         for o in sorted(live, key=lambda x: (x.arrive, x.symbol_idx)):
             j = o.symbol_idx
             op, lo = opens[i, j], lows[i, j]
-            if o.expire < i:                                # 超过有效期 ⇒ 放弃
-                if o.limit is not None:
-                    skipped_expired += 1
+            # ⚠️ **按构造不可达**（`keep` 只收 `i < o.expire` 的单 ⇒ 进入本循环时
+            #    必有 `o.expire >= i`）。保留它只为"任何一条离场路径都必须分类"。
+            if o.expire < i:
+                _skip(SKIP_EXPIRED)
                 continue
             if j in positions:                              # 已持有 ⇒ 挂到到期
                 if i < o.expire:
-                    keep.append(o)
+                    keep.append(o)              # 还在等仓位腾出来 ⇒ 此刻**不记账**
+                else:
+                    _skip(SKIP_HELD)            # 挂到最后一刻仍未成交 ⇒ 记一次
                 continue
             if o.limit is None:                             # 市价单：只有一次机会
                 # 默认按**开盘**；`trade_on_close` 时按**当日收盘**
                 ref = closes[i, j] if account.trade_on_close else op
                 if not np.isfinite(ref) or ref <= 0:
+                    _skip(SKIP_NO_PRICE)        # 原来**静默 `continue`**
                     continue
                 px = float(ref)
             else:                                           # 限价单：碰到才算
@@ -721,29 +785,38 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                     if i < o.expire:
                         keep.append(o)
                     else:
-                        skipped_expired += 1
+                        _skip(SKIP_EXPIRED)
                     continue
                 px = min(o.limit, float(op))                # 开盘更优 ⇒ 按开盘
             if px <= o.stop:
-                continue                # 成交价已在止损下方 ⇒ 不进场（不是"进场即止损"）
-            if len(positions) >= settings.max_positions:
-                if not o.counted:            # ★ 按**单**记一次，不按"单-天"
-                    skipped_no_slot += 1
-                    o.counted = True
-                if i < o.expire:
-                    keep.append(o)
+                # 成交价已在止损下方 ⇒ 不进场（不是"进场即止损"）。
+                # ⚠️ 原来**静默 `continue`** —— 它同样是"一个没变成交易的信号"。
+                _skip(SKIP_INVALIDATED)
                 continue
-            shares = (equity_open * settings.risk_fraction) / (px - o.stop)
+            if len(positions) >= settings.max_positions:
+                if i < o.expire:
+                    keep.append(o)              # 挂着等仓位 ⇒ 此刻**不记账**
+                else:
+                    _skip(SKIP_NO_SLOT)         # 到最后一刻仍没位置 ⇒ 记一次
+                continue
+            # ★ **R 的绝对值不随本金变动**（原文 §2.1 行 102：「100 万 → 105 万，R 仍是 1 万」；
+            #   同节行 103：「**调整频率：每季度 / 每年一次**」）。
+            #   ⇒ 分母用**初始本金**（`account.initial_equity`），**不是**当日开盘权益。
+            #   ⚠️ 原来用 `equity_open` ⇒ **R 随权益浮动**：赚了就放大单笔风险、
+            #      亏了就缩小 —— 那不是他的规则（他的 R 一个季度才动一次）。
+            #   ⚠️ 别把它和「**用利润下注**」混为一谈：后者发生在**总曝险**那一层
+            #      （`held + notional > equity_open × max_total_exposure`，见下方）——
+            #      单笔 R 固定 + 总曝险随利润 ⇒ 两条**同时**成立才是原文的样子。
+            shares = (account.initial_equity * settings.risk_fraction) / (px - o.stop)
             notional = shares * px
             held = sum(p.shares_left * opens[i, jj]
                        for jj, p in positions.items()
                        if np.isfinite(opens[i, jj]))
             if (held + notional) > equity_open * account.max_total_exposure:
-                if not o.counted:            # ★ 同上
-                    skipped_exposure += 1
-                    o.counted = True
                 if i < o.expire:
-                    keep.append(o)
+                    keep.append(o)              # ★ 同上：只在"最后一刻"记一次
+                else:
+                    _skip(SKIP_EXPOSURE)
                 continue
             c = cost_of(notional)
             cash -= notional + c
@@ -961,10 +1034,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
         trades=tuple(trades),
         equity_days=tuple(equity_days),
         equity_values=tuple(equity_values),
-        skipped_no_slot=skipped_no_slot,
-        skipped_exposure=skipped_exposure,
+        skipped=dict(skipped),
         daily_exposure=tuple(exposures),
-        skipped_expired=skipped_expired,
-        skipped_after_end=skipped_after_end,
         stages=tuple(stage_by_day),
     )

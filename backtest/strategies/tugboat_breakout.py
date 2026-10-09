@@ -110,7 +110,7 @@ import pandas as pd
 
 import units
 from strategies.tugboat_rules import (
-    ALL_KEYS, RULESETS, check_coverage,
+    ALL_KEYS, BASE, RULESETS, RSI_TIGHT, VCP, check_coverage, rule_params,
 )
 from trade_simulator import (
     EXIT_STOP, AccountState, ExitPolicy, ExposureSettings,
@@ -127,6 +127,14 @@ ENTER_PULLBACK = "pullback"
 ENTER_ANTICIPATE = "anticipate"
 ENTER_MODES = (ENTER_BREAKOUT, ENTER_PULLBACK, ENTER_ANTICIPATE)
 
+#: ★ **阈值只有一个来源** —— 全部从 `tugboat_rules.Rule.value` **派生**
+#:   （值**带出处**写在那边；这里只留"不是阈值"的参数）。
+#:
+#:   为什么要派生：原来 `DEFAULTS` 与 `Rule.value` **各写一份**
+#:   （`rs_min` 与 `Rule(rs_rank, value=…)` 是同一个数）⇒ 改一处漏一处；
+#:   而 `rule_values()` 早就是为这件事写的、却**没人调用**（治 TD-05-29 的顺带发现）。
+_THRESHOLDS: Mapping[str, Any] = rule_params(BASE, VCP, RSI_TIGHT)
+
 #: 全部阈值（**默认值就是预注册那一套**；改它 = 开新实验）。
 #:
 #: ⚠️ **「哪几条是我定的」不在这里手写** —— 出处是 `rules.py::Rule.source`（**数据**），
@@ -135,31 +143,27 @@ ENTER_MODES = (ENTER_BREAKOUT, ENTER_PULLBACK, ENTER_ANTICIPATE)
 DEFAULTS: Mapping[str, Any] = {
     # ── 他的四条件（§6.1）──
     "tight_days": 5,                 # 他「一般 5 天或以上」
-    "tight_range_max": 0.06,         # ⚠️「够紧」——数值我定
-    "ma_converge_max": 0.02,         # ⚠️「平行或收拢」——数值我定
-    "require_converging": True,      # 他「或**开始收拢**」（不只是平行）
-    "near_ma_max_atr": 1.0,          # 条件②（§11.5「误差 ≤ 1 个 ATR」）
-    "rise_12m_min": 0.50,            # 他「过去 12 个月至少涨过 50%」
-    "no_dump_days": 3,               # ⚠️「最近几天没有高动能下跌」——天数我定
-    "no_dump_adr": 2.0,              # ⚠️「高动能」的量级我定
-    # ★ 「过度延伸」用 **§11.4 的原文口径**：距 50MA 的 **ATR 倍数**
-    #   （原文：「ATR% multiple from 50MA 超过 **10 倍 ATR** ⇒ 过度延伸」）
-    #   ⚠️ 我第一版写的是「距 50MA ≤ **15% 价格**」—— **那是另一个东西**
-    #      （ATR 倍数 vs 价格比例），单位都不对。见 `tugboat_rules.BASE`。
-    "overextend_max": 10.0,          # 单位：ATR 倍数（原文给的数）
-    # ── VCP 六要点（§7.1）──
-    "above_150ma": True,             # A1
-    "rs_min": 0.90,                  # A2（他「90 以上」）
-    "near_high_min": 0.85,           # A3（他「不低于 15%」）
-    "contractions_min": 3,           # A4（他「最好三次或以上」）
+    # ── ★ 阈值**全部派生**（唯一真源 = `tugboat_rules.Rule.value`，带出处）──
+    #   这里原来与 `Rule.value` **各写一份**（`rs_min` vs `Rule(rs_rank, value=…)`）
+    #   ⇒ 改一处漏一处（治 TD-05-29 的顺带发现）。
+    #   ⚠️ 每个阈值的**出处与理由**在 `Rule.note`，**别在这里重写**（那是第二份真相）。
+    #   ⚠️ 曾经有两个**幽灵开关**（`require_converging` / `require_volume_decline`）：
+    #      定义了但全仓无人引用，行为被硬编码 ⇒ 已删（同 TD-05-29）。
+    **_THRESHOLDS,
+    # ⚠️「最近几天没有高动能下跌」的**天数**不是阈值 ⇒ 留在参数里
+    "no_dump_days": 3,
+    # ── VCP 六要点（§7.1）—— 阈值已派生；这里只剩"段落长度"不是阈值 ──
     "contraction_step": 5,           # ⚠️「一段」多长——原文没给
-    "final_range_max": 0.01,         # A5（他「< 1%」）
-    "require_volume_decline": True,  # A6
     # ★ **VCP 六要点是否启用** —— 默认 `False`：
     #   `False` = §6.1 的**通用**突破条件（T1–T8）
     #   `True`  = 只挑 **VCP 那一个形态**（§6.1 三种形态里的"中间盘整"）
     #   见模块 docstring：**两套是并列的，连乘会归零**（实测 4.0e-10）。
     "vcp_filter": False,
+    # ── 形态分界（B1：按「离 52 周高点多近」分 高／中／低）──
+    #   ⚠️ 这两个数原来**硬编码在 `candidates()` 里** ⇒ 不可变更、不可审计、
+    #      **报告指纹不含它**（治 TD-05-20）。现在进 `DEFAULTS`（唯一参数真源）。
+    "form_high_near": 0.95,          # ≥ 此值 ⇒ 高位紧旗（⚠️ 数值我定）
+    "form_low_near": 0.90,           # < 此值 ⇒ 低位（⚠️ 数值我定）
     # ── 突破触发 ──
     "breakout_lookback": 5,          # 他「区间突破」——回看长度我定
     "entry_mode": ENTER_BREAKOUT,    # 他的三种之①（②③ 见 `ENTER_MODES`）
@@ -187,19 +191,19 @@ DEFAULTS: Mapping[str, Any] = {
     #
     #   ⇒ 现在默认 **1.5**（他原文「控制在 **1–1.5 倍 ADR** 之内」的上界），
     #     且**单位换算只走 `units.stop_distance_adr()`**（结构上不可能再写错）。
-    "stop_width_adr": 1.5,
-    # ── 他的两个**选股过滤器**（第一版完全没实现）──
-    "adr_floor": 0.025,              # §10.6①「ADR% < 2.5% 直接排除」（原文）
-    # ── §7.1 VCP / §11.5 的其余阈值 ──
-    "volume_decline_max": 1.0,       # A6：缩量（`vol_ratio10_50 < 1`）
-    # ── §11.5 条件①：**两个条件**（治 TD-05-09）──
-    #   原文：「最近 **3–4 天** RSI **每日**变化 < 3，**且累计** ≤ 5」
-    #   第一版**只写了一个**：`rsi.diff(3).abs() < 3`（= 3 日**累计** < 3）——
-    #   既漏了"每日"那一半，又把"累计 ≤ 5"记成了"累计 < 3"（**比原文更严**）。
-    "rsi_daily_change_max": 3.0,     # 「每日变化 < 3」
-    "rsi_cum_change_max": 5.0,       # 「累计变化 ≤ 5」
-    "atr_pct_min": 0.025,            # §11.5 条件④（ATR/收盘 > 2.5%）
-    "rsi_min": 50.0,                 # §11.5 条件⑤（RSI > 50）
+    # ⚠️ §11.5 条件① 的**弯路留痕**（值在 `rsi_daily_change_max` / `rsi_cum_change_max`）：
+    #   原文是**两个条件**（「最近 3–4 天 RSI **每日**变化 < 3，**且累计** ≤ 5」）；
+    #   第一版只写了一个 `rsi.diff(3).abs() < 3`（= 3 日**累计** < 3）——
+    #   既漏了"每日"那一半，又把"累计 ≤ 5"记成了"累计 < 3"（**比原文更严**，治 TD-05-09）。
+    # ── ★ §7.1「判断大市动能」→ **入场门槛**（治 TD-05-30 的核心那一条）──
+    #   原文：「如果大市具备动能 → VCP 等突破交易的成功率往往比较高」；
+    #        「如果你总是突破失败，**可能并非 VCP 六要点有哪一点没满足**，
+    #          而是你在**不适合的大市状况下**做 VCP 突破」。
+    #   ⚠️ 这**不是**四阶段曝险 —— §2.2 那套是**情绪**维度（已由 `TugboatExposure` 表达），
+    #      本开关管的是「**做不做**」。
+    #   ⚠️ `True` 时**必须**注入市况（`attach_market_state`），否则 `candidates()` 报错
+    #      （承 P1：不静默兜底 —— 不许"没市况就当市况很好"）。
+    "market_gate": True,
     # ── ★ 用**哪一套规则集**（并列，不是开关）──
     #   `"base"`      = §6.1 通用条件 + §10.6① / §8.1 选股过滤器
     #   `"vcp"`       = §7.1 VCP 六要点（**替代** base，不是叠加）
@@ -244,11 +248,45 @@ class TugboatBreakout:
             raise ValueError(
                 f"ruleset 必须是 {sorted(RULESETS)}，收到 {self.params['ruleset']!r}")
         self.exit_policy = exit_policy or ExitPolicy()
+        #: 按日的**大市动能**（列含 `net4` / `spy_above_20ma`）—— **由调用方注入**
+        #: （`attach_market_state`），保证本文件不依赖因子层（与 `TugboatExposure` 同款）。
+        self.market_state: pd.DataFrame | None = None
 
     @property
     def ruleset(self):
         """当前用的那一套规则（**并列三选一**，不是 base + 开关）。"""
         return RULESETS[self.params["ruleset"]]
+
+    def attach_market_state(self, state: pd.DataFrame) -> None:
+        """注入按日的**大市动能**（§7.1 的两个方法）—— `market_gate` 的门槛用它。"""
+        missing = [c for c in ("net4", "spy_above_20ma") if c not in state.columns]
+        if missing:
+            raise ValueError(
+                f"market_state 缺列 {missing}（承 P1：不静默兜底）"
+                " —— §7.1 的两个方法：`net4`（升/跌超 4% 家数占比之差）、"
+                "`spy_above_20ma`（标普是否在 20 日线之上）")
+        self.market_state = state
+
+    def _market_ok(self, panel) -> pd.DataFrame:
+        """★ §7.1 的**两个方法** → 按日的放行布尔，摊成与掩码同形状的宽表。
+
+        | # | 原文方法（§7.1 行 755–758）| 实现 | 判据 |
+        |---|---|---|---|
+        | ① | Stockbee Market Monitor：**当日升超 4% / 跌超 4% 的个股数** | 票池里 `ret > +4%` 与 `ret < −4%` 的**占比之差** `net4` | **`net4 >= 0`** —— 「升超的家数**不少于**跌超的家数」。这是 Market Monitor 的**直接读法**（原文反复说「绿（升超多）和红（跌超多）**相互交错** ⇒ 非常不利」），**不是我拍的阈值** |
+        | ② | **标普 500 能否维持在 20 日线之上**并平稳向上 | `spy_above_20ma` | `> 0` |
+
+        ⚠️ 原文的 Market Monitor 用的是**绝对家数**（「跌超 4% 的股票 **> 300 个**」），
+        而我们的票池只有 **270 只** ⇒ 改用**占比**（已在 `run_tugboat._market_state` 显形）。
+        """
+        if self.market_state is None:
+            raise ValueError(
+                "market_gate=True 但没注入市况 —— 先 `attach_market_state(...)`，"
+                "或显式 `market_gate=False`（承 P1：不静默兜底）")
+        st = self.market_state
+        ok = ((st["spy_above_20ma"] > 0) & (st["net4"] >= 0)
+              ).reindex(panel.dates).fillna(False).to_numpy(dtype=bool)
+        return pd.DataFrame(np.repeat(ok[:, None], len(panel.symbols), axis=1),
+                            index=panel.dates, columns=panel.symbols)
 
     # ── 内部：从 `factors` 里取一张宽表（**缺就报错**，不静默兜底）──────
 
@@ -344,12 +382,6 @@ class TugboatBreakout:
                                 panel.field("low"))
         stop = self._stop_series(panel)
 
-        def wide(x) -> pd.DataFrame:
-            """常量 / 标量摊成同形状的宽表（否则 `&` 会广播出意外形状）。"""
-            if isinstance(x, pd.DataFrame):
-                return x
-            return pd.DataFrame(bool(x), index=close.index, columns=close.columns)
-
         # ── 区间几何（**含今天**；"看昨天"交给 `Rule.as_of`）──
         n = int(p["tight_days"])
         hi_n, lo_n = high_f.rolling(n).max(), low_f.rolling(n).min()
@@ -384,13 +416,23 @@ class TugboatBreakout:
 
         lb = int(p["breakout_lookback"])
 
+        # ★ **「贴近均线」的判据只有一份**（治 TD-05-19）：
+        #   BASE 的 T4（`near_support`）与 RSI_TIGHT 的 ②（`near_ma`）**是同一个表达式**
+        #   （`near` = 到最近一条均线的 ATR 距离）—— 原来两处各写一遍 ⇒ 改一处漏一处。
+        #   ⇒ 在这里算一次，两个 key 引用**同一份**。
+        near_ok = near <= float(p["near_ma_max_atr"])
+
         return {
             # ── §6.1 通用条件 ──
             "tight_range": (hi_n - lo_n) / close <= float(p["tight_range_max"]),
+            # ★ **原文是「或」，不是「且」**（§6.1 行 493：「均线平行**或**开始收拢」）——
+            #   原来写成 `&`（必须同时"够平"且"在收拢"）⇒ 比原文更严。
+            #   漏斗实测：它是**最大的一刀**（砍掉 36,354 格）；改回「或」⇒
+            #   候选 33→63、笔数 29→48、期望 R −0.124→**+0.049**（治 TD-05-29）。
             "ma_converge": (gap / close <= float(p["ma_converge_max"]))
-                           & (gap <= gap.shift(n)),
+                           | (gap <= gap.shift(n)),
             "above_200ma": ma["ma_dist_sma200"] > 0,
-            "near_support": near <= float(p["near_ma_max_atr"]),
+            "near_support": near_ok,
             "rise_12m": ret260 >= float(p["rise_12m_min"]),
             "no_dump": (close / close.shift(1) - 1.0).rolling(
                 int(p["no_dump_days"])).min() > -float(p["no_dump_adr"]) * adr,
@@ -399,6 +441,14 @@ class TugboatBreakout:
             # ── 他的两个**选股过滤器**（第一版完全没实现）──
             "adr_floor": adr >= float(p["adr_floor"]),
             "rs_rank": rs >= float(p["rs_min"]),
+            # ── §10 指标层：两条**筛选器**（治 TD-05-38 的前两条）──
+            #   ① §10.8②「RSI > 50 = 突破交易的核心确认讯号」—— `rsi_above_50` 的实现在
+            #      下面 §11.5 那一段（**同一份**，`RSI_TIGHT` 也用它）；这里只是让 `BASE` 也能取到它。
+            #   ② §10.6 进阶「ADR% 从 5% 收缩到 2% = 突破前兆」—— 比较窗口 `adr_contract_days`
+            #      是**我定的**（原文只说了 ADR 自己的窗口设 3 天更敏感）。
+            #   ⚠️ §10.2「多头排列」试过并**撤回**（与 T2 的"均线收拢"语义互斥 ⇒ 候选归零），
+            #      证据留在 `tugboat_rules.BASE` 的注释里。
+            "adr_contracting": adr < adr.shift(int(p["adr_contract_days"])),
             # ── 突破触发 ──
             "breakout": close > high_f.shift(1).rolling(lb).max(),
             # ── 止损宽度：★ **单位换算只走 `units.py`** ──
@@ -416,7 +466,7 @@ class TugboatBreakout:
             "rsi_change_cum": rsi_chg_cum <= float(p["rsi_cum_change_max"]),
             "atr_pct_floor": atr_pct > float(p["atr_pct_min"]),
             "rsi_above_50": rsi > float(p["rsi_min"]),
-            "near_ma": wide(near <= float(p["near_ma_max_atr"])),
+            "near_ma": near_ok,          # ★ 与 `near_support` **同一份**（治 TD-05-19）
         }
 
     def _masks(self, panel, factors: Mapping[str, pd.DataFrame],
@@ -457,6 +507,10 @@ class TugboatBreakout:
         cond = masks[0][1]
         for _name, m in masks[1:]:
             cond = cond & m
+        # ★ **§7.1 的入场门槛**（治 TD-05-30 的核心那一条）：市况不对 ⇒ **不做突破**。
+        #   这是「**做不做**」，与 `TugboatExposure` 的「做几笔」（§2.2 四阶段，情绪维度）**两件事**。
+        if bool(p["market_gate"]):
+            cond = cond & self._market_ok(panel)
 
         close = panel.field("close")
         stop = self._stop_series(panel)
@@ -464,9 +518,11 @@ class TugboatBreakout:
         prior_hi, prior_lo = self._range_edges(panel)
 
         # ── 形态分类（B1）：按"离 52 周高点多近" ──
+        # ★ 分界值来自 `DEFAULTS`（治 TD-05-20）—— 原来 0.95 / 0.90 硬编码在这里，
+        #   既不可变更、不可审计，也**不进报告指纹**（改了没人知道）。
         form = pd.DataFrame(FORM_MID, index=close.index, columns=close.columns)
-        form = form.where(near_high < 0.95, FORM_HIGH)
-        form = form.where(near_high >= 0.90, FORM_LOW)
+        form = form.where(near_high < float(p["form_high_near"]), FORM_HIGH)
+        form = form.where(near_high >= float(p["form_low_near"]), FORM_LOW)
 
         stack = cond.stack()
         hit = stack[stack.fillna(False)]

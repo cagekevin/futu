@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np  # noqa: E402
 
 import trade_metrics as tm  # noqa: E402
-from trade_simulator import SimulationResult, Trade  # noqa: E402
+from trade_simulator import SKIP_REASONS, SimulationResult, Trade  # noqa: E402
 
 
 def _result(rs, *, reasons=None, equity=None) -> SimulationResult:
@@ -34,7 +34,7 @@ def _result(rs, *, reasons=None, equity=None) -> SimulationResult:
     return SimulationResult(
         strategy="t", params_fingerprint="x", trades=trades,
         equity_days=tuple(f"d{i}" for i in range(len(eq))),
-        equity_values=tuple(eq), skipped_no_slot=0, skipped_exposure=0)
+        equity_values=tuple(eq), skipped={k: 0 for k in SKIP_REASONS})
 
 
 # ── 稳健性 ───────────────────────────────────────────────────────────────

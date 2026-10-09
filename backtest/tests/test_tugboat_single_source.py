@@ -1,0 +1,219 @@
+"""**同一判据只有一份** —— Tugboat 策略层的 SSOT 测试（治 TD-05-19 / TD-05-20）。
+
+## 为什么单立一个文件
+
+`test_tugboat_causality.py` 管的是「**看不看未来**」；
+本文件管的是「**同一件事被实现成几份**」—— 两个**不同**的不变式，别混在一起。
+
+| 测试 | 不变式 |
+|---|---|
+| `test_near_mask_is_single_source` | `near_support`（BASE T4）与 `near_ma`（RSI_TIGHT ②）**必须是同一份判据** |
+| `test_form_boundaries_are_params` | 形态分界（0.95 / 0.90）**必须是 `DEFAULTS` 的参数**，且**真的驱动**分类 |
+
+⚠️ 夹具**复用** `test_tugboat_causality._make()`（同一份确定性面板），
+不在这里再造第二份"造面板"的代码。
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+
+from strategies.tugboat_breakout import (  # noqa: E402
+    DEFAULTS, FORM_HIGH, FORM_LOW, TugboatBreakout,
+)
+from strategies.tugboat_rules import (  # noqa: E402
+    BASE, RSI_TIGHT, VCP, rule_params,
+)
+from tests.test_tugboat_causality import _make  # noqa: E402
+
+
+def test_near_mask_is_single_source() -> bool:
+    """★ `near_support` 与 `near_ma` 必须**逐格相同**（治 TD-05-19）。
+
+    它们本来就是**同一个表达式**（`near <= near_ma_max_atr`）在 `_impl_masks` 里
+    **各写一遍** ⇒ 改一处漏一处。现在算一次、两个 key 引用**同一份**。
+
+    判据：把其中一份改坏（只改一份）⇒ 本条必须红。
+    """
+    panel, factors = _make()
+    impl = TugboatBreakout()._impl_masks(panel, factors)
+    a = impl["near_support"].to_numpy()
+    b = impl["near_ma"].to_numpy()
+    # ⚠️ `equal_nan=True`：两边的 warm-up 期都是 NaN，而 `NaN != NaN`
+    same = np.array_equal(a, b, equal_nan=True)
+    print(f"{'[PASS]' if same else '[FAIL]'} 「贴近均线」判据只有一份"
+          f"（BASE 的 T4 与 RSI_TIGHT 的 ② 逐格相同={same}）")
+    return same
+
+
+def test_form_boundaries_are_params() -> bool:
+    """★ 形态分界必须是 `DEFAULTS` 的参数，且**真的驱动**分类（治 TD-05-20）。
+
+    原来 `0.95` / `0.90` **硬编码在 `candidates()` 里** ⇒ 不可变更、不可审计、
+    **报告指纹不含它**。这里用**同一份面板 + 同一批因子**，只改这两个参数 ⇒
+    `form` 列必须跟着变（否则说明它还在硬编码）。
+
+    判据：把参数改回字面量（`form.where(near_high < 0.95, …)`）⇒ 本条必须红。
+    """
+    panel, factors = _make()
+    # ⚠️ `market_gate=False`：本文件测的是**形态分界**，市况门槛是另一件事
+    #    （它要求注入市况；夹具里没有 ⇒ 显式关掉，而不是让它去 raise）。
+    base = TugboatBreakout(ruleset="rsi_tight",
+                           market_gate=False).candidates(panel, factors)
+    assert not base.empty, "夹具失效：这份面板在 rsi_tight 下没有候选（先修夹具）"
+    day, sym = base.iloc[0]["day"], base.iloc[0]["symbol"]
+
+    # 让那个候选的 `near_52w_high` 变成**有限值** ——
+    # 否则 NaN 恒落到 LOW（NaN 比较恒 False），参数改了也**测不出差别**。
+    nh = factors["near_52w_high"].copy()
+    nh.loc[day, sym] = 0.96
+    factors["near_52w_high"] = nh
+
+    def forms(**over: float) -> list[str]:
+        s = TugboatBreakout(ruleset="rsi_tight", market_gate=False, **over)
+        return sorted(s.candidates(panel, factors)["form"])
+
+    default_forms = forms()                                    # 0.96 ≥ 0.95 ⇒ 高位
+    tightened = forms(form_high_near=0.99, form_low_near=0.98)  # ⇒ 落到低位
+    ok = default_forms == [FORM_HIGH] and tightened == [FORM_LOW]
+    print(f"{'[PASS]' if ok else '[FAIL]'} 形态分界是参数且真的驱动分类"
+          f"（默认 {default_forms} ⇒ 应 [{FORM_HIGH}]；"
+          f"改 0.99/0.98 ⇒ {tightened} ⇒ 应 [{FORM_LOW}]）")
+    return ok
+
+
+def test_ma_converge_is_or_not_and() -> bool:
+    """★ T2 必须是原文的「**或**」—— 不是「且」（治 TD-05-29）。
+
+    原文 §6.1 行 493：「均线**平行 或** 开始收拢」。
+    曾经实现成 `&`（必须同时"够平"**且**"在收拢"）⇒ 比原文更严，
+    是 29 笔的主要成因（漏斗里砍掉 36,354 格，最大的一刀）。
+
+    判据：把实现改回 `&` ⇒ 本条**必红**。
+    """
+    panel, factors = _make()
+    s = TugboatBreakout()
+    mask = s._impl_masks(panel, factors)["ma_converge"].fillna(False).to_numpy(dtype=bool)
+
+    close = panel.field("close")
+    gap = (close.rolling(10).mean() - close.rolling(20).mean()).abs()
+    n = int(s.params["tight_days"])
+    a = (gap / close <= float(s.params["ma_converge_max"])).to_numpy(dtype=bool)
+    b = (gap <= gap.shift(n)).to_numpy(dtype=bool)
+    same_as_or = np.array_equal(mask, a | b)
+    # 反向：必须**严格多于**「且」的通过数（否则"退化成且"也能过）
+    more_than_and = int((a | b).sum()) > int((a & b).sum())
+    ok = same_as_or and more_than_and
+    print(f"{'[PASS]' if ok else '[FAIL]'} T2 是「或」不是「且」"
+          f"（与 A|B 逐格相同={same_as_or}；|B|={int((a | b).sum())} > "
+          f"|A&B|={int((a & b).sum())}={more_than_and}）")
+    return ok
+
+
+def test_thresholds_come_from_the_rule_registry() -> bool:
+    """★ **阈值只有一处来源**（`Rule.value`，带出处）—— `DEFAULTS` 必须与它逐项一致。
+
+    原来 `DEFAULTS` 与 `Rule.value` **各写一份**（`rs_min` vs `Rule(rs_rank, …)`）
+    ⇒ 改一处漏一处（治 TD-05-29 的顺带发现）。
+
+    判据：把 `DEFAULTS` 里的任一派生阈值改回字面量 ⇒ 本条**必红**。
+    """
+    derived = rule_params(BASE, VCP, RSI_TIGHT)
+    bad = {k: (DEFAULTS.get(k), v) for k, v in derived.items() if DEFAULTS.get(k) != v}
+    # ★ `rs_min` 的**值**是 2026-10-09 的**用户决定**（原文 0.90 → **0.85**，
+    #   理由：参考系是池内而非全市场）⇒ 钉在测试里，防被悄悄改回。
+    rs_ok = DEFAULTS["rs_min"] == 0.85
+    ghosts = [k for k in ("require_converging", "require_volume_decline") if k in DEFAULTS]
+    ok = not bad and rs_ok and not ghosts
+    print(f"{'[PASS]' if ok else '[FAIL]'} 阈值只有一处来源（不一致={bad or '无'}；"
+          f"rs_min=0.85={rs_ok}；幽灵开关={ghosts or '无'}）")
+    return ok
+
+
+def test_base_takes_the_indicator_filters() -> bool:
+    """★ §10 指标层的两条筛选器必须**真的进 `BASE`**（不只是写在 `tugboat_rules` 里）。
+
+    出处：§10.8②「**RSI > 50 = 突破交易的核心确认讯号**」（行 1491，**讲的正是突破交易**，
+    原来却只挂在 `RSI_TIGHT` 上）；§10.6 进阶「**ADR% 从 5% 收缩到 2% = 突破前兆**」（行 1461）。
+
+    判据：从 `BASE.rules` 里删掉任一条 ⇒ 本条**必红**（承 TD-05-38）。
+    """
+    want = {"rsi_above_50", "adr_contracting"}
+    declared = {r.key for r in BASE.rules}
+    panel, factors = _make()
+
+    def mask(key: str, **kw):
+        return (TugboatBreakout(**kw)._impl_masks(panel, factors)[key]
+                .fillna(False).to_numpy(dtype=bool))
+
+    missing_decl = sorted(want - declared)
+    missing_impl = sorted(want - set(TugboatBreakout()._impl_masks(panel, factors)))
+    # ★ **行为面**：参数必须**真的驱动掩码**。
+    #   只断"键存在"是弱的 —— 把条件里的参数换成写死的常量，键照样在、条件却形同虚设。
+    #   （不依赖夹具的代表性：只要求"两档参数 ⇒ 两种掩码"，不要求某一档必为全真/全假。）
+    rsi_driven = not np.array_equal(mask("rsi_above_50", rsi_min=1e9),
+                                    mask("rsi_above_50", rsi_min=0.0))
+    adr_driven = not np.array_equal(mask("adr_contracting", adr_contract_days=1000),
+                                    mask("adr_contracting", adr_contract_days=1))
+    ok = (not missing_decl and not missing_impl and rsi_driven and adr_driven)
+    print(f"{'[PASS]' if ok else '[FAIL]'} §10 指标层两条筛选器进了 BASE"
+          f"（未登记={missing_decl or '无'}；未实现={missing_impl or '无'}；"
+          f"参数驱动掩码 rsi={rsi_driven} adr={adr_driven}）")
+    return ok
+
+
+def test_market_gate_blocks_when_momentum_is_bad() -> bool:
+    """★ §7.1 的两个方法必须**真的当门槛**（市况差 ⇒ 不做突破）—— 治 TD-05-30。
+
+    原文：「如果大市具备动能 → VCP 等突破交易的成功率往往比较高」；
+    「如果你总是突破失败，**可能并非 VCP 六要点有哪一点没满足**，而是你在不适合的大市状况下做突破」。
+
+    判据：把 `_market_ok` 的判据改成恒真 ⇒ 本条**必红**（"动能差"那一档会开始出候选）。
+    """
+    panel, factors = _make()
+    dates = list(panel.field("close").index)
+    # ⚠️ 用 `rsi_tight` 而**不是** `base`：`base` 在本夹具下本来就没有候选
+    #    ⇒ `0 == 0` 会把这条测试变成**恒真**（证伪不了）。这条测试要的是"有候选的规则集"。
+    kw = {"ruleset": "rsi_tight"}
+    # ① `market_gate=True` 却没注入市况 ⇒ **报错**（承 P1：不许"没市况就当市况很好"）
+    raised = False
+    try:
+        TugboatBreakout(**kw).candidates(panel, factors)   # 默认 market_gate=True
+    except ValueError as e:
+        raised = "market_gate" in str(e)
+    # ② 动能差 ⇒ 一条都不给；动能好 ⇒ 与"关掉门槛"**逐格相同**
+    s = TugboatBreakout(**kw)
+    s.attach_market_state(pd.DataFrame(
+        {"net4": -1.0, "spy_above_20ma": 0.0}, index=dates))
+    n_bad = len(s.candidates(panel, factors))
+    s.attach_market_state(pd.DataFrame(
+        {"net4": +1.0, "spy_above_20ma": 1.0}, index=dates))
+    n_good = len(s.candidates(panel, factors))
+    n_off = len(TugboatBreakout(market_gate=False, **kw).candidates(panel, factors))
+    ok = raised and n_bad == 0 and n_good > 0 and n_off == n_good
+    print(f"{'[PASS]' if ok else '[FAIL]'} 市况门槛真的在拦人"
+          f"（未注入报错={raised}；动能差候选={n_bad}（应 0）；"
+          f"动能好={n_good}（应 > 0），关掉门槛={n_off}（应相等））")
+    return ok
+
+
+if __name__ == "__main__":
+    import traceback
+
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    failed = 0
+    for fn in fns:
+        try:
+            if not fn():
+                failed += 1
+        except Exception:  # noqa: BLE001
+            failed += 1
+            print(f"[FAIL] {fn.__name__}: 抛异常")
+            traceback.print_exc()
+    print(f"\n{len(fns) - failed}/{len(fns)} passed")
+    sys.exit(1 if failed else 0)

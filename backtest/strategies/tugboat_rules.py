@@ -31,11 +31,13 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from rules import Rule, RuleSet, Source
 
 __all__ = [
-    "ALL_KEYS", "BASE", "RSI_TIGHT", "RULESETS", "VCP", "check_coverage",
-    "rule_values",
+    "ALL_KEYS", "BASE", "PARAM_OF", "RSI_TIGHT", "RULESETS", "VCP",
+    "check_coverage", "rule_params", "rule_values",
 ]
 
 _O = Source.ORIGINAL
@@ -48,7 +50,7 @@ _C = Source.CHOSEN
 
 BASE = RuleSet(
     name="base",
-    label="§6.1 通用突破条件（+ §10.6① / §8.1 选股过滤器）",
+    label="§6.1 通用突破条件（+ §10.6① / §8.1 选股过滤器 + §10 指标层两条）",
     note=(
         "这是他**通用**的入场条件。VCP 六要点**不在这一套里** —— "
         "那是三种形态之一的标准，见 `VCP`（并列，不是叠加）。"),
@@ -58,9 +60,11 @@ BASE = RuleSet(
              note="原文只说「够紧」，**没给数字** ⇒ 这个 6% 是我定的"),
         Rule(key="ma_converge", label="T2 均线平行**或开始收拢**",
              source=_I, where="§6.1 行 483", unit="比例", value=0.02,
-             note="★ **条件是原文（「平行或开始收拢」），但阈值 2% 是我定的** ⇒ "
+             note="★ **条件是原文（「平行**或**开始收拢」），但阈值 2% 是我定的** ⇒ "
                   "按「阈值由谁定」归类为**推断**，不标「原文」"
-                  "（标原文会让读者以为 2% 也是他给的）"),
+                  "（标原文会让读者以为 2% 也是他给的）。"
+                  "⚠️ **实现必须是「或」（`|`）** —— 曾经写成「且」（`&`），"
+                  "比原文更严（治 TD-05-29）；`_impl_masks` 里有对账注释。"),
         Rule(key="above_200ma", label="T3 在 200 日均线之上（上升趋势）",
              source=_O, where="§6.1 行 488", unit="bool"),
         Rule(key="near_support", label="T4 盘整靠近支撑位",
@@ -89,11 +93,35 @@ BASE = RuleSet(
              note="★ 他明写的**选股过滤器**：「< 2.5% 直接排除」"
                   "（§10.6①、§11.5 筛选器、Deepvue 示范三处都写了）。"
                   "我第一版**完全没实现**"),
-        Rule(key="rs_rank", label="选股过滤器：相对强度 ≥ 90",
-             source=_O, where="§8.1 要点2 行 931", unit="百分位", value=0.90,
-             note="原文「RS > 97（**他有时放宽到 > 90**）」⇒ 取放宽值 90。"
-                  "参考系：**池内截面百分位**（与 MarketSmith 的"
-                  "「全市场百分位」**不等价**，我们更严 —— 池子本身是强票）"),
+        Rule(key="rs_rank", label="选股过滤器：相对强度 ≥ 85",
+             source=_C, where="§8.1 要点2 行 931", unit="百分位", value=0.85,
+             note="原文「RS > 97（**他有时放宽到 > 90**）」。"
+                  "★ **我们取 0.85**（2026-10-09，用户决定）："
+                  "参考系是**池内**截面百分位，与 MarketSmith 的「全市场百分位」"
+                  "**不等价** —— 池子本身是「从全市场挑出来的强票」"
+                  "⇒ 池内前 10% 在**绝对强度上更严**，故放宽；"
+                  "取 85（而非 80/90）是**在已实测的两端之间取中**，"
+                  "实测对照见 `daily/架构日志/05-跨区-策略验证Tugboat-2026-10-09.md` §二十七。"),
+        # ── §10 技术指标里**直接进选股**的两条（治 TD-05-38 的前两条）──
+        # ⚠️ **§10.2「多头排列 10>20>50>200」试过，撤回了**（2026-10-09 实测）：
+        #    它与本规则集的 **T2（紧密盘整：均线平行或收拢）语义互斥** ——
+        #    盘整时均线必然**收拢**，而「多头排列」要求均线**有序发散**，两条不可能同时成立。
+        #    漏斗实测：加上它 ⇒ 累计从 **648 格直接归零**（单独通过率 15.32%，正是压死的那一刀）
+        #    ⇒ **一条票都选不出来**。
+        #    ⇒ 它是 §10.1 四层框架里**趋势层**的描述（"做多成功率较高"），
+        #      **不是**一条入场筛选器；趋势那一层已由 T3（200MA 之上）+ T8（200MA 不向下）表达。
+        #    （弯路留痕：这是我读错原文的一次，证据不删。）
+        Rule(key="rsi_above_50", label="§10.8② 突破确认：RSI > 50",
+             source=_O, where="§10.8 行 1491", unit="倍数", value=50.0,
+             note="原文「**RSI > 50 = 突破交易的核心确认讯号**：紧密盘整 + RSI 站上 50 = "
+                  "**双重确认**（**光看紧密盘整不够 —— 假突破太多**）」。"
+                  "⚠️ 原来只把它放进 `RSI_TIGHT`，**`BASE` 没有** —— 而这一条讲的正是"
+                  "**突破交易**的确认，不是 RSI 那一套的。"),
+        Rule(key="adr_contracting", label="§10.6 进阶：ADR% 在收缩（突破前兆）",
+             source=_C, where="§10.6 行 1461", unit="倍数", value=20,
+             note="原文「**ADR% 从 5% 收缩到 2% = 波动收敛、能量累积 → 突破前兆**」。"
+                  "⚠️ 原文**没给比较窗口**（「把回溯期设成 3 天会更敏感」说的是 ADR 的**计算窗口**）"
+                  "⇒ **20 天这个数是我定的**（与 `adr20` 的窗口一致），故标「我定」而非「原文」。"),
         Rule(key="breakout", label="区间突破触发（收盘 > 前 5 日最高）",
              source=_O, where="§6.1 行 470", as_of="today", unit="bool",
              note="★ 入场③「偷步买」**不要求**这一条（那是它的定义）"),
@@ -122,19 +150,35 @@ VCP = RuleSet(
     rules=(
         Rule(key="above_150ma", label="① 股价在 150 日线之上",
              source=_O, where="§7.1 行 703", unit="bool"),
-        Rule(key="rs_rank", label="② 相对强度 ≥ 90",
-             source=_O, where="§7.1 行 704", unit="百分位", value=0.90,
-             note="原文「MarketSmith 的 RS 值，**他一般选 90 以上**」"),
-        Rule(key="near_52w_high", label="③ 接近 52 周新高（不低于 15%）",
-             source=_O, where="§7.1 行 705", unit="比例", value=0.85,
-             note="原文「最好**不低于 52 周新高的 15%**」⇒ `close/high_52w ≥ 0.85`"),
-        Rule(key="contractions", label="④ 波幅收缩**三次或以上**",
-             source=_O, where="§7.1 行 706", unit="倍数", value=3,
-             note="原文「波幅收缩，**最好三次或以上**」"),
-        Rule(key="final_range", label="⑤ 收缩到最后，股价波动 < 1%",
-             source=_O, where="§7.1 行 707", unit="比例", value=0.01,
-             note="★ 原文没说「当日」还是「多日」。取**当日振幅**"
-                  "（多日极差 ≤1% = 两周总共动不到 1% ⇒ 那是**停牌**，语义上不成立）"),
+        Rule(key="rs_rank", label="② 相对强度 ≥ 85",
+             source=_C, where="§7.1 行 704", unit="百分位", value=0.85,
+             note="原文「MarketSmith 的 RS 值，**他一般选 90 以上**」。"
+                  "★ 我们取 **0.85**（同 `BASE`，理由见那一处：参考系是池内而非全市场）"),
+        Rule(key="near_52w_high", label="③ 接近 52 周新高（放宽版：≥ 70%）",
+             source=_C, where="§7.1 行 705", unit="比例", value=0.70,
+             note="原文「**最好**不低于 52 周新高的 15%」⇒ 原读法 `close/high_52w ≥ 0.85`。"
+                  "★ **「最好」不是「必须」**（逐字依据：原文用词）⇒ 2026-10-09 放宽到 0.70"
+                  "（距高点 30%），并把出处从「原文」改成「**我定**」——"
+                  "因为 0.70 这个数是**我拍的**，只有「最好」两个字是他的。"),
+        Rule(key="contractions", label="④ 波幅收缩（放宽版：≥ 2 次）",
+             source=_C, where="§7.1 行 706", unit="倍数", value=2,
+             note="原文「波幅收缩，**最好三次或以上**」⇒ 原读法 `≥ 3`。"
+                  "★ 同上：**「最好三次」⇒ 3 是最佳，2 次可接受** ⇒ 2026-10-09 放宽到 2，"
+                  "出处标「**我定**」（2 这个数是我拍的）。"),
+        Rule(key="final_range", label="⑤ 收缩到最后，股价波动 < 2%（日线近似）",
+             source=_C, where="§7.1 行 707", unit="比例", value=0.02,
+             note="原文「收缩到最后，股价波动 **< 1%**」。\n"
+                  "★ **2026-10-09 取证后改**（原实现 = 当日振幅 ≤ **1%**）：\n"
+                  "  · 日线振幅**中位 3.80%**（p10 = 1.71%）⇒ 「≤1%」是**低于 p10 的罕见一天**，"
+                  "单条通过率仅 **1.43%**，且它是 VCP 的**唯一瓶颈**"
+                  "（放宽 ③④ 后累计 12,946 格，⑤ 一过只剩 **18**，吃掉 **99.86%**）。\n"
+                  "  · 备选读法**全都更严**（3 天每日 ≤1% = 0.53%；3 天区间 ≤1% = 0.45%）"
+                  "⇒ 「多日」不是放宽。\n"
+                  "  · ⇒ **最可能的解释：他是日内交易者**（入场看 1/5/30 分钟），"
+                  "「波动 < 1%」说的是**分钟级**波动 —— **日线里没有这个信息**，"
+                  "拿日线振幅量它**必然过严**。\n"
+                  "  · ⇒ 按「日线等价的极紧」（中位 3.80% 的一半）取 **2%**，"
+                  "出处改标「**我定**」：**2% 这个数是我拍的**，原文只有「< 1%」。"),
         Rule(key="volume_decline", label="⑥ 最后配合成交量下跌",
              source=_O, where="§7.1 行 708", unit="倍数", value=1.0,
              note="`vol_ratio10_50 < 1`（盘整末期缩量）"),
@@ -182,11 +226,76 @@ ALL_KEYS: frozenset[str] = frozenset(
 
 
 def rule_values(rs: RuleSet) -> dict[str, object]:
-    """取出某套规则里**所有 `value`**（供构造参数用）。
+    """取出某套规则里**所有 `value`**（键是**规则键**）—— 供审计/对账用。
 
-    ⇒ 阈值只有一处来源（`Rule.value`），不再散落在 `DEFAULTS` 与文档里。
+    ⚠️ 要**构造参数**请用 `rule_params()`：那个会把键换成 `DEFAULTS` 的参数名。
     """
     return {r.key: r.value for r in rs.rules if r.value is not None}
+
+
+#: ★ **规则键 → `DEFAULTS` 里的参数名**（治 TD-05-29 的顺带发现）。
+#:
+#: ## 为什么需要它
+#:
+#: 阈值的**值**写在 `Rule.value`（本文件，**带出处**），而**参数名**写在
+#: `tugboat_breakout.DEFAULTS` —— 两边键名不同（`rs_rank` vs `rs_min`），
+#: 于是**同一个数字在两处各写一遍**（例如 `0.90` 出现过两次）。
+#: ⇒ 这张表把它们对上，`DEFAULTS` 的阈值部分改成**从 `Rule.value` 派生**
+#:   （见 `tugboat_breakout._THRESHOLDS`）⇒ **值只有一处**。
+#:
+#: ⚠️ 穷举守卫：`Rule` 有 `value` 却不在本表里 ⇒ `rule_params()` **报错**
+#:   （不许"悄悄多一个没人对得上的阈值"）。
+PARAM_OF: Mapping[str, str] = {
+    # BASE
+    "tight_range": "tight_range_max",
+    "ma_converge": "ma_converge_max",
+    "rise_12m": "rise_12m_min",
+    "no_dump": "no_dump_adr",
+    "not_overextended": "overextend_max",
+    "adr_floor": "adr_floor",
+    "rs_rank": "rs_min",
+    "stop_width": "stop_width_adr",
+    # VCP
+    "near_52w_high": "near_high_min",
+    "contractions": "contractions_min",
+    "final_range": "final_range_max",
+    "volume_decline": "volume_decline_max",
+    # §10 指标层（治 TD-05-38）
+    "adr_contracting": "adr_contract_days",
+    # RSI_TIGHT
+    "rsi_change_daily": "rsi_daily_change_max",
+    "rsi_change_cum": "rsi_cum_change_max",
+    "atr_pct_floor": "atr_pct_min",
+    "rsi_above_50": "rsi_min",
+    "near_ma": "near_ma_max_atr",
+    # ⚠️ `near_support`（BASE 的 T4）与 `near_ma`（RSI_TIGHT 的 ②）是**同一个阈值**
+    #    ⇒ 映射到同一个参数名（`rule_params` 允许，值必须一致）。
+    "near_support": "near_ma_max_atr",
+}
+
+
+def rule_params(*rulesets: RuleSet) -> dict[str, object]:
+    """把若干 `RuleSet` 的**阈值**摊成 `DEFAULTS` 用的 `{参数名: 值}`。
+
+    ⇒ **阈值只有一处来源**（`Rule.value`，带出处），`DEFAULTS` 不再抄一份。
+    同一个参数名在两个规则集里值不同 ⇒ **报错**（那说明它们本该是两个参数）。
+    """
+    out: dict[str, object] = {}
+    for rs in rulesets:
+        for r in rs.rules:
+            if r.value is None:
+                continue
+            if r.key not in PARAM_OF:
+                raise ValueError(
+                    f"规则 {r.key!r} 有阈值 {r.value!r}，但 `PARAM_OF` 里没有它的参数名"
+                    " —— 承 R5：阈值必须能对到 `DEFAULTS` 的参数上（穷举，不许漏）")
+            name = PARAM_OF[r.key]
+            if name in out and out[name] != r.value:
+                raise ValueError(
+                    f"参数 {name!r} 在两个规则集里值不同：{out[name]!r} vs {r.value!r}"
+                    " ⇒ 那说明它们本该是两个参数")
+            out[name] = r.value
+    return out
 
 
 def check_coverage(rs: RuleSet, implemented: set[str],

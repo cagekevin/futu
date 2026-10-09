@@ -165,17 +165,87 @@ def _market_state(panel, spy_panel) -> pd.DataFrame:
     spy_close = spy_panel.field("close")["SPY"]
     dist = spy_close / spy_close.rolling(200).mean() - 1.0
 
+    # ── ★ §7.1「判断大市动能」的两个方法（治 TD-05-30）──────────────────────
+    #   ① Stockbee Market Monitor：当日**升超 4% / 跌超 4%** 的个股数
+    #      ⚠️ 原文用**绝对家数**（「跌超 4% 的股票 **> 300 个**」），而我们票池只有 **270 只**
+    #      ⇒ 改用**占比之差** `net4`（显形：这是口径替换，不是照抄他的数字）。
+    #   ② 标普 500 能否**维持在 20 日线之上**（我们原来用的是「距 **200** 日线偏离」——
+    #      那是 §2.2「30 周均线」的代理，**不是** §7.1 的方法②）。
+    #   ⚠️ 两者都**不含今天**（`pct_change` 用到今天收盘，`shift(1)` 在返回处统一做）。
+    ret = close.pct_change()
+    valid_ret = close.notna() & close.shift(1).notna()
+    n_ret = valid_ret.sum(axis=1).replace(0, np.nan)
+    net4 = ((ret > 0.04).sum(axis=1) / n_ret) - ((ret < -0.04).sum(axis=1) / n_ret)
+    above20 = (spy_close > spy_close.rolling(20).mean()).astype(float)
+
     # ★ **整条后移一天**：开盘前能看到的只有截至昨天的状态
     return pd.DataFrame({
         "breadth": breadth.reindex(panel.dates),
         "index_dist_200ma": dist.reindex(panel.dates),
+        "net4": net4.reindex(panel.dates),
+        "spy_above_20ma": above20.reindex(panel.dates),
     }).shift(1)
 
 
-def _replace_account(account):
-    """把成本**翻倍**（测"结果有多依赖成本假设"）。"""
+def _replace_account(account, cost_rate):
+    """换成本率重跑用的账户（成本是**执行假设**，不是策略参数）。"""
     from dataclasses import replace as _r
-    return _r(account, cost_rate=account.cost_rate * 2.0)
+    return _r(account, cost_rate=cost_rate)
+
+
+def cost_stress(run, *, base_cost_rate: float, benchmark,
+                multiples=backtest_config.COST_STRESS_MULTIPLES) -> list[dict]:
+    """★ **成本压力曲线**（承 V4：约束原文要求 **1/2/3/5×**）。
+
+    ## 为什么是一条曲线，不是一个点
+    V4 的**可验证标准**只要求「2x 成本下必须仍盈利」（⇒ 那是**判据**），
+    但 V4 的**约束原文**是「成本压力 **1/2/3/5x**」——
+    只报一个点看不出**形状**：基准已经为负时，
+    「2× 仍不赚」与「成本再降一半也赚不了」是**两件事**，读者分不出来。
+    （手册的验收项写的也是「报告里有 `2x 成本**年化**`」，不是一个布尔。）
+
+    ## 接口
+    `run(cost_rate) -> SimulationResult`：**注入**"按这个成本率跑一次模拟"的入口
+    （与 `panel.provide_reader.Runner` 同款手法）——
+    本函数只负责「换成本率 → 跑 → 取指标」，**不自己造第二套模拟**（承 R1）。
+    """
+    rows: list[dict] = []
+    for m in multiples:
+        rate = base_cost_rate * float(m)
+        rep = trade_metrics.summarize(run(rate), benchmark=benchmark)
+        rows.append({
+            "multiple": float(m),
+            "cost_rate": rate,
+            "annual_return": float(rep["cagr"]),
+            "total_return": float(rep["total_return"]),
+            "profitable": float(rep["total_return"]) > 0.0,
+        })
+    return rows
+
+
+def cost_stress_judge(rows: list[dict]) -> dict:
+    """取 **V4 判据档**那一行（真源 = `backtest_config.COST_STRESS_JUDGE_MULTIPLE`）。
+
+    找不到 ⇒ **报错**（承 P1：判据缺输入不许静默当"没通过"）。
+    """
+    want = float(backtest_config.COST_STRESS_JUDGE_MULTIPLE)
+    for r in rows:
+        if r["multiple"] == want:
+            return r
+    raise KeyError(f"成本压力表里没有判据档 {want:g}× —— 配置自检失效（承 V4）")
+
+
+def render_cost_stress(rows: list[dict]) -> str:
+    """渲染成本压力表 —— **单边 bp 必须显形**（否则"3bp"是黑话）。"""
+    mults = "/".join(f"{r['multiple']:g}" for r in rows)
+    out = ["", f"  ── ★ 成本压力（V4：{mults}×）──",
+           "  倍数      单边(bp)        年化        总收益     仍赚"]
+    for r in rows:
+        out.append(f"  {r['multiple']:>4g}×  {r['cost_rate'] * 1e4:>8.2f}"
+                   f"  {r['annual_return'] * 100:>9.2f}%"
+                   f"  {r['total_return'] * 100:>9.2f}%"
+                   f"  {'是' if r['profitable'] else '**否**'}")
+    return "\n".join(out)
 
 
 def _cluster_p_value(trades) -> tuple[float, int, int]:
@@ -541,6 +611,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="变体：只挑 VCP 那一个形态（§7.1 六要点）")
     ap.add_argument("--no-exposure", action="store_true",
                     help="关掉四阶段曝险（做对照用）")
+    ap.add_argument("--no-market-gate", action="store_true",
+                    help="关掉 §7.1 的**大市动能门槛**（做对照用）")
     ap.add_argument("--start", default=DEFAULT_START, help="起点（默认票池成型那天）")
     ap.add_argument("--stocks-day", default=None, help="票池快照日（默认自动找）")
     ap.add_argument("--iterations", type=int, default=2000, help="蒙特卡洛次数")
@@ -560,7 +632,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"成本   : 单边 {backtest_config.COST_RATE:.5f}"
           f"（往返 ×2 = {backtest_config.COST_RATE * 2:.5f}）")
     print(f"入场   : {args.entry_mode}｜VCP 过滤: {args.vcp}｜"
-          f"四阶段曝险: {not args.no_exposure}")
+          f"四阶段曝险: {not args.no_exposure}｜"
+          f"大市动能门槛: {not args.no_market_gate}")
     print()
 
     # ★★ **面板必须多吃一段预热** —— 否则因子预热落在**评估窗口内部**。
@@ -590,7 +663,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"面板   : {len(panel.dates)} 天 × {len(panel.symbols)} 只"
           f"（含 **{len(warmup)} 天预热**，评估窗口 {len(window)} 天）")
 
-    strategy = TugboatBreakout(entry_mode=args.entry_mode, vcp_filter=args.vcp)
+    strategy = TugboatBreakout(entry_mode=args.entry_mode, vcp_filter=args.vcp,
+                               market_gate=not args.no_market_gate)
     # ★ **出处分布从数据生成**（承 R3：出处只有一处 ⇒ 不可能漂移）——
     #   `RuleSet.summary()` 是 `rules.py` 里**早就有的**能力，这里只是**接线**。
     #   ⇒ 手写「几个阈值是我定的」那类声明**全部作废**，以这一行为准（治 TD-05-21）。
@@ -599,6 +673,10 @@ def main(argv: list[str] | None = None) -> int:
     factors = {n: run_factor(n, panel).values.loc[list(window)]
                for n in REQUIRED_FACTORS}
     market_state = _market_state(panel, spy_panel)      # 也要**在长面板上算**
+    # ★ §7.1 的两个方法 → **入场门槛**（治 TD-05-30）：市况不对 ⇒ 不做突破。
+    #   与 `exposure.attach_market_state` 是**两份用途**：这里管「做不做」，
+    #   那里管「做几笔」（§2.2 四阶段）。同一个 state 喂两处，但判据各取所需。
+    strategy.attach_market_state(market_state)
     panel = _WindowedPanel(panel, window)               # ⇒ 下游自动只看窗口
 
     if args.entries:
@@ -691,7 +769,7 @@ def main(argv: list[str] | None = None) -> int:
     eff_years = max(used / 252.0, 1e-9)
 
     footer = (
-        "\n⚠️ 签五个已经显形的偏差（规格 §11.4）：\n"
+        "\n⚠️ 签六个已经显形的偏差（规格 §11.4）：\n"
         "  ① 催化剂/叙事**测不了** —— 那是他称「最核心」的筛选条件 ⇒ 对他不利\n"
         "  ② 日内入场**测不了**（无分钟数据）⇒ 入场与止损都用日线近似\n"
         "  ③ 四阶段的市场状态只能用「票池宽度 + 指数偏离」代理（情绪无数据）\n"
@@ -704,6 +782,12 @@ def main(argv: list[str] | None = None) -> int:
         "     `walk_forward_validation` 只做「分段一致性」（`train` 段从不被使用、\n"
         "     `gap` 是空操作，见其文件头）⇒ 本报告里**任何一个「最好的参数」\n"
         "     都不是样本外结论**（治 TD-05-13）。\n"
+        "  ⑥ ★ **成本假设**（**执行假设**，不是策略参数）—— 本报告按 "
+        f"**{backtest_config.COST_RATE * 1e4:.1f}bp 单边**估；成交时点是\n"
+        "     「突破日**次日开盘的市价单**」⇒ 其中**滑点部分偏乐观**\n"
+        "     （理由见 `backtest_config.COST_RATE` 注释）。\n"
+        "     ⇒ **结论对成本的依赖看紧随本报告之后的 V4 成本压力表**，\n"
+        "       不要只读基准那一行。\n"
         f"\n⚠️ 检出下限：**{eff_years:.1f} 年**（不是窗口的 {len(window) / 252:.1f} 年）\n"
         f"    —— 因子预热 {WARMUP_DAYS} 天落在窗口外，但**首个信号**在\n"
         f"    {first_signal}，此后才有交易 ⇒ 有效样本从那时算。\n"
@@ -721,14 +805,27 @@ def main(argv: list[str] | None = None) -> int:
     #   ⇒ 在说"说不清"之前先过门；**按门算可能是 INVALID，不是说不清**。
     side_ratio = (float(np.mean(result.daily_exposure))
                   if result.daily_exposure else None)
-    # ★ **2 倍成本还赚不赚** —— 它要**重跑一次**（成本是执行假设，不是策略参数）
-    _ac2 = _replace_account(account)
-    r2 = simulate(panel.dates, panel.symbols, bars, cand,
-                  strategy_name=strategy.name, strategy_params={},
-                  ma_exit_level=ma_exit, exit_policy=strategy.exit_policy,
-                  account=_ac2, exposure=exposure)
-    cost2x_ok = float(trade_metrics.summarize(
-        r2, benchmark=bench)["total_return"]) > 0.0
+    # ★ **成本压力曲线**（承 V4：1/2/3/5×）—— 成本是**执行假设**，不是策略参数，
+    #   且它进的是**现金流**（影响后续每一笔的股数）⇒ 每个档位必须**真的重跑一次**，
+    #   不能拿基准结果按比例缩放（那是第二份、更弱的实现）。
+    def _run_at_cost(cost_rate: float):
+        return simulate(panel.dates, panel.symbols, bars, cand,
+                        strategy_name=strategy.name, strategy_params=strategy.params,
+                        ma_exit_level=ma_exit, exit_policy=strategy.exit_policy,
+                        account=_replace_account(account, cost_rate), exposure=exposure)
+
+    stress = cost_stress(_run_at_cost, base_cost_rate=account.cost_rate, benchmark=bench)
+    # ★ **1× 档必须与主报告逐位一致** —— 否则报告与压力表就是**两份真相**。
+    #   （它顺手把"主报告那次跑"与"压力表那次跑"钉成同一个口径。）
+    _base_row = next(r for r in stress if r["multiple"] == 1.0)
+    if abs(_base_row["total_return"] - float(report["total_return"])) > 1e-9:
+        print(f"\n⛔ 成本压力表的 1× 档（总收益 {_base_row['total_return']:.8f}）与"
+              f"主报告（{float(report['total_return']):.8f}）**不一致**"
+              " ⇒ 两条路径口径不同，报告不可信 —— 已中止。")
+        return 2
+    _judge = cost_stress_judge(stress)
+    cost2x_ok = bool(_judge["profitable"])
+    print(render_cost_stress(stress))
     # ★ **判据只有一个来源**：`walk_forward_validation.judge_verdict`。
     #   `independent_audit`（`run_backtest.py` 那条路）吃**逐 bar 仓位**，
     #   本路径吃**交易级结果** ⇒ 两条入口**形态不同**，但**共用同一个判据**。
@@ -933,7 +1030,7 @@ def main(argv: list[str] | None = None) -> int:
             family.append((f"均线收拢≤{v:.2f}", {"ma_converge_max": v}, "strategy"))
         for v in (0.0, 0.025, 0.04):                  # §10.6① ADR%（原文）
             family.append((f"ADR%≥{v:.3f}", {"adr_floor": v}, "strategy"))
-        for v in (0.80, 0.90, 0.97):                  # §8.1 RS（原文）
+        for v in (0.80, 0.85, 0.90, 0.97):            # §8.1 RS（原文；含默认 0.85）
             family.append((f"RS≥{v:.2f}", {"rs_min": v}, "strategy"))
         for rs in ("base", "vcp", "rsi_tight"):       # 三套并列的规则集
             family.append((f"规则集={rs}", {"ruleset": rs}, "strategy"))

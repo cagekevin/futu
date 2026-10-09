@@ -178,8 +178,8 @@ def test_max_positions_blocks_extra_entries() -> bool:
              [("d1", s, 95.0) for s in "ABCD"], symbols=tuple("ABCD"),
              exit_policy=ExitPolicy(use_ma_exit=False, target_r=99),
              account=AccountPolicy(max_positions=2, cost_rate=COST))
-    ok = r.skipped_no_slot == 2 and len({t.symbol for t in r.trades}) == 2
-    print(f"{'[PASS]' if ok else '[FAIL]'} 持仓位上限：跳过 {r.skipped_no_slot} 只"
+    ok = r.skipped["no_slot"] == 2 and len({t.symbol for t in r.trades}) == 2
+    print(f"{'[PASS]' if ok else '[FAIL]'} 持仓位上限：跳过 {r.skipped['no_slot']} 只"
           f"（应 2），成交 {len({t.symbol for t in r.trades})} 只（应 2）")
     return ok
 
@@ -190,9 +190,9 @@ def test_exposure_cap_blocks_entry() -> bool:
              [("d1", "A", 99.0), ("d1", "B", 99.0)], symbols=("A", "B"),
              exit_policy=ExitPolicy(use_ma_exit=False, target_r=99),
              account=AccountPolicy(max_total_exposure=1.0, cost_rate=COST))
-    ok = r.skipped_exposure == 1
+    ok = r.skipped["exposure"] == 1
     print(f"{'[PASS]' if ok else '[FAIL]'} 曝险上限挡住超杠杆的入场"
-          f"（跳过 {r.skipped_exposure}，应 1）")
+          f"（跳过 {r.skipped['exposure']}，应 1）")
     return ok
 
 
@@ -351,9 +351,127 @@ def test_limit_order_expires_and_is_counted() -> bool:
     r = _run(bars, [{"day": "d1", "symbol": SYM, "stop_price": 90.0,
                      "limit_price": 99.0, "valid_days": 2}],
              exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=2))
-    ok = len(r.trades) == 0 and r.skipped_expired == 1
+    ok = len(r.trades) == 0 and r.skipped["expired"] == 1
     print(f"{'[PASS]' if ok else '[FAIL]'} 限价单到期作废（成交 {len(r.trades)} 笔，"
-          f"到期 {r.skipped_expired}，应 0 笔 / 1 到期）")
+          f"到期 {r.skipped['expired']}，应 0 笔 / 1 到期）")
+    return ok
+
+
+# ── ⑦ ★ 跳过计数的**口径**（治 TD-05-17：不重复、不漏计）──────────────────
+
+def test_blocked_then_filled_is_not_counted_as_skipped() -> bool:
+    """★ 被挡住、**后来又成交**的单 **不算「被跳过」**（治 TD-05-17 的"重复"）。
+
+    原来计数写在「**被挡住的那一天**」⇒ 这张限价单会先进"仓位已满"，
+    然后在有效期最后一天真的成交 —— 于是"跳过 N 笔"里多算了一笔**实际成交**的信号。
+    现在记账时机 = **离开 `live` 且没成交**那一刻 ⇒ 成交了就不记。
+    """
+    bars = [(100, 100, 100, 100),      # d1 两个信号（A 市价 / B 限价 99）
+            (100, 100, 98.0, 100),     # d2 A 成交占掉唯一仓位；B **碰到 99 却被挡**
+            (100, 100, 98.0, 100),     # d3 A 超时离场；B 仍被挡（A 还没走）
+            (100, 100, 98.0, 100),     # d4 仓位腾出 ⇒ B 成交（99）
+            (100, 100, 100, 100)]
+    r = _run(bars,
+             [{"day": "d1", "symbol": "A", "stop_price": 95.0, "valid_days": 1},
+              {"day": "d1", "symbol": "B", "stop_price": 90.0,
+               "limit_price": 99.0, "valid_days": 3}],
+             symbols=("A", "B"),
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=1),
+             account=AccountPolicy(max_positions=1, cost_rate=COST))
+    filled = sorted({t.symbol for t in r.trades})
+    ok = filled == ["A", "B"] and r.skipped["no_slot"] == 0
+    print(f"{'[PASS]' if ok else '[FAIL]'} 被挡后**又成交**的单不计入跳过"
+          f"（成交 {filled}，仓位已满={r.skipped['no_slot']}，应 0）")
+    return ok
+
+
+def test_signal_for_already_held_symbol_is_counted() -> bool:
+    """★ **已持有该标的**时进来的信号：挂到有效期结束仍未成交 ⇒ 计入 `held`。
+
+    原来这条路径（`j in positions` 且 `i >= expire`）**直接 `continue`** ——
+    哪个计数都不进 ⇒ 报告里"被跳过的"**少算**这一类。
+    """
+    bars = [(100, 100, 100, 100)] * 4
+    r = _run(bars,
+             [{"day": "d1", "symbol": SYM, "stop_price": 95.0,        # 市价：d2 成交
+               "valid_days": 1},
+              {"day": "d1", "symbol": SYM, "stop_price": 90.0,         # 同标的限价：永不成交
+               "limit_price": 90.0, "valid_days": 2}],
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=99))
+    ok = len(r.trades) == 1 and r.skipped["held"] == 1
+    print(f"{'[PASS]' if ok else '[FAIL]'} 已持有同标的的信号被计入"
+          f"（成交 {len(r.trades)}，已持有={r.skipped['held']}，应 1 / 1）")
+    return ok
+
+
+def test_entry_below_stop_is_counted() -> bool:
+    """★ 开盘已跌破结构止损 ⇒ 不进场 **且计入** `invalidated`（原来**漏计**）。
+
+    它与 `test_entry_skipped_if_open_already_below_stop` 测的是同一件事，
+    区别是这里盯**计数**：一个"没变成交易的信号"必须在报告里看得见（承 P1）。
+    """
+    bars = [(100, 100, 100, 100), (90, 91, 89, 90), (90, 90, 90, 90)]
+    r = _run(bars, [("d1", SYM, 95.0)],
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=2))
+    ok = len(r.trades) == 0 and r.skipped["invalidated"] == 1
+    print(f"{'[PASS]' if ok else '[FAIL]'} 开盘已跌破止损的信号被计入"
+          f"（成交 {len(r.trades)}，设置失效={r.skipped['invalidated']}，应 0 / 1）")
+    return ok
+
+
+def test_candidate_outside_panel_is_counted() -> bool:
+    """★ 候选指向**面板外的日子** ⇒ 计入 `bad_candidate`（原来**静默 `continue`**）。"""
+    bars = [(100, 100, 100, 100)] * 3
+    r = _run(bars, [("d9", SYM, 95.0)],               # d9 不在 dates 里
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=2))
+    ok = len(r.trades) == 0 and r.skipped["bad_candidate"] == 1
+    print(f"{'[PASS]' if ok else '[FAIL]'} 面板外的候选被计入"
+          f"（成交 {len(r.trades)}，候选无效={r.skipped['bad_candidate']}，应 0 / 1）")
+    return ok
+
+
+def test_missing_open_price_is_counted() -> bool:
+    """★ 成交日**开盘价缺失** ⇒ 计入 `no_price`（原来**静默 `continue`**）。"""
+    nan = float("nan")
+    bars = [(100, 100, 100, 100), (nan, 100, 100, 100), (100, 100, 100, 100)]
+    r = _run(bars, [("d1", SYM, 95.0)],
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=2))
+    ok = len(r.trades) == 0 and r.skipped["no_price"] == 1
+    print(f"{'[PASS]' if ok else '[FAIL]'} 开盘价缺失的信号被计入"
+          f"（成交 {len(r.trades)}，价格缺失={r.skipped['no_price']}，应 0 / 1）")
+    return ok
+
+
+# ── ⑧ ★ R 的口径（原文 §2.1：「R 的绝对值**不随本金变动**」）─────────────
+
+def test_risk_amount_is_fixed_not_scaled_with_equity() -> bool:
+    """★ **R 固定 = 初始本金 × `risk_per_trade`** —— 亏了一笔之后，下一笔的 R **不变**。
+
+    原文 §2.1 行 102：「**R 的绝对值不随本金变动**」（100 万 → 105 万，R 仍是 1 万）；
+    同节行 103：「**调整频率：每季度 / 每年一次**」。
+
+    ⚠️ 原来分母是**当日开盘权益** ⇒ 赚了就放大单笔风险、亏了就缩小 —— 那不是他的规则。
+    判据：把分母改回 `equity_open` ⇒ 本条**必红**（第二笔的 `risk_amount` 会变小）。
+    """
+    bars = [(100, 100, 100, 100),      # d1 信号 A
+            (100, 100, 94, 95),        # d2 A 开盘 100 成交；low 94 ⇒ **当天打止损**（95）
+            (100, 100, 100, 100),      # d3 信号 B（此时权益已经亏了）
+            (100, 100, 100, 100),      # d4 B 开盘 100 成交
+            (100, 100, 100, 100)]
+    acct = AccountPolicy(cost_rate=COST, initial_equity=1_000_000.0,
+                         risk_per_trade=0.01, max_positions=5)
+    r = _run(bars, [("d1", SYM, 95.0), ("d3", SYM, 95.0)],
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=1),
+             account=acct)
+    want = 1_000_000.0 * 0.01                      # = 10,000（固定）
+    #: `Trade` 不存 `risk_amount`，但它是**可反推**的：股数 × 每股风险。
+    risks = [t.shares * (t.entry_price - t.initial_stop) for t in r.trades]
+    equity_moved = abs(r.equity_values[-1] - acct.initial_equity) > 1.0
+    ok = (len(risks) == 2 and equity_moved
+          and all(math.isclose(x, want, rel_tol=1e-9) for x in risks))
+    print(f"{'[PASS]' if ok else '[FAIL]'} R 固定不随权益变动"
+          f"（两笔 risk_amount={[round(x, 2) for x in risks]}，应都是 {want:,.0f}；"
+          f"期末权益 {r.equity_values[-1]:,.2f}，已变动={equity_moved}）")
     return ok
 
 
@@ -375,9 +493,9 @@ def test_exposure_policy_controls_max_positions() -> bool:
              [("d1", s, 95.0) for s in "ABC"], symbols=tuple("ABC"),
              exit_policy=ExitPolicy(use_ma_exit=False, target_r=99),
              exposure=_OneSlotExposure())
-    ok = len({t.symbol for t in r.trades}) == 1 and r.skipped_no_slot == 2
+    ok = len({t.symbol for t in r.trades}) == 1 and r.skipped["no_slot"] == 2
     print(f"{'[PASS]' if ok else '[FAIL]'} 曝险策略能改 `max_positions`"
-          f"（成交 {len({t.symbol for t in r.trades})} 只，跳过 {r.skipped_no_slot}）")
+          f"（成交 {len({t.symbol for t in r.trades})} 只，跳过 {r.skipped['no_slot']}）")
     return ok
 
 
@@ -607,15 +725,15 @@ def test_last_bar_signal_is_counted_not_dropped() -> bool:
     """★ **末日的信号**：`arrive` 越过数据末尾 ⇒ 永远等不到成交。
 
     原来**静默丢弃、不计入任何计数**（复审 G3）⇒ 现在必须计入
-    `skipped_after_end`（承 P1：不许静默丢东西）。
+    `skipped["after_end"]`（承 P1：不许静默丢东西）。
     """
     bars = [(100, 100, 100, 100)] * 4
     dates = [f"d{i + 1}" for i in range(len(bars))]
     r = _run(bars, [(dates[-1], SYM, 95.0)],          # ← 信号在**最后一天**
              exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=2))
-    ok = len(r.trades) == 0 and r.skipped_after_end == 1
+    ok = len(r.trades) == 0 and r.skipped["after_end"] == 1
     print(f"{'[PASS]' if ok else '[FAIL]'} 末日信号被**计数**而不是静默丢弃"
-          f"（成交 {len(r.trades)}，末日跳过 {r.skipped_after_end}，应 0 / 1）")
+          f"（成交 {len(r.trades)}，末日跳过 {r.skipped['after_end']}，应 0 / 1）")
     return ok
 
 

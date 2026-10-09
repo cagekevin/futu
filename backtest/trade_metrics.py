@@ -31,6 +31,9 @@ from typing import Any, Sequence
 import numpy as np
 
 import metrics_core
+#: ★ 跳过原因的**键 + 中文标签 + 顺序**都由生产者给（承 Step 4 铁律①：给全）。
+#: 本模块**只转发**，不自造文案、不自己决定顺序（治 TD-05-17）。
+from trade_simulator import SKIP_REASONS
 
 __all__ = ["ROBUSTNESS_DROP_TOP", "monte_carlo", "render_report", "robustness",
            "summarize"]
@@ -145,12 +148,12 @@ def summarize(result, *, benchmark: Sequence[float] | None = None) -> dict[str, 
         "beta": beta, "corr": corr,
         "ir_raw": ir_raw, "ir_stripped": ir_stripped,
         "benchmark_return": bench_total,
-        # ── 被跳过的 ──
-        "skipped_no_slot": result.skipped_no_slot,
-        "skipped_exposure": result.skipped_exposure,
-        "skipped_expired": result.skipped_expired,
-        # ★ 末日的信号（`arrive` 越过数据末尾）—— 原来静默丢弃（复审 G3）
-        "skipped_after_end": result.skipped_after_end,
+        # ── 被跳过的信号 ──
+        # ★ **口径唯一**（治 TD-05-17）：按**信号（订单）**计、**互斥** ——
+        #   一张单要么成交，要么**恰好**计入一个类别。
+        #   键、中文标签、展示顺序全部来自生产者（`trade_simulator.SKIP_REASONS`），
+        #   本模块**只转发**（承 Step 4 铁律②：消费者不自造文案、不决定顺序）。
+        "skipped": dict(result.skipped),
         "stages": _stage_summary(result.stages),
     }
 
@@ -326,12 +329,16 @@ def render_report(report: dict[str, Any], mc: dict[str, float] | None = None,
             "（真实 164%）")
         lines.append(
             "        ⇒ **真实反而比随机更不集中** ⇒ 这条「危险信号」在本系统上是**误报**")
+    # ★ **被跳过的信号**（治 TD-05-17）：单位写明、**互斥** ⇒ 各项相加就是总数。
+    #   标签与顺序**全部转发**生产者的 `SKIP_REASONS`（消费者不自造文案）。
+    skipped = report["skipped"]
     lines += [
         "",
-        "  ── 被跳过的 ──",
-        f"  仓位满 / 曝险上限 / 限价到期 / **末日信号** : "
-        f"{report['skipped_no_slot']} / {report['skipped_exposure']} / "
-        f"{report['skipped_expired']} / {report['skipped_after_end']}",
+        f"  ── 被跳过的信号（★ 按**信号**计、**互斥**；合计 {sum(skipped.values())}）──",
+    ]
+    for key, label in SKIP_REASONS.items():
+        lines.append(f"  {label:24s}: {skipped[key]:>4d}")
+    lines += [
         "",
         "  ── 曝险档位（他 §2.2 的四阶段）──",
     ]
