@@ -189,10 +189,12 @@ def test_market_gate_blocks_when_momentum_is_bad() -> bool:
     # ② 动能差 ⇒ 一条都不给；动能好 ⇒ 与"关掉门槛"**逐格相同**
     s = TugboatBreakout(**kw)
     s.attach_market_state(pd.DataFrame(
-        {"net4": -1.0, "spy_above_20ma": 0.0, "vol_ratio": 1.0}, index=dates))
+        {"net4": -1.0, "spy_above_20ma": 0.0, "vol_ratio": 1.0,
+         "breadth": 0.5, "index_dist_200ma": 0.0}, index=dates))
     n_bad = len(s.candidates(panel, factors))
     s.attach_market_state(pd.DataFrame(
-        {"net4": +1.0, "spy_above_20ma": 1.0, "vol_ratio": 1.0}, index=dates))
+        {"net4": +1.0, "spy_above_20ma": 1.0, "vol_ratio": 1.0,
+         "breadth": 0.5, "index_dist_200ma": 0.0}, index=dates))
     n_good = len(s.candidates(panel, factors))
     n_off = len(TugboatBreakout(market_gate=False, **kw).candidates(panel, factors))
     ok = raised and n_bad == 0 and n_good > 0 and n_off == n_good
@@ -219,10 +221,12 @@ def test_stop_limit_widens_when_volatility_expands() -> bool:
     weak = float(DEFAULTS["stop_width_adr_weak"])
     s = TugboatBreakout(ruleset="rsi_tight")
     s.attach_market_state(pd.DataFrame(
-        {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 2.0}, index=dates))
+        {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 2.0,
+         "breadth": 0.5, "index_dist_200ma": 0.0}, index=dates))
     got_weak = float(s._stop_limit(panel).to_numpy()[0, 0])
     s.attach_market_state(pd.DataFrame(
-        {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 0.5}, index=dates))
+        {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 0.5,
+         "breadth": 0.5, "index_dist_200ma": 0.0}, index=dates))
     got_ok = float(s._stop_limit(panel).to_numpy()[0, 0])
     got_off = float(TugboatBreakout(ruleset="rsi_tight", market_gate=False)
                     ._stop_limit(panel).to_numpy()[0, 0])
@@ -259,6 +263,42 @@ def test_vcp_soft_conditions_are_optional() -> bool:
     ok = ok_soft and ok_hard and ok_beh
     print(f"{'[PASS]' if ok else '[FAIL]'} VCP 的「一般/最好」三条是 optional"
           f"（软={sorted(soft)}；硬={sorted(hard)}；默认掩码不含软={ok_beh}）")
+    return ok
+
+
+def test_stop_limit_tightens_in_washout_and_euphoria() -> bool:
+    """★ §2.2 阶段①④ ⇒ 止损**收紧**（治 TD-05-39 的剩余两条）。
+
+    原文：「阶段① 疑似见底：小注尝试、**止损设窄**、不成功就快速认错」；
+    「阶段④ 过度延伸：压低曝险 + 节奏变快（**很窄的止损**、2–3 天部分获利）」。
+
+    判据 = 四阶段的**同一份阈值**（`BREADTH_WASHOUT` / `BREADTH_EUPHORIA` / `INDEX_STRETCH`，
+    与 `TugboatExposure` **共用**）⇒ **判据不是我拍的**（只有收紧后的**值**是我定的）。
+
+    判据：把 `washout | euphoria` 那一行删掉 ⇒ 本条**必红**。
+    """
+    panel, factors = _make()
+    dates = list(panel.field("close").index)
+    base = float(DEFAULTS["stop_width_adr"])
+    tight = float(DEFAULTS["stop_width_adr_tight"])
+    s = TugboatBreakout(ruleset="rsi_tight")
+
+    def lim(**over) -> float:
+        row = {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 1.0,
+               "breadth": 0.5, "index_dist_200ma": 0.0}
+        row.update(over)
+        s.attach_market_state(pd.DataFrame(row, index=dates))
+        return float(s._stop_limit(panel).to_numpy()[0, 0])
+
+    got_washout = lim(breadth=0.05)             # ① 疑似见底
+    got_euphoria = lim(breadth=0.95)            # ④ 过度延伸（宽度）
+    got_stretch = lim(index_dist_200ma=0.40)    # ④ 过度延伸（指数偏离）
+    got_normal = lim()                          # 正常
+    ok = (got_washout == tight and got_euphoria == tight
+          and got_stretch == tight and got_normal == base and tight < base)
+    print(f"{'[PASS]' if ok else '[FAIL]'} 阶段①④ ⇒ 止损收紧"
+          f"（见底={got_washout}／亢奋={got_euphoria}／偏离={got_stretch}"
+          f"（都应 {tight}）；正常={got_normal}（应 {base}））")
     return ok
 
 

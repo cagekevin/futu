@@ -222,6 +222,13 @@ DEFAULTS: Mapping[str, Any] = {
     #   ⇒ **没有我拍的数**（「集体性」= 广度、「显著」= 跌破 20MA，两个词各对一个条件）。
     #   ⚠️ 「所在行业」那一半**测不了**（票池无行业分类）⇒ 显形，只做「大盘」。
     "market_exit": True,
+    # ── ★ §2.2 阶段①④ 的**收紧档**（治 TD-05-39 的剩余两条）──
+    #   原文：「阶段① 疑似见底：**止损设窄**」；「阶段④ 过度延伸：**很窄的止损**」。
+    #   判据 = 四阶段里 ①④ 的**同一份阈值**（`BREADTH_WASHOUT` / `BREADTH_EUPHORIA` /
+    #   `INDEX_STRETCH`，与 `TugboatExposure` **共用**）⇒ **判据不是我拍的**。
+    #   ⚠️ **1.0 这个数是我定的** —— 原文只说"窄 / 很窄"，没给数。
+    #      （旁证：§6.1 行 549 他自己说止损「**尽量不大于一个 ADR**」⇒ 1.0 有依据。）
+    "stop_width_adr_tight": 1.0,
     # ── ★ 用**哪一套规则集**（并列，不是开关）──
     #   `"base"`      = §6.1 通用条件 + §10.6① / §8.1 选股过滤器
     #   `"vcp"`       = §7.1 VCP 六要点（**替代** base，不是叠加）
@@ -288,14 +295,16 @@ class TugboatBreakout:
 
     def attach_market_state(self, state: pd.DataFrame) -> None:
         """注入按日的**大市动能**（§7.1 的两个方法）—— `market_gate` 的门槛用它。"""
-        missing = [c for c in ("net4", "spy_above_20ma", "vol_ratio")
+        missing = [c for c in ("net4", "spy_above_20ma", "vol_ratio",
+                               "breadth", "index_dist_200ma")
                    if c not in state.columns]
         if missing:
             raise ValueError(
                 f"market_state 缺列 {missing}（承 P1：不静默兜底）"
                 " —— §7.1 的两个方法：`net4`（升/跌超 4% 家数占比之差）、"
                 "`spy_above_20ma`（标普是否在 20 日线之上）；"
-                "§6.1 的止损维度：`vol_ratio`（票池振幅中位数的扩张比）")
+                "§6.1 的止损维度：`vol_ratio`（票池振幅中位数的扩张比）；"
+                "§2.2 阶段①④：`breadth`（50MA 之上比例）、`index_dist_200ma`")
         self.market_state = state
 
     def _market_ok(self, panel) -> pd.DataFrame:
@@ -338,15 +347,29 @@ class TugboatBreakout:
         if not bool(self.params["market_gate"]):
             return pd.DataFrame(base, index=panel.dates, columns=panel.symbols)
         weak = float(self.params["stop_width_adr_weak"])
+        tight = float(self.params["stop_width_adr_tight"])
         st = self.market_state
         if st is None:
             raise ValueError(
                 "market_gate=True 但没注入市况 —— 先 `attach_market_state(...)`，"
                 "或显式 `market_gate=False`（承 P1：不静默兜底）")
+        idx = st.reindex(panel.dates)
         # ★ **波动在扩张** ⇒ 放宽（`> 1` 是"扩张"的直接读法，不是我拍的阈值）
-        expanding = (st["vol_ratio"] > 1.0).reindex(
-            panel.dates).fillna(False).to_numpy(dtype=bool)
+        expanding = (idx["vol_ratio"] > 1.0).fillna(False).to_numpy(dtype=bool)
         per_day = np.where(expanding, weak, base)
+        # ★ **§2.2 阶段①④ ⇒ 收紧**（治 TD-05-39 的剩余两条）——
+        #   原文：「阶段① 疑似见底：小注尝试、**止损设窄**、不成功就快速认错」；
+        #        「阶段④ 过度延伸：压低曝险 + 节奏变快（**很窄的止损**、2–3 天部分获利）」。
+        #   ⚠️ **档位本身在模拟器侧**（依赖 `AccountState`），策略层拿不到 ——
+        #      但四阶段的**判据是市场状态**，那两个列 `market_state` 里本来就有
+        #      ⇒ 这里用**同一份阈值常量**（`BREADTH_WASHOUT` / `BREADTH_EUPHORIA` /
+        #      `INDEX_STRETCH`，与 `TugboatExposure` **共用**，不是各写一份）。
+        #   优先级：**收紧覆盖放宽**（阶段①④ 是主动的短期状态；波动扩张是环境背景）。
+        washout = (idx["breadth"] < BREADTH_WASHOUT).fillna(False).to_numpy(dtype=bool)
+        euphoria = ((idx["breadth"] > BREADTH_EUPHORIA)
+                    | (idx["index_dist_200ma"] > INDEX_STRETCH)
+                    ).fillna(False).to_numpy(dtype=bool)
+        per_day = np.where(washout | euphoria, tight, per_day)
         return pd.DataFrame(np.repeat(per_day[:, None], len(panel.symbols), axis=1),
                             index=panel.dates, columns=panel.symbols)
 
