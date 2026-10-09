@@ -49,6 +49,8 @@ import pandas as pd  # noqa: E402
 
 import backtest_config  # noqa: E402
 import factor.implementations  # noqa: E402
+import entry_quality  # noqa: E402
+import units  # noqa: E402
 import plateau  # noqa: E402
 import random_control  # noqa: E402
 import statistics as _stats  # noqa: E402
@@ -512,6 +514,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="★ 净值曲线 + 逐年表现 + R 倍数分布")
     ap.add_argument("--free-params", action="store_true",
                     help="★★ **验我自创的近似**（入场时点 / 止损位 / 6 个阈值）会不会翻掉结论")
+    ap.add_argument("--entry-quality", action="store_true",
+                    help="★★ **进场质量筛查**：信号日可观测的量 → 能不能活过 5 天"
+                         "（单变量 + BH，不拟合多元）")
+    ap.add_argument("--eq-alpha", type=float, default=0.05,
+                    help="BH 的 alpha（默认 0.05）")
     ap.add_argument("--plateau", action="store_true",
                     help="★ **邻域稳定性**：扫一条参数轴，看「最好」是尖峰还是平台")
     ap.add_argument("--plateau-metric", default="expectancy_r",
@@ -721,6 +728,61 @@ def main(argv: list[str] | None = None) -> int:
     if args.trades:
         _dump_trades(result, args.trades)
 
+    if args.entry_quality:
+        # ★ **进场质量筛查**（用户要的第 3 条）。
+        #
+        #   为什么只做"单变量 + BH"：样本只有几十笔，拟合多元模型**必然过拟合**。
+        #   为什么特征只能是**信号日可观测**的：用 `hold_days` 当特征 = **同义反复**。
+        order = {d: i for i, d in enumerate(panel.dates)}
+        have = set(zip(cand["day"], cand["symbol"]))
+        feats: list[dict] = []
+        for t in result.trades:
+            ei = order.get(t.entry_day)
+            sig = None
+            if ei is not None:
+                for k in range(ei - 1, max(ei - 6, -1), -1):
+                    if (panel.dates[k], t.symbol) in have:
+                        sig = panel.dates[k]
+                        break
+            if sig is None:
+                continue
+            row: dict = {"_symbol": t.symbol, "_entry": t.entry_day,
+                         "_hold": t.hold_days, "_r": t.r_multiple}
+            for name in REQUIRED_FACTORS:
+                v = factors[name].loc[sig, t.symbol]
+                row[name] = float(v) if np.isfinite(v) else np.nan
+            # ── 结构性特征（信号日可观测）：止损有多宽 ──
+            row["止损宽度_ADR"] = float(units.stop_distance_adr(
+                float(panel.field("close").loc[sig, t.symbol]),
+                float(cand[(cand["day"] == sig) & (cand["symbol"] == t.symbol)]
+                      ["stop_price"].iloc[0]),
+                float(panel.field("close").loc[sig, t.symbol]),
+                float(factors["adr20"].loc[sig, t.symbol])))
+            # ── 市场状态（也是信号日可观测的；已 shift(1)）──
+            if market_state is not None and sig in market_state.index:
+                row["市场_宽度"] = float(market_state.loc[sig, "breadth"])
+                row["市场_SPY距200MA"] = float(
+                    market_state.loc[sig, "index_dist_200ma"])
+            feats.append(row)
+        fd = pd.DataFrame(feats)
+        if fd.empty:
+            print("\n（没有可用的成交，无法筛查）")
+            return 0
+        targets = {
+            "活过 5 天": (fd["_hold"] > 5).astype(int).to_numpy(),
+            "活过 2 天": (fd["_hold"] > 2).astype(int).to_numpy(),
+            "最终赚钱（R>0）": (fd["_r"] > 0).astype(int).to_numpy(),
+        }
+        cols = [c for c in fd.columns if not c.startswith("_")]
+        for tname, y in targets.items():
+            if len(set(y.tolist())) < 2:
+                print(f"\n（「{tname}」只有一类，无法筛查）")
+                continue
+            res = entry_quality.screen(fd[cols], y, target=tname,
+                                       alpha=args.eq_alpha)
+            print(entry_quality.render_screen(res))
+        return 0
+
     if args.plateau:
         # ★ **小样本下唯一能做的过拟合检验**：看「最好」的点周围是尖峰还是平台。
         #
@@ -777,66 +839,133 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.bh:
-        # ★★ **多重检验校正**（复审第 2 条后半）。
+        # ★★ **多重检验校正 —— 把「我试过的全部变体」当一个族报出来**（用户要的第 2 条）。
+        #
         #   复审的原话：「策略注册表 + 阈值网格 ⇒ 必然试 N 次；
-        #   1 − 0.95¹⁸ ≈ **60%** ⇒ **只报单个 p<0.05 而不报分母，等于没做统计。**」
-        #   而 `--matrix` / `--sensitivity` / `--free-params` 正是"同一数据上跑 N 个变体"。
-        from dataclasses import replace as _rep2
+        #   `1 − 0.95¹⁸ ≈ **60%**` ⇒ **只报单个 p<0.05 而不报分母，等于没做统计。**」
+        #
+        #   ⚠️ 关键不是"跑了 BH 函数"，而是 **族要收全**：
+        #      前面 `--matrix` / `--sensitivity` / `--free-params` / `--plateau`
+        #      各自报数字，**谁也不报分母** ⇒ 合起来看就是"挑了最好的那个"。
+        #      ⇒ 这里把**它们全部**收进一个族。
+        from dataclasses import replace as _r5
 
-        combos = []
-        for mode in ENTER_MODES:
-            for exp_on in (True, False):
-                combos.append((f"{mode}｜四阶段={'开' if exp_on else '关'}",
-                               mode, exp_on))
-        ps, tags, info = [], [], []
-        for tag, mode, exp_on in combos:
-            st = TugboatBreakout(entry_mode=mode)
+        def _mk_strategy(prm: dict):
+            return TugboatBreakout(
+                entry_mode=args.entry_mode,
+                **{k: v for k, v in prm.items() if k in DEFAULTS})
+
+        def _run(prm: dict, where: str):
+            """`where` ∈ {strategy, exit, account} —— **参数属于哪必须显式**。"""
+            st = _mk_strategy(prm if where == "strategy" else {})
             c = st.candidates(panel, factors)
             if c.empty:
-                continue
-            ex = exposure if exp_on else StaticExposure()
-            if hasattr(ex, "attach_market_state"):
-                ex.attach_market_state(market_state)
-            rr = simulate(panel.dates, panel.symbols, bars, c,
-                          strategy_name=st.name, strategy_params={},
-                          ma_exit_level=st.ma_exit_level(panel, factors),
-                          exit_policy=st.exit_policy, account=account, exposure=ex)
-            p, obs, k = _cluster_p_value(rr.trades)
-            ps.append(p)
-            tags.append(tag)
-            info.append((len(c), rr, obs, k))
-        finite = [i for i, v in enumerate(ps) if np.isfinite(v)]
+                return None
+            ep, ac = st.exit_policy, account
+            if where == "exit":
+                ep = _r5(ep, **{k: float(v) for k, v in prm.items()})
+            elif where == "account":
+                ac = _r5(ac, **{k: float(v) for k, v in prm.items()})
+            return simulate(panel.dates, panel.symbols, bars, c,
+                            strategy_name=st.name, strategy_params=st.params,
+                            ma_exit_level=st.ma_exit_level(panel, factors),
+                            exit_policy=ep, account=ac, exposure=exposure)
+
+        # ── ★ **族**：我在这份数据上试过的全部变体 ──
+        family: list[tuple[str, dict, str]] = []
+        for mode in ENTER_MODES:                      # 三种入场 × 曝险开关
+            for on in (True, False):
+                family.append((f"入场={mode}｜四阶段={'开' if on else '关'}",
+                               {"entry_mode": mode, "_exposure_on": on}, "entry"))
+        for v in (1.0, 1.25, 1.5, 2.0, 3.0):          # 止损宽度（他的规则，1–1.5）
+            family.append((f"止损宽度={v}×ADR", {"stop_width_adr": v}, "strategy"))
+        for v in (2.0, 3.0, 4.0, 5.0, 6.0):           # 止盈
+            family.append((f"止盈={v:g}R", {"target_r": v}, "exit"))
+        for v in (0.0, 0.33, 0.5, 1.0):               # 部分止盈比例
+            family.append((f"部分止盈={v:.2f}",
+                           {"partial_fraction": v}, "exit"))
+        for v in (0.03, 0.045, 0.06, 0.075, 0.09):    # 紧区间（**唯一我定的**）
+            family.append((f"紧区间≤{v:.3f}", {"tight_range_max": v}, "strategy"))
+        for v in (0.01, 0.02, 0.04):                  # 均线收拢（推断）
+            family.append((f"均线收拢≤{v:.2f}", {"ma_converge_max": v}, "strategy"))
+        for v in (0.0, 0.025, 0.04):                  # §10.6① ADR%（原文）
+            family.append((f"ADR%≥{v:.3f}", {"adr_floor": v}, "strategy"))
+        for v in (0.80, 0.90, 0.97):                  # §8.1 RS（原文）
+            family.append((f"RS≥{v:.2f}", {"rs_min": v}, "strategy"))
+        for rs in ("base", "vcp", "rsi_tight"):       # 三套并列的规则集
+            family.append((f"规则集={rs}", {"ruleset": rs}, "strategy"))
+
+        ps, tags, notes = [], [], []
         print()
-        print("═" * 78)
-        print("★ 多重检验校正（**同一份数据上跑了 N 个变体**）")
+        print("═" * 84)
+        print("★ 多重检验校正 —— **把「我试过的全部变体」当一个族报出来**")
         print(f"  p 值口径：**簇级 bootstrap**（簇 = 交易日）—— 同日多笔**不独立**，"
               f"按笔算会高估显著性")
-        print("─" * 78)
-        print(f"  {'变体':30s}{'候选':>6s}{'笔数':>6s}{'簇数':>6s}"
+        print("  ⚠️ 这不是「跑了 BH 函数」，是 **族收全了**：前面 --matrix / --sensitivity /")
+        print(f"     --free-params / --plateau 各自报数字、**谁也不报分母**")
+        print("─" * 84)
+        print(f"  {'变体':34s}{'候选':>6s}{'笔数':>6s}{'簇数':>6s}"
               f"{'每笔R':>9s}{'p(原始)':>10s}")
-        for i, tag in enumerate(tags):
-            n_c, rr, obs, k = info[i]
+        for tag, prm, where in family:
+            if where == "entry":
+                # ⚠️ **必须把 `entry_mode` 与曝险开关真的传下去** ——
+                #    第一版这里写的是 `_mk_strategy({})` + 恒用 `exposure`，
+                #    于是 6 行**数字一模一样**（看着像"入场没影响"，其实是**没改**）。
+                #    同一个错我在 `--plateau` 上犯过一次（`target_r` 五行相同）。
+                mode = prm["entry_mode"]
+                on = prm["_exposure_on"]
+                st = TugboatBreakout(entry_mode=mode)
+                c = st.candidates(panel, factors)
+                if c.empty:
+                    print(f"  {tag:34s}      —— 候选 0")
+                    continue
+                ex = exposure
+                if not on:
+                    ex = StaticExposure()
+                elif hasattr(ex, "attach_market_state"):
+                    ex.attach_market_state(market_state)
+                rr = simulate(panel.dates, panel.symbols, bars, c,
+                              strategy_name=st.name, strategy_params=st.params,
+                              ma_exit_level=st.ma_exit_level(panel, factors),
+                              exit_policy=st.exit_policy, account=account,
+                              exposure=ex)
+                n_c = len(c)
+            else:
+                rr = _run(prm, where)
+                if rr is None:
+                    print(f"  {tag:34s}      —— 候选 0")
+                    continue
+                n_c = len(cand) if where != "strategy" else len(
+                    _mk_strategy(prm).candidates(panel, factors))
+            pv, obs, k = _cluster_p_value(rr.trades)
             m = trade_metrics.summarize(rr, benchmark=bench)
-            print(f"  {tag:30s}{n_c:>6d}{obs:>6d}{k:>6d}"
-                  f"{m['expectancy_r']:>9.3f}{ps[i]:>10.4f}")
+            ps.append(pv)
+            tags.append(tag)
+            notes.append(f"{n_c}|{obs}|{k}|{m['expectancy_r']}")
+            print(f"  {tag:34s}{n_c:>6d}{obs:>6d}{k:>6d}"
+                  f"{m['expectancy_r']:>9.3f}{pv:>10.4f}")
+
+        finite = [i for i, v in enumerate(ps) if np.isfinite(v)]
+        print("─" * 84)
         if finite:
             res = _stats.benjamini_hochberg([ps[i] for i in finite],
                                             alpha=args.bh_alpha)
-            print("─" * 78)
-            # ⚠️ `res.threshold` 在"一个都不显著"时是 `NaN`（不是 0）——
-            #    直接 `:.4f` 会印出 `nan`，读起来像出错。
             thr = res.threshold
             thr_txt = f"{thr:.4f}" if np.isfinite(thr) else "无（没有变体过线）"
-            print(f"  **BH 校正**（族大小 = **{res.family_size}**，"
-                  f"alpha = {res.alpha}，阈值 = {thr_txt}）")
-            for j, i in enumerate(finite):
-                mark = "✅ 显著" if res.significant[j] else "— 不显著"
-                print(f"    {tags[i]:30s} p={ps[i]:.4f} → "
-                      f"BH p={res.adjusted[j]:.4f}  {mark}")
+            print(f"  **BH 校正**：族大小 = **{res.family_size}**｜"
+                  f"alpha = {res.alpha}｜阈值 = {thr_txt}")
             print(f"  ⇒ **通过 BH 的变体数：{sum(res.significant)} / {res.family_size}**")
+            if not any(res.significant):
+                print()
+                print("  ★★ **一个都没过。** 这正说明为什么必须报分母 ——")
+                print("     若只看原始 p 值，下面这些会「看起来显著」：")
+                for j, i in enumerate(finite):
+                    if ps[i] < args.bh_alpha:
+                        print(f"       {tags[i]:34s} p={ps[i]:.4f} → "
+                              f"**BH p={res.adjusted[j]:.4f}** ✗")
         else:
             print("  （所有变体的 p 值都算不出来 —— 样本/簇数不足）")
-        print("─" * 78)
+        print("─" * 84)
         print("  ⚠️ 不报分母的 p 值是**没有意义**的 —— 这就是为什么这张表要一起给。")
         return 0
 
