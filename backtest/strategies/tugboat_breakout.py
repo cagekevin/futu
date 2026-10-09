@@ -222,6 +222,11 @@ DEFAULTS: Mapping[str, Any] = {
     #   ⇒ **没有我拍的数**（「集体性」= 广度、「显著」= 跌破 20MA，两个词各对一个条件）。
     #   ⚠️ 「所在行业」那一半**测不了**（票池无行业分类）⇒ 显形，只做「大盘」。
     "market_exit": True,
+    # ── ★ **跑赢基准才做**（§8.1「RS > 90」的**时序**版本；治 TD-05-30）──
+    #   判据 = `ret260(个股) − ret260(SPY) > 0`（跑赢基准）⇒ **零魔法数字**（0 有出处：
+    #   `vcp-signals.TrendConfig.rs_min_avg = 0.0`）。
+    #   ⚠️ 它是**门槛**（gate），不是打分项 —— 与 `vcp-signals` 的 `--trend-gate` 同款。
+    "bench_gate": True,
     # ── ★ §2.2 阶段①④ 的**收紧档**（治 TD-05-39 的剩余两条）──
     #   原文：「阶段① 疑似见底：**止损设窄**」；「阶段④ 过度延伸：**很窄的止损**」。
     #   判据 = 四阶段里 ①④ 的**同一份阈值**（`BREADTH_WASHOUT` / `BREADTH_EUPHORIA` /
@@ -301,7 +306,7 @@ class TugboatBreakout:
     def attach_market_state(self, state: pd.DataFrame) -> None:
         """注入按日的**大市动能**（§7.1 的两个方法）—— `market_gate` 的门槛用它。"""
         missing = [c for c in ("net4", "spy_above_20ma", "vol_ratio",
-                               "breadth", "index_dist_200ma")
+                               "breadth", "index_dist_200ma", "spy_ret260")
                    if c not in state.columns]
         if missing:
             raise ValueError(
@@ -332,6 +337,32 @@ class TugboatBreakout:
               ).reindex(panel.dates).fillna(False).to_numpy(dtype=bool)
         return pd.DataFrame(np.repeat(ok[:, None], len(panel.symbols), axis=1),
                             index=panel.dates, columns=panel.symbols)
+
+    def _rs_vs_spy(self, panel, factors: Mapping[str, pd.DataFrame],
+                   ) -> pd.DataFrame:
+        """★ **个股 vs SPY 的相对强度**（他 §8.1「RS > 90」的**时序**版本）——
+        治 TD-05-30（B 的市况/趋势层），出处是**外部 A/B 验证**：
+
+        | 来源 | 事实 |
+        |---|---|
+        | `vcp-signals` v2 | **纯 VCP 反预测**：60d 超额 **−0.97pp**（vs 非信号）、**−2.38pp**（vs SPX）；16 组阈值扫描**全输** |
+        | `vcp-signals` v3 | 加 **Stage-2 趋势模板 + RS vs SPY** ⇒ 60d **+1.87% → +3.30%**、Sharpe/笔 **0.13 → 0.21**、**vs SPX −2.4pp → +0.6pp**（翻符号）、亏 ≥30% 的交易 **28 → 0** |
+        | 它自己的配置 | `TrendConfig.rs_min_avg = 0.0`（**require average RS > 0**）|
+
+        ⇒ 判据 = **`ret260(个股) − ret260(SPY) > 0`**（跑赢基准）—— **零魔法数字**（0 有出处）。
+        ⚠️ 这是**时序**判据（票 vs 基准），**不是**横截面排名：
+           我们的 `rs_rank` 是池内百分位（横截面），池子只 270 只，
+           实测截面排位 **53.2%**（门槛 95%）⇒ 那条在本池上**没有分辨力**。
+        """
+        if self.market_state is None:
+            raise ValueError(
+                "bench_gate=True 但没注入市况 —— 先 `attach_market_state(...)`，"
+                "或显式 `bench_gate=False`（承 P1：不静默兜底）")
+        st = self.market_state
+        spy = st["spy_ret260"].reindex(panel.dates)
+        ret = self._get(factors, "ret260")
+        # `ret260` 是宽表（日 × 标的）、`spy` 是按日的 ⇒ **按行**广播（`axis=0`）
+        return ret.sub(spy, axis=0) > 0.0
 
     def _stop_limit(self, panel) -> pd.DataFrame:
         """★ **止损宽度的上限**（按日）—— §6.1「止损**结合 SA**」（治 TD-05-39）。
@@ -610,6 +641,10 @@ class TugboatBreakout:
         #   这是「**做不做**」，与 `TugboatExposure` 的「做几笔」（§2.2 四阶段，情绪维度）**两件事**。
         if bool(p["market_gate"]):
             cond = cond & self._market_ok(panel)
+        # ★ **跑赢基准才做**（§8.1「RS > 90」的**时序**版本；治 TD-05-30）
+        #   出处 = `vcp-signals` v3 的 A/B（那是唯一被证明能翻正的一层）。
+        if bool(p["bench_gate"]):
+            cond = cond & self._rs_vs_spy(panel, factors)
 
         close = panel.field("close")
         stop = self._stop_series(panel)

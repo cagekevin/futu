@@ -187,6 +187,15 @@ def _market_state(panel, spy_panel) -> pd.DataFrame:
     med = rng.median(axis=1)
     vol_ratio = med.rolling(20).mean() / med.rolling(20).mean().shift(20)
 
+    # ── ★ **SPY 的 260 日收益**（个股「vs SPY 相对强度」的基准）──
+    #   出处：`vcp-signals` 的 `TrendConfig.rs_min_avg = 0.0`（**require average RS > 0**）
+    #   —— 那是它 v3 里**唯一被 A/B 证明能翻正**的两样之一（Stage-2 趋势模板 + RS vs SPY），
+    #   实测把 60d 超额从 **−2.4pp 翻到 +0.6pp**、亏 ≥30% 的交易 **28 → 0**。
+    #   ⚠️ 这是**时序上的相对强度**（票 vs 基准），**不是**横截面排名 ——
+    #      我们原来的 `rs_rank` 是**池内**百分位（横截面），池子只 270 只，
+    #      实测截面排位 **53.2%**（门槛 95%）⇒ 那条在本池上没有分辨力。
+    spy_ret260 = spy_close / spy_close.shift(260) - 1.0
+
     # ★ **整条后移一天**：开盘前能看到的只有截至昨天的状态
     return pd.DataFrame({
         "breadth": breadth.reindex(panel.dates),
@@ -194,6 +203,7 @@ def _market_state(panel, spy_panel) -> pd.DataFrame:
         "net4": net4.reindex(panel.dates),
         "spy_above_20ma": above20.reindex(panel.dates),
         "vol_ratio": vol_ratio.reindex(panel.dates),
+        "spy_ret260": spy_ret260.reindex(panel.dates),
     }).shift(1)
 
 

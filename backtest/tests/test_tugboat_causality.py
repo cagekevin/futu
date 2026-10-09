@@ -103,7 +103,7 @@ def _perturb_after(panel: _Panel, factors: dict[str, pd.DataFrame], cut: int,
 
 def _mask_at(panel: _Panel, factors: dict[str, pd.DataFrame], label: str,
              cut: int) -> np.ndarray:
-    s = TugboatBreakout(market_gate=False)
+    s = TugboatBreakout(market_gate=False, bench_gate=False)
     for lbl, m in s._masks(panel, factors):
         if label in lbl:
             return m.to_numpy()[cut]
@@ -182,7 +182,7 @@ def test_rule_masks_ignore_future() -> bool:
     cut = 280
     p2, f2 = _perturb_after(panel, factors, cut)
 
-    s = TugboatBreakout(market_gate=False)
+    s = TugboatBreakout(market_gate=False, bench_gate=False)
     labels = [lbl for lbl, _ in s._masks(panel, factors)]
     bad = []
     for lbl in labels:
