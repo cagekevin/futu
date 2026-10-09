@@ -511,18 +511,26 @@ class TugboatBreakout:
         }
 
     def _masks(self, panel, factors: Mapping[str, pd.DataFrame],
-               ruleset=None) -> list[tuple[str, pd.DataFrame]]:
+               ruleset=None, include_optional: bool = False,
+               ) -> list[tuple[str, pd.DataFrame]]:
         """按 `RuleSet` 取条件掩码 —— **`candidates` 与 `diagnose` 共用**（防分叉）。
 
         ★ **覆盖检查在这里**（承 R5：审计必须穷举）：
           规则里声明了但没实现 ⇒ 报错；实现了但**任何规则集里都没登记** ⇒ 报错。
           （上一版的对账工具用 `if k in prod` 静默跳过，**恰好漏掉唯一有 bug 的那条**。）
+
+        ★ `include_optional` —— 原文写「**一般 / 最好**」的那些条件（`Rule.optional`）：
+          · `False`（默认，`candidates` 用）⇒ **跳过**：它们是**偏好**，不参与排除
+            （原文：「他**一般**选 90 以上」「**最好**不低于 15%」「**最好**三次或以上」）；
+          · `True`（`diagnose` 用）⇒ 全印出来 —— **他看的是六样，一样不少**。
         """
         rs = ruleset if ruleset is not None else self.ruleset
         impl = self._impl_masks(panel, factors)
         check_coverage(rs, set(impl), all_declared=ALL_KEYS)
         out = []
         for r in rs.rules:
+            if r.optional and not include_optional:
+                continue
             m = impl[r.key]
             if r.as_of == "yesterday":
                 m = m.shift(1)          # ★ "看哪天"由登记表决定，只有这一处
@@ -598,12 +606,19 @@ class TugboatBreakout:
         逐个条件**累计**统计剩余格数；掉得最多的那一步就是卡点。
         ⚠️ 只用于诊断，**不进判决**。
         """
-        masks = self._masks(panel, factors)
+        masks = self._masks(panel, factors)          # 筛选链（**不含** optional）
         keep = masks[0][1].fillna(False)
         out = {"eligible": int(keep.to_numpy().sum())}
         for name, m in masks[1:]:
             keep = keep & m.fillna(False)
             out[f"after:{name}"] = int(keep.to_numpy().sum())
+        # ★ **观察项**（原文写「一般 / 最好」的偏好）：单独报**单独通过率**，
+        #   **不并入累计** —— 否则漏斗会显示一个"其实不参与排除"的条件在砍人，
+        #   读者会以为它是门槛（那正是 `optional` 要修掉的东西）。
+        soft_labels = {r.label for r in self.ruleset.rules if r.optional}
+        for name, m in self._masks(panel, factors, include_optional=True):
+            if name in soft_labels:
+                out[f"soft:{name}"] = int(m.fillna(False).to_numpy().sum())
         return out
 
     def ma_exit_level(self, panel, factors: Mapping[str, pd.DataFrame],

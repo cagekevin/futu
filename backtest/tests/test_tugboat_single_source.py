@@ -234,6 +234,34 @@ def test_stop_limit_widens_when_volatility_expands() -> bool:
     return ok
 
 
+def test_vcp_soft_conditions_are_optional() -> bool:
+    """★ VCP 里原文写「**一般 / 最好**」的三条必须标 `optional`（**偏好，不参与排除**）。
+
+    原文 §7.1 的用词是**分档**的：②「他**一般**选 90 以上」（行 704）、
+    ③「**最好**不低于 52 周新高的 15%」（行 705）、④「波幅收缩，**最好**三次或以上」（行 706）
+    —— 三个"一般/最好"= 偏好；而 ①「在 150 日线之上」、⑤「波动 < 1%」、⑥「缩量」
+    **没有修饰词** = 门槛。把它们一律做成硬 AND 是**比原文更严**。
+
+    判据：把任一条的 `optional=True` 去掉 ⇒ 本条**必红**。
+    """
+    soft = {r.key for r in VCP.rules if r.optional}
+    hard = {r.key for r in VCP.rules if not r.optional}
+    ok_soft = soft == {"rs_rank", "near_52w_high", "contractions"}
+    ok_hard = hard == {"above_150ma", "final_range", "volume_decline", "breakout"}
+    # ★ 行为面：默认掩码里**不含**这三条；`include_optional=True` 时**都在**
+    panel, factors = _make()
+    s = TugboatBreakout(ruleset="vcp", market_gate=False)
+    labels = {r.key: r.label for r in VCP.rules}
+    soft_labels = {labels[k] for k in soft}
+    default_labels = {n for n, _ in s._masks(panel, factors)}
+    all_labels = {n for n, _ in s._masks(panel, factors, include_optional=True)}
+    ok_beh = (not (soft_labels & default_labels)) and soft_labels <= all_labels
+    ok = ok_soft and ok_hard and ok_beh
+    print(f"{'[PASS]' if ok else '[FAIL]'} VCP 的「一般/最好」三条是 optional"
+          f"（软={sorted(soft)}；硬={sorted(hard)}；默认掩码不含软={ok_beh}）")
+    return ok
+
+
 if __name__ == "__main__":
     import traceback
 
