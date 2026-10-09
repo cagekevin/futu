@@ -178,12 +178,22 @@ def _market_state(panel, spy_panel) -> pd.DataFrame:
     net4 = ((ret > 0.04).sum(axis=1) / n_ret) - ((ret < -0.04).sum(axis=1) / n_ret)
     above20 = (spy_close > spy_close.rolling(20).mean()).astype(float)
 
+    # ── ★ §6.1「止损结合 SA」用的**波动维度**（治 TD-05-39）────────────────
+    #   原文（行 550）：「**市场开始变得波动**、动能开始下降 → **不要设得太窄**」。
+    #   实现 = 票池**日振幅中位数**的 20 日均 ÷ 它的 20 天前值 ⇒ **`> 1` = 波动在扩张**。
+    #   ⚠️ 它**不是** §7.1 的动能（那个管"做不做"）—— 用错输入会让"放宽档"**永远不可达**
+    #      （门槛已经把动能差的日子整段排除了）。
+    rng = (panel.field("high") - panel.field("low")) / close
+    med = rng.median(axis=1)
+    vol_ratio = med.rolling(20).mean() / med.rolling(20).mean().shift(20)
+
     # ★ **整条后移一天**：开盘前能看到的只有截至昨天的状态
     return pd.DataFrame({
         "breadth": breadth.reindex(panel.dates),
         "index_dist_200ma": dist.reindex(panel.dates),
         "net4": net4.reindex(panel.dates),
         "spy_above_20ma": above20.reindex(panel.dates),
+        "vol_ratio": vol_ratio.reindex(panel.dates),
     }).shift(1)
 
 

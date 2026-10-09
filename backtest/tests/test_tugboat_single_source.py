@@ -41,7 +41,7 @@ def test_near_mask_is_single_source() -> bool:
     判据：把其中一份改坏（只改一份）⇒ 本条必须红。
     """
     panel, factors = _make()
-    impl = TugboatBreakout()._impl_masks(panel, factors)
+    impl = TugboatBreakout(market_gate=False)._impl_masks(panel, factors)
     a = impl["near_support"].to_numpy()
     b = impl["near_ma"].to_numpy()
     # ⚠️ `equal_nan=True`：两边的 warm-up 期都是 NaN，而 `NaN != NaN`
@@ -97,7 +97,7 @@ def test_ma_converge_is_or_not_and() -> bool:
     判据：把实现改回 `&` ⇒ 本条**必红**。
     """
     panel, factors = _make()
-    s = TugboatBreakout()
+    s = TugboatBreakout(market_gate=False)
     mask = s._impl_masks(panel, factors)["ma_converge"].fillna(False).to_numpy(dtype=bool)
 
     close = panel.field("close")
@@ -148,11 +148,11 @@ def test_base_takes_the_indicator_filters() -> bool:
     panel, factors = _make()
 
     def mask(key: str, **kw):
-        return (TugboatBreakout(**kw)._impl_masks(panel, factors)[key]
+        return (TugboatBreakout(market_gate=False, **kw)._impl_masks(panel, factors)[key]
                 .fillna(False).to_numpy(dtype=bool))
 
     missing_decl = sorted(want - declared)
-    missing_impl = sorted(want - set(TugboatBreakout()._impl_masks(panel, factors)))
+    missing_impl = sorted(want - set(TugboatBreakout(market_gate=False)._impl_masks(panel, factors)))
     # ★ **行为面**：参数必须**真的驱动掩码**。
     #   只断"键存在"是弱的 —— 把条件里的参数换成写死的常量，键照样在、条件却形同虚设。
     #   （不依赖夹具的代表性：只要求"两档参数 ⇒ 两种掩码"，不要求某一档必为全真/全假。）
@@ -189,16 +189,48 @@ def test_market_gate_blocks_when_momentum_is_bad() -> bool:
     # ② 动能差 ⇒ 一条都不给；动能好 ⇒ 与"关掉门槛"**逐格相同**
     s = TugboatBreakout(**kw)
     s.attach_market_state(pd.DataFrame(
-        {"net4": -1.0, "spy_above_20ma": 0.0}, index=dates))
+        {"net4": -1.0, "spy_above_20ma": 0.0, "vol_ratio": 1.0}, index=dates))
     n_bad = len(s.candidates(panel, factors))
     s.attach_market_state(pd.DataFrame(
-        {"net4": +1.0, "spy_above_20ma": 1.0}, index=dates))
+        {"net4": +1.0, "spy_above_20ma": 1.0, "vol_ratio": 1.0}, index=dates))
     n_good = len(s.candidates(panel, factors))
     n_off = len(TugboatBreakout(market_gate=False, **kw).candidates(panel, factors))
     ok = raised and n_bad == 0 and n_good > 0 and n_off == n_good
     print(f"{'[PASS]' if ok else '[FAIL]'} 市况门槛真的在拦人"
           f"（未注入报错={raised}；动能差候选={n_bad}（应 0）；"
           f"动能好={n_good}（应 > 0），关掉门槛={n_off}（应相等））")
+    return ok
+
+
+def test_stop_limit_widens_when_volatility_expands() -> bool:
+    """★ §6.1「止损**结合 SA**」：**波动扩张** ⇒ 止损上限**放宽**（治 TD-05-39）。
+
+    原文（行 550）：「**市场开始变得波动**、动能开始下降 → **不要设得太窄**」。
+
+    ⚠️ 判据是**波动**（`vol_ratio > 1`）而**不是** §7.1 的动能 ——
+    用动能会让放宽档**永远不可达**（门槛已把动能差的日子整段排除），
+    这条测试就是那次错误的守卫。
+
+    判据：把 `_stop_limit` 的 `np.where(...)` 改成恒 `base` ⇒ 本条**必红**。
+    """
+    panel, factors = _make()
+    dates = list(panel.field("close").index)
+    base = float(DEFAULTS["stop_width_adr"])
+    weak = float(DEFAULTS["stop_width_adr_weak"])
+    s = TugboatBreakout(ruleset="rsi_tight")
+    s.attach_market_state(pd.DataFrame(
+        {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 2.0}, index=dates))
+    got_weak = float(s._stop_limit(panel).to_numpy()[0, 0])
+    s.attach_market_state(pd.DataFrame(
+        {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 0.5}, index=dates))
+    got_ok = float(s._stop_limit(panel).to_numpy()[0, 0])
+    got_off = float(TugboatBreakout(ruleset="rsi_tight", market_gate=False)
+                    ._stop_limit(panel).to_numpy()[0, 0])
+    ok = (got_weak == weak and got_ok == base and got_off == base
+          and weak > base)
+    print(f"{'[PASS]' if ok else '[FAIL]'} 止损上限随市况放宽"
+          f"（波动扩张={got_weak}（应 {weak}）；波动收敛={got_ok}（应 {base}）；"
+          f"关掉门槛={got_off}（应 {base}））")
     return ok
 
 

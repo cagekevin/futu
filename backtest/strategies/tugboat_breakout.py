@@ -204,6 +204,13 @@ DEFAULTS: Mapping[str, Any] = {
     #   ⚠️ `True` 时**必须**注入市况（`attach_market_state`），否则 `candidates()` 报错
     #      （承 P1：不静默兜底 —— 不许"没市况就当市况很好"）。
     "market_gate": True,
+    # ── ★ §6.1「止损**结合 SA**」的放宽档（治 TD-05-39）──
+    #   原文（行 550）：「**市场开始变得波动、动能开始下降 → 不要设得太窄**」
+    #   （理由同 §8.4：波动大的环境里，太窄的止损会被**正常噪音**扫出去）。
+    #   ⇒ **动能差**的日子（`market_gate` 的判据不成立时），止损上限从
+    #      `stop_width_adr`（1.5，§10.6② 的上界）**放宽**到本值。
+    #   ⚠️ **2.5 这个数是我定的** —— 原文只说了"不要设得太窄"，没给数。
+    "stop_width_adr_weak": 2.5,
     # ── ★ 用**哪一套规则集**（并列，不是开关）──
     #   `"base"`      = §6.1 通用条件 + §10.6① / §8.1 选股过滤器
     #   `"vcp"`       = §7.1 VCP 六要点（**替代** base，不是叠加）
@@ -259,12 +266,14 @@ class TugboatBreakout:
 
     def attach_market_state(self, state: pd.DataFrame) -> None:
         """注入按日的**大市动能**（§7.1 的两个方法）—— `market_gate` 的门槛用它。"""
-        missing = [c for c in ("net4", "spy_above_20ma") if c not in state.columns]
+        missing = [c for c in ("net4", "spy_above_20ma", "vol_ratio")
+                   if c not in state.columns]
         if missing:
             raise ValueError(
                 f"market_state 缺列 {missing}（承 P1：不静默兜底）"
                 " —— §7.1 的两个方法：`net4`（升/跌超 4% 家数占比之差）、"
-                "`spy_above_20ma`（标普是否在 20 日线之上）")
+                "`spy_above_20ma`（标普是否在 20 日线之上）；"
+                "§6.1 的止损维度：`vol_ratio`（票池振幅中位数的扩张比）")
         self.market_state = state
 
     def _market_ok(self, panel) -> pd.DataFrame:
@@ -286,6 +295,37 @@ class TugboatBreakout:
         ok = ((st["spy_above_20ma"] > 0) & (st["net4"] >= 0)
               ).reindex(panel.dates).fillna(False).to_numpy(dtype=bool)
         return pd.DataFrame(np.repeat(ok[:, None], len(panel.symbols), axis=1),
+                            index=panel.dates, columns=panel.symbols)
+
+    def _stop_limit(self, panel) -> pd.DataFrame:
+        """★ **止损宽度的上限**（按日）—— §6.1「止损**结合 SA**」（治 TD-05-39）。
+
+        原文（行 550）：「**市场开始变得波动**、动能开始下降 → **不要设得太窄**」。
+
+        ## ⚠️ 为什么判据是「**波动扩张**」而不是「动能差」（一次真实的错）
+        我第一版拿 `market_gate` 的判据（§7.1 的动能）来放宽止损 —— **结果一点没变**：
+        §7.1 的**门槛已经把"动能差的日子"整段排除了**，那些日子进不到这里
+        ⇒ 放宽档**永远不可达**（两道判据用同一个市况 ⇒ 互斥）。
+        而原文两处说的**不是同一个东西**：§7.1 是**动能**（做不做），
+        §6.1 是「市场开始变得**波动**」—— **波动维度**。
+        ⇒ 改用 `vol_ratio`（票池日振幅中位数的 20 日均 ÷ 20 天前）**> 1** = 波动在扩张。
+
+        `market_gate=False` 时一律用 `stop_width_adr`（**不用市况就不该依赖市况**）。
+        """
+        base = float(self.params["stop_width_adr"])
+        if not bool(self.params["market_gate"]):
+            return pd.DataFrame(base, index=panel.dates, columns=panel.symbols)
+        weak = float(self.params["stop_width_adr_weak"])
+        st = self.market_state
+        if st is None:
+            raise ValueError(
+                "market_gate=True 但没注入市况 —— 先 `attach_market_state(...)`，"
+                "或显式 `market_gate=False`（承 P1：不静默兜底）")
+        # ★ **波动在扩张** ⇒ 放宽（`> 1` 是"扩张"的直接读法，不是我拍的阈值）
+        expanding = (st["vol_ratio"] > 1.0).reindex(
+            panel.dates).fillna(False).to_numpy(dtype=bool)
+        per_day = np.where(expanding, weak, base)
+        return pd.DataFrame(np.repeat(per_day[:, None], len(panel.symbols), axis=1),
                             index=panel.dates, columns=panel.symbols)
 
     # ── 内部：从 `factors` 里取一张宽表（**缺就报错**，不静默兜底）──────
@@ -453,8 +493,9 @@ class TugboatBreakout:
             "breakout": close > high_f.shift(1).rolling(lb).max(),
             # ── 止损宽度：★ **单位换算只走 `units.py`** ──
             #    信号日用 `close` 近似入场价（成交在次日开盘）
+            # ★ 上限**按日**取（§6.1「止损结合 SA」）：动能差 ⇒ 放宽到 `stop_width_adr_weak`
             "stop_width": units.stop_distance_adr(
-                close, stop, close, adr) <= float(p["stop_width_adr"]),
+                close, stop, close, adr).le(self._stop_limit(panel)),
             # ── §7.1 VCP 六要点 ──
             "above_150ma": ma["ma_dist_sma150"] > 0,
             "near_52w_high": near_high >= float(p["near_high_min"]),
