@@ -88,6 +88,9 @@ EXIT_EARLY_DROP = "early_drop"
 #: ★ 他 §6.1 提前离场**第 4 条**：「**大盘或所在行业发生集体性显著回撤**」（行 573）。
 #: 成交价 = **出场日收盘**（与 `_CLOSE_SETTLED` 同款 ⇒ 可反推）。
 EXIT_MARKET = "market"
+#: ★ 他 §2.2 阶段③：「**开新仓同时关旧仓** / 部分获利，止损移到盈亏平衡」（行 129）。
+#: 成交价 = **出场日收盘**（与 `_CLOSE_SETTLED` 同款 ⇒ 可反推）。
+EXIT_ROTATE = "rotate"
 EXIT_TARGET_PARTIAL = "target_partial"
 EXIT_TARGET_FINAL = "target_final"
 EXIT_MA_BREAK = "ma_break"
@@ -218,6 +221,13 @@ class AccountPolicy:
     #: 他做的是**日内**（"开盘第一根 K 线最高点入场"），而突破策略对**那一天**极敏感。
     #: ⇒ 用"当日收盘成交"当他的**上界近似**（比次日开盘更接近他的成交时点）。
     trade_on_close: bool = False
+    #: ★ **仓位满了就换仓**：他 §2.2 阶段③「还想加仓 → **开新仓同时关旧仓**」（行 129）。
+    #:
+    #: ⚠️ **原文没说关哪一笔** ⇒ 这里取「**R 最低的那笔**」（关强的没道理）。
+    #:    这个选择**是我定的**，必须显形。
+    #: ⚠️ 默认 `False`（理由同 `ExitPolicy.early_drop_adr`：别静默改单测夹具）；
+    #:    `TugboatBreakout` 会用 `DEFAULTS` 的值补上。
+    rotate_on_full: bool = False
 
 
 @dataclass(frozen=True)
@@ -475,7 +485,7 @@ def reconcile(result: SimulationResult, cost_rate: float) -> dict[str, Any]:
 #: `reconcile_fills` 能**独立反推**成交价的出场原因（"收盘结算"类：③均线 / ④超时 / 末尾强平）。
 #: 它们的成交价规则就是 `close[出场日]` —— 简单、无需复制模拟器的路径逻辑。
 _CLOSE_SETTLED = (EXIT_MA_BREAK, EXIT_NO_PROGRESS, EXIT_TIME_CAP, EXIT_END_OF_DATA,
-                  EXIT_EARLY_DROP, EXIT_MARKET)
+                  EXIT_EARLY_DROP, EXIT_MARKET, EXIT_ROTATE)
 
 #: **不能**独立反推的出场原因 ⇒ **显形**，不假装覆盖（承 R5：审不了要报错／报出，不许静默跳过）。
 _UNVERIFIABLE_FILLS: dict[str, str] = {
@@ -861,6 +871,39 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                 # ⚠️ 原来**静默 `continue`** —— 它同样是"一个没变成交易的信号"。
                 _skip(SKIP_INVALIDATED)
                 continue
+            # ①d ★ **仓位满了就换仓**（他 §2.2 阶段③「还想加仓 → **开新仓同时关旧仓**」，行 129）
+            #   ⚠️ **原文没说关哪一笔** ⇒ 取「**R 最低**的那笔」（关强的没道理）。
+            #      **这个选择是我定的**，必须显形。
+            if len(positions) >= settings.max_positions and account.rotate_on_full:
+                worst_j, worst_r = None, None
+                for jj, pp in positions.items():
+                    px_j = closes[i, jj]
+                    if not np.isfinite(px_j) or pp.risk_per_share <= 0:
+                        continue
+                    r_j = (px_j - pp.entry_price) / pp.risk_per_share
+                    if worst_r is None or r_j < worst_r:
+                        worst_j, worst_r = jj, r_j
+                if worst_j is not None:
+                    pp = positions[worst_j]
+                    px_j = float(closes[i, worst_j])
+                    pp.realized += (px_j - pp.entry_price) * pp.shares_left
+                    notional = px_j * pp.shares_left
+                    c = cost_of(notional)
+                    pp.cost_paid += c
+                    cash += notional - c
+                    held_days = i - int(day_idx[pp.entry_day])
+                    trades.append(Trade(
+                        symbol=pp.symbol, entry_day=pp.entry_day,
+                        entry_price=pp.entry_price, initial_stop=pp.initial_stop,
+                        exit_day=day, exit_price=px_j, shares=pp.shares_initial,
+                        took_partial=pp.took_partial,
+                        partial_price=pp.partial_price,
+                        partial_shares=pp.partial_shares,
+                        r_multiple=(pp.realized - pp.cost_paid) / pp.risk_amount,
+                        return_pct=(pp.realized - pp.cost_paid)
+                        / (pp.shares_initial * pp.entry_price),
+                        exit_reason=EXIT_ROTATE, hold_days=held_days))
+                    del positions[worst_j]
             if len(positions) >= settings.max_positions:
                 if i < o.expire:
                     keep.append(o)              # 挂着等仓位 ⇒ 此刻**不记账**

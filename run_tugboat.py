@@ -715,7 +715,9 @@ def main(argv: list[str] | None = None) -> int:
         exposure.attach_market_state(market_state)
 
     from trade_simulator import AccountPolicy
-    account = AccountPolicy(cost_rate=backtest_config.COST_RATE)
+    # ★ §2.2 阶段③「开新仓同时关旧仓」（治 TD-05-39 最后一条）：值取策略参数 ⇒ 进指纹。
+    account = AccountPolicy(cost_rate=backtest_config.COST_RATE,
+                            rotate_on_full=bool(strategy.params["rotate_on_full"]))
     result = simulate(
         panel.dates, panel.symbols, bars, cand,
         strategy_name=strategy.name, strategy_params=strategy.params,

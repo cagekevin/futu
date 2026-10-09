@@ -23,7 +23,7 @@ import pandas as pd  # noqa: E402
 
 import pnl_engine  # noqa: E402
 from trade_simulator import (  # noqa: E402
-    EXIT_EARLY_DROP, EXIT_MARKET, EXIT_STOP, AccountPolicy, ExitPolicy, simulate,
+    EXIT_EARLY_DROP, EXIT_MARKET, EXIT_ROTATE, EXIT_STOP, AccountPolicy, ExitPolicy, simulate,
 )
 
 COST = 0.0003
@@ -957,6 +957,33 @@ def test_market_exit_requires_market_state() -> bool:
     print(f"{'[PASS]' if raised else '[FAIL]'} 缺 market_state 时报错而不是静默跳过"
           f"（raised={raised}）")
     return raised
+
+
+def test_rotate_on_full_swaps_out_a_position() -> bool:
+    """★ 他 §2.2 阶段③「**开新仓同时关旧仓**」（行 129）—— 治 TD-05-39 最后一条。
+
+    仓位满了、又来了新信号 ⇒ **换仓**（关掉 R 最低的那笔，开新的）。
+    ⚠️ 「关哪一笔」**原文没说** ⇒ 取 R 最低那笔 —— **这个选择是我定的**。
+
+    判据：把换仓那段删掉 ⇒ 本条**必红**（新信号会被 `no_slot` 挡掉、不产生 `EXIT_ROTATE`）。
+    """
+    bars = [(100, 100, 100, 100),      # d1 信号 A
+            (100, 100, 100, 100),      # d2 A 成交（占掉唯一仓位）
+            (97, 97, 97, 97),          # d3 A 走弱；信号 B 在这天
+            (100, 100, 100, 100),      # d4 B 到达 ⇒ 仓位满 ⇒ 换仓
+            (100, 100, 100, 100)]
+    # ⚠️ 必须**两个标的**：同一个标的的第二个信号会先被 `SKIP_HELD` 挡掉
+    #    （`j in positions`），根本走不到"仓位满"那一步 ⇒ 那测的就不是换仓。
+    r = _run(bars, [("d1", "A", 90.0), ("d3", "B", 95.0)],
+             symbols=("A", "B"),
+             account=AccountPolicy(cost_rate=COST, max_positions=1,
+                                   rotate_on_full=True),
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99, max_hold_days=9))
+    rotated = [t for t in r.trades if t.exit_reason == EXIT_ROTATE]
+    ok = len(rotated) == 1 and r.skipped["no_slot"] == 0
+    print(f"{'[PASS]' if ok else '[FAIL]'} 仓位满 ⇒ 换仓（开新仓同时关旧仓）"
+          f"（换仓 {len(rotated)} 笔（应 1）；被 no_slot 挡={r.skipped['no_slot']}（应 0））")
+    return ok
 
 
 if __name__ == "__main__":
