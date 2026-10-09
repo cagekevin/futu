@@ -211,6 +211,12 @@ DEFAULTS: Mapping[str, Any] = {
     #      `stop_width_adr`（1.5，§10.6② 的上界）**放宽**到本值。
     #   ⚠️ **2.5 这个数是我定的** —— 原文只说了"不要设得太窄"，没给数。
     "stop_width_adr_weak": 2.5,
+    # ── ★ §6.1 提前离场**第 1 条**：「单日大动能下跌（突兀走势）」（治 TD-05-32）──
+    #   判据 = 当日涨跌幅 ≤ −本值 × ADR（ADR 归一，与止损同尺度）。
+    #   ⚠️ **2.0 这个数是我定的** —— 原文只说「大动能」「突兀」，没给数。
+    #   ⚠️ `ExitPolicy` 的默认是 `None`（关闭），由 `run_tugboat` 用本值显式打开
+    #      （见 `trade_simulator.ExitPolicy.early_drop_adr` 的理由：别静默改单测夹具）。
+    "early_drop_adr": 2.0,
     # ── ★ 用**哪一套规则集**（并列，不是开关）──
     #   `"base"`      = §6.1 通用条件 + §10.6① / §8.1 选股过滤器
     #   `"vcp"`       = §7.1 VCP 六要点（**替代** base，不是叠加）
@@ -254,7 +260,14 @@ class TugboatBreakout:
         if self.params["ruleset"] not in RULESETS:
             raise ValueError(
                 f"ruleset 必须是 {sorted(RULESETS)}，收到 {self.params['ruleset']!r}")
-        self.exit_policy = exit_policy or ExitPolicy()
+        # ★ **§6.1 提前离场第 1 条**（治 TD-05-32）：本策略**默认打开**「单日大动能下跌」，
+        #   值取 `DEFAULTS["early_drop_adr"]`（**我定的数**，进报告指纹）。
+        #   调用方显式传了 `exit_policy` 就**尊重它**（只在它没设这一项时补上）
+        #   —— 这样 `--sensitivity` 等诊断臂的出场规则不会被静默改掉。
+        _ep = exit_policy or ExitPolicy()
+        if _ep.early_drop_adr is None:
+            _ep = replace(_ep, early_drop_adr=float(self.params["early_drop_adr"]))
+        self.exit_policy = _ep
         #: 按日的**大市动能**（列含 `net4` / `spy_above_20ma`）—— **由调用方注入**
         #: （`attach_market_state`），保证本文件不依赖因子层（与 `TugboatExposure` 同款）。
         self.market_state: pd.DataFrame | None = None

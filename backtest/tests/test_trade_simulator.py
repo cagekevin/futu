@@ -23,7 +23,7 @@ import pandas as pd  # noqa: E402
 
 import pnl_engine  # noqa: E402
 from trade_simulator import (  # noqa: E402
-    EXIT_STOP, AccountPolicy, ExitPolicy, simulate,
+    EXIT_EARLY_DROP, EXIT_STOP, AccountPolicy, ExitPolicy, simulate,
 )
 
 COST = 0.0003
@@ -43,7 +43,7 @@ def _make(bars, symbols=(SYM,)):
 
 
 def _run(bars, candidates, *, exit_policy=None, account=None, ma=None,
-         symbols=(SYM,), exposure=None):
+         symbols=(SYM,), exposure=None, adr=None):
     dates, syms, frames = _make(bars, symbols)
     if candidates and isinstance(candidates[0], dict):
         frame = pd.DataFrame(candidates)          # 含 limit_price / valid_days
@@ -56,6 +56,7 @@ def _run(bars, candidates, *, exit_policy=None, account=None, ma=None,
         ma_exit_level=ma,
         exit_policy=exit_policy or ExitPolicy(),
         account=account or AccountPolicy(cost_rate=COST),
+        adr_ratio=adr,
         exposure=exposure,
     )
 
@@ -872,6 +873,50 @@ def test_reconcile_fills_rejects_unknown_exit_reason() -> bool:
         return ok
     print("[FAIL] 未知出场原因 ⇒ 竟然没报错（静默漏对账）")
     return False
+
+
+# ── ⑨ ★ 提前离场第 1 条「单日大动能下跌」（治 TD-05-32）──────────────────
+
+def test_single_day_big_drop_exits_early() -> bool:
+    """★ 他 §6.1 提前离场**第 1 条**：「**单日大动能下跌**（突兀走势）」（行 570）。
+
+    判据 = 当日涨跌幅 ≤ −`early_drop_adr` × ADR（**ADR 归一**，与止损同尺度）。
+    判据：把那个分支删掉 ⇒ 本条**必红**（会一直持有到超时）。
+
+    ⚠️ 夹具刻意把止损放到 **80**：让 d3 的 −10% **打不到止损**，
+    这样测的才是"止损没中、但走势突兀"那条路径（否则测到的是止损）。
+    """
+    bars = [(100, 100, 100, 100),      # d1 信号
+            (100, 100, 100, 100),      # d2 开盘 100 成交（stop 80，打不到）
+            (100, 100, 90, 90),        # d3 单日 −10%（ADR=2% ⇒ 阈值 4%）
+            (90, 90, 90, 90)]
+    adr = pd.DataFrame(0.02, index=[f"d{i + 1}" for i in range(len(bars))],
+                       columns=[SYM])
+    r = _run(bars, [("d1", SYM, 80.0)], adr=adr,
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99,
+                                    max_hold_days=9, early_drop_adr=2.0))
+    got = r.trades[0].exit_reason if r.trades else "?"
+    ok = (len(r.trades) == 1 and got == EXIT_EARLY_DROP
+          and r.trades[0].exit_day == "d3")
+    print(f"{'[PASS]' if ok else '[FAIL]'} 单日大动能下跌 ⇒ 提前离场"
+          f"（原因 {got}，应 {EXIT_EARLY_DROP}；出场日 "
+          f"{r.trades[0].exit_day if r.trades else '?'}，应 d3）")
+    return ok
+
+
+def test_early_drop_requires_adr_ratio() -> bool:
+    """★ 打开了「单日大动能下跌」却没传 `adr_ratio` ⇒ **报错**（承 P1：不静默兜底）。"""
+    bars = [(100, 100, 100, 100)] * 3
+    raised = False
+    try:
+        _run(bars, [("d1", SYM, 95.0)],
+             exit_policy=ExitPolicy(use_ma_exit=False, target_r=99,
+                                    max_hold_days=2, early_drop_adr=2.0))
+    except ValueError as e:
+        raised = "adr_ratio" in str(e)
+    print(f"{'[PASS]' if raised else '[FAIL]'} 缺 adr_ratio 时报错而不是静默跳过"
+          f"（raised={raised}）")
+    return raised
 
 
 if __name__ == "__main__":

@@ -719,7 +719,7 @@ def main(argv: list[str] | None = None) -> int:
     result = simulate(
         panel.dates, panel.symbols, bars, cand,
         strategy_name=strategy.name, strategy_params=strategy.params,
-        ma_exit_level=ma_exit, exit_policy=strategy.exit_policy,
+        ma_exit_level=ma_exit, exit_policy=strategy.exit_policy, adr_ratio=factors["adr20"],
         account=account,
         exposure=exposure,
     )
@@ -821,7 +821,7 @@ def main(argv: list[str] | None = None) -> int:
     def _run_at_cost(cost_rate: float):
         return simulate(panel.dates, panel.symbols, bars, cand,
                         strategy_name=strategy.name, strategy_params=strategy.params,
-                        ma_exit_level=ma_exit, exit_policy=strategy.exit_policy,
+                        ma_exit_level=ma_exit, exit_policy=strategy.exit_policy, adr_ratio=factors["adr20"],
                         account=_replace_account(account, cost_rate), exposure=exposure)
 
     stress = cost_stress(_run_at_cost, base_cost_rate=account.cost_rate, benchmark=bench)
@@ -974,7 +974,7 @@ def main(argv: list[str] | None = None) -> int:
                 ac = _r4(ac, **{key: float(val)})
             return simulate(panel.dates, panel.symbols, bars, candidates,
                             strategy_name=st.name, strategy_params=st.params,
-                            ma_exit_level=st.ma_exit_level(panel, factors),
+                            ma_exit_level=st.ma_exit_level(panel, factors), adr_ratio=factors["adr20"],
                             exit_policy=ep, account=ac, exposure=exposure)
 
         for _name, (_where, _vals) in axes.items():
@@ -1018,7 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
                 ac = _r5(ac, **{k: float(v) for k, v in prm.items()})
             return simulate(panel.dates, panel.symbols, bars, c,
                             strategy_name=st.name, strategy_params=st.params,
-                            ma_exit_level=st.ma_exit_level(panel, factors),
+                            ma_exit_level=st.ma_exit_level(panel, factors), adr_ratio=factors["adr20"],
                             exit_policy=ep, account=ac, exposure=exposure)
 
         # ── ★ **族**：我在这份数据上试过的全部变体 ──
@@ -1076,7 +1076,7 @@ def main(argv: list[str] | None = None) -> int:
                     ex.attach_market_state(market_state)
                 rr = simulate(panel.dates, panel.symbols, bars, c,
                               strategy_name=st.name, strategy_params=st.params,
-                              ma_exit_level=st.ma_exit_level(panel, factors),
+                              ma_exit_level=st.ma_exit_level(panel, factors), adr_ratio=factors["adr20"],
                               exit_policy=st.exit_policy, account=account,
                               exposure=ex)
                 n_c = len(c)
@@ -1143,7 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
                 ex.attach_market_state(market_state)
             rr = simulate(panel.dates, panel.symbols, bars, cand,
                           strategy_name=strategy.name, strategy_params={},
-                          ma_exit_level=ma_exit, exit_policy=strategy.exit_policy,
+                          ma_exit_level=ma_exit, exit_policy=strategy.exit_policy, adr_ratio=factors["adr20"],
                           account=account, exposure=ex)
             mm = trade_metrics.summarize(rr, benchmark=bench)
             print(f"  {label:36s}{mm['n_trades']:>6d}"
@@ -1191,7 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
                           **({"max_positions": cap} if cap else {}))
             rr = simulate(panel.dates, panel.symbols, bars, c,
                           strategy_name=st.name, strategy_params=st.params,
-                          ma_exit_level=st.ma_exit_level(panel, factors),
+                          ma_exit_level=st.ma_exit_level(panel, factors), adr_ratio=factors["adr20"],
                           exit_policy=st.exit_policy, account=ac, exposure=exposure)
             mm = trade_metrics.summarize(rr, benchmark=bench)
             print(f"  {label:34s}{len(c):>6d}{mm['n_trades']:>6d}"
@@ -1270,7 +1270,7 @@ def main(argv: list[str] | None = None) -> int:
                     rr = simulate(
                         panel.dates, panel.symbols, bars, c,
                         strategy_name=st.name, strategy_params=st.params,
-                        ma_exit_level=st.ma_exit_level(panel, factors),
+                        ma_exit_level=st.ma_exit_level(panel, factors), adr_ratio=factors["adr20"],
                         exit_policy=st.exit_policy, account=account, exposure=ex)
                     mm = trade_metrics.summarize(rr, benchmark=bench)
                     print(f"  {tag:40s}{len(c):>6d}{mm['n_trades']:>6d}"
@@ -1340,7 +1340,7 @@ def main(argv: list[str] | None = None) -> int:
             r = simulate(
                 panel.dates, panel.symbols, bars, c,
                 strategy_name=st.name, strategy_params=st.params,
-                ma_exit_level=st.ma_exit_level(panel, factors),
+                ma_exit_level=st.ma_exit_level(panel, factors), adr_ratio=factors["adr20"],
                 exit_policy=_replace(st.exit_policy, **eparams),
                 account=_replace(account, max_positions=cap,
                                  **({} if exp_cap is None
@@ -1363,7 +1363,7 @@ def main(argv: list[str] | None = None) -> int:
                               max_positions=max_positions)
             r = simulate(panel.dates, panel.symbols, bars, cand,
                          strategy_name=strategy.name, strategy_params={},
-                         ma_exit_level=ma_exit, exit_policy=exit_policy,
+                         ma_exit_level=ma_exit, exit_policy=exit_policy, adr_ratio=factors["adr20"],
                          account=a, exposure=exposure)
             return trade_metrics.summarize(r, benchmark=bench)
 
@@ -1381,11 +1381,11 @@ def main(argv: list[str] | None = None) -> int:
 
         r1 = simulate(panel.dates, panel.symbols, bars, cand,
                       strategy_name=strategy.name, strategy_params={},
-                      ma_exit_level=ma_exit, exit_policy=strategy.exit_policy,
+                      ma_exit_level=ma_exit, exit_policy=strategy.exit_policy, adr_ratio=factors["adr20"],
                       account=account, exposure=exposure)
         r2 = simulate(panel.dates, panel.symbols, bars, cand,
                       strategy_name=strategy.name + "·无框架", strategy_params={},
-                      ma_exit_level=ma_exit, exit_policy=bare_ep,
+                      ma_exit_level=ma_exit, exit_policy=bare_ep, adr_ratio=factors["adr20"],
                       account=account, exposure=exposure)
         m1, m2 = (trade_metrics.summarize(r1, benchmark=bench),
                   trade_metrics.summarize(r2, benchmark=bench))

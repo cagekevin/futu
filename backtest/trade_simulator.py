@@ -82,6 +82,9 @@ __all__ = [
 
 #: 出场原因（**封闭枚举** —— 报告按它分组，写错会静默少一类）。
 EXIT_STOP = "stop"
+#: ★ 他 §6.1 提前离场**第 1 条**：「单日大动能下跌（突兀走势）」（行 570）。
+#: 成交价 = **出场日收盘**（与 `_CLOSE_SETTLED` 同款 ⇒ 可反推）。
+EXIT_EARLY_DROP = "early_drop"
 EXIT_TARGET_PARTIAL = "target_partial"
 EXIT_TARGET_FINAL = "target_final"
 EXIT_MA_BREAK = "ma_break"
@@ -163,6 +166,17 @@ class ExitPolicy:
     #: 出处：他 §2.2 阶段④「**压低曝险 + 节奏变快**（很窄的止损、**2–3 天部分获利**）」。
     #: `None` = 关闭（默认；只有阶段④会打开）。
     partial_after_days: int | None = None
+    #: ★ **单日大动能下跌 ⇒ 离场**（他 §6.1 提前离场**第 1 条**：「**单日大动能下跌**（突兀走势）」，
+    #: 行 570；§6.1 的失败案例里 **PLUG** 就是这个形态：「突破后立刻大动能拉回原点」）。
+    #:
+    #: 判据 = **当日涨跌幅 ≤ −k × ADR** —— 用 **ADR 归一**而不是绝对百分比，
+    #: 理由与止损同一条：**高波动的票不该被一个绝对百分比误伤**
+    #: （原文在止损那里也是这个尺度：「尽量不大于一个 ADR」）。
+    #:
+    #: ⚠️ `None` = **关闭**（默认）—— 这是刻意的：`ExitPolicy` 被大量单测直接构造，
+    #:    默认打开会**静默改变它们的夹具语义**。`run_tugboat` 会显式打开
+    #:    （值来自 `DEFAULTS["early_drop_adr"]`，**我定的数**，进报告指纹）。
+    early_drop_adr: float | None = None
 
 
 @dataclass(frozen=True)
@@ -445,7 +459,8 @@ def reconcile(result: SimulationResult, cost_rate: float) -> dict[str, Any]:
 
 #: `reconcile_fills` 能**独立反推**成交价的出场原因（"收盘结算"类：③均线 / ④超时 / 末尾强平）。
 #: 它们的成交价规则就是 `close[出场日]` —— 简单、无需复制模拟器的路径逻辑。
-_CLOSE_SETTLED = (EXIT_MA_BREAK, EXIT_NO_PROGRESS, EXIT_TIME_CAP, EXIT_END_OF_DATA)
+_CLOSE_SETTLED = (EXIT_MA_BREAK, EXIT_NO_PROGRESS, EXIT_TIME_CAP, EXIT_END_OF_DATA,
+                  EXIT_EARLY_DROP)
 
 #: **不能**独立反推的出场原因 ⇒ **显形**，不假装覆盖（承 R5：审不了要报错／报出，不许静默跳过）。
 _UNVERIFIABLE_FILLS: dict[str, str] = {
@@ -603,6 +618,7 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
              strategy_name: str, strategy_params: Mapping[str, Any],
              ma_exit_level: pd.DataFrame, exit_policy: ExitPolicy,
              account: AccountPolicy,
+             adr_ratio: "pd.DataFrame | None" = None,
              exposure: ExposurePolicy | None = None) -> SimulationResult:
     """跑一次组合模拟。返回交易清单 + 净值曲线 + 跳过计数。
 
@@ -647,6 +663,25 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
             f"（前 3 列：{list(ma_exit_level.columns[:3])} vs {list(symbols[:3])}）"
             "承 P1：不静默兜底")
     ma_levels = ma_exit_level.to_numpy(dtype=float)
+    # ★ **ADR 比例**（供「单日大动能下跌」用）—— 与 `ma_exit_level` 同款：
+    #   由调用方算好传进来（模拟器不 import 因子层），且**必须对齐校验**
+    #   （错位会静默用别人的 ADR 判离场）。
+    if exit_policy.early_drop_adr is not None and adr_ratio is None:
+        raise ValueError(
+            "exit_policy.early_drop_adr 打开了，但没传 `adr_ratio` "
+            "—— 承 P1：不静默兜底（不许'没 ADR 就当不会大动能下跌'）")
+    if adr_ratio is not None:
+        if tuple(adr_ratio.index) != tuple(dates):
+            raise ValueError(
+                "adr_ratio 的**行序**与 dates 不一致 ⇒ 大动能下跌判据会静默错位。"
+                f"（前 3 行：{list(adr_ratio.index[:3])} vs {list(dates[:3])}）")
+        if tuple(adr_ratio.columns) != tuple(symbols):
+            raise ValueError(
+                "adr_ratio 的**列序**与 symbols 不一致 ⇒ 大动能下跌判据会静默错位。"
+                f"（前 3 列：{list(adr_ratio.columns[:3])} vs {list(symbols[:3])}）")
+        adr_arr = adr_ratio.to_numpy(dtype=float)
+    else:
+        adr_arr = None
 
     # 候选 → 入场单（**按 `(arrive, symbol_idx)` 排序** ⇒ 可复现，不依赖行序）
     has_limit = "limit_price" in candidates.columns
@@ -870,7 +905,38 @@ def simulate(dates: tuple[str, ...], symbols: tuple[str, ...],
                 del positions[j]
                 continue
 
-            # ② 止盈（部分）：跳空高开则按**更有利**的开盘价成交
+            # ①b ★ **单日大动能下跌 ⇒ 离场**（他 §6.1 提前离场**第 1 条**，行 570）
+            #   「**单日大动能下跌（突兀走势）**」—— 他举的失败案例 **PLUG** 就是这个形态
+            #   （「突破后立刻大动能拉回原点」）。
+            #   判据 = 当日涨跌幅 ≤ −`early_drop_adr` × ADR（**ADR 归一**，与止损同尺度）。
+            #   ⚠️ 放在止损**之后**：若当日已打穿止损，由①负责
+            #      （同 bar 冲突一律取**对他不利**的一侧）。
+            if (p.shares_left > 1e-12 and ep.early_drop_adr is not None
+                    and adr_arr is not None and i > 0):
+                pc, aj = closes[i - 1, j], adr_arr[i, j]
+                if (np.isfinite(pc) and pc > 0 and np.isfinite(cl)
+                        and np.isfinite(aj)
+                        and (cl / pc - 1.0) <= -float(ep.early_drop_adr) * aj):
+                    p.realized += (cl - p.entry_price) * p.shares_left
+                    notional = cl * p.shares_left
+                    c = cost_of(notional)
+                    p.cost_paid += c
+                    cash += notional - c
+                    trades.append(Trade(
+                        symbol=p.symbol, entry_day=p.entry_day,
+                        entry_price=p.entry_price, initial_stop=p.initial_stop,
+                        exit_day=day, exit_price=float(cl), shares=p.shares_initial,
+                        took_partial=p.took_partial,
+                        partial_price=p.partial_price,
+                        partial_shares=p.partial_shares,
+                        r_multiple=(p.realized - p.cost_paid) / p.risk_amount,
+                        return_pct=(p.realized - p.cost_paid)
+                        / (p.shares_initial * p.entry_price),
+                        exit_reason=EXIT_EARLY_DROP, hold_days=hold))
+                    del positions[j]
+                    continue
+
+            # ② 止盈（部分）：跳空高开则用**更有利**的开盘价成交
             #    `ep` = 当日适用的出场规则（曝险策略可逐日改它 —— 他阶段④的"2–3 天部分获利"）
             target = p.entry_price + ep.target_r * p.risk_per_share
             if (not p.took_partial and np.isfinite(hi) and hi >= target):
