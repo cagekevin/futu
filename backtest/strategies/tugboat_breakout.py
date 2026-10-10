@@ -227,6 +227,12 @@ DEFAULTS: Mapping[str, Any] = {
     #   `vcp-signals.TrendConfig.rs_min_avg = 0.0`）。
     #   ⚠️ 它是**门槛**（gate），不是打分项 —— 与 `vcp-signals` 的 `--trend-gate` 同款。
     "bench_gate": True,
+    # ── ★ **大盘 Stage 2 才做多**（§6.1 行 528 + §2.3 行 164–168；治 TD-05-30）──
+    #   判据 = SPY 在 **150 日线之上** **且** 150 日线**斜率向上**（= Weinstein 上涨阶段）。
+    #   原文：「筑底/筑顶 ⇒ **不主动开仓**」「**下跌 ⇒ 不做多**」⇒ 其余三个阶段都不做。
+    #   ⚠️ **零魔法数字**（0 就是"在均线之上/之下""斜率向上/向下"）。
+    #   ⚠️ 「最好在 50 日之上」是**加分项**（原文用"最好"）⇒ 记进 `spy_above_50ma`，不作门槛。
+    "stage2_gate": True,
     # ── ★ §2.2 阶段①④ 的**收紧档**（治 TD-05-39 的剩余两条）──
     #   原文：「阶段① 疑似见底：**止损设窄**」；「阶段④ 过度延伸：**很窄的止损**」。
     #   判据 = 四阶段里 ①④ 的**同一份阈值**（`BREADTH_WASHOUT` / `BREADTH_EUPHORIA` /
@@ -306,7 +312,9 @@ class TugboatBreakout:
     def attach_market_state(self, state: pd.DataFrame) -> None:
         """注入按日的**大市动能**（§7.1 的两个方法）—— `market_gate` 的门槛用它。"""
         missing = [c for c in ("net4", "spy_above_20ma", "vol_ratio",
-                               "breadth", "index_dist_200ma", "spy_ret260")
+                               "breadth", "index_dist_200ma", "spy_ret260",
+                               "spy_dist_150ma", "spy_150ma_slope",
+                               "spy_above_50ma")
                    if c not in state.columns]
         if missing:
             raise ValueError(
@@ -335,6 +343,36 @@ class TugboatBreakout:
         st = self.market_state
         ok = ((st["spy_above_20ma"] > 0) & (st["net4"] >= 0)
               ).reindex(panel.dates).fillna(False).to_numpy(dtype=bool)
+        return pd.DataFrame(np.repeat(ok[:, None], len(panel.symbols), axis=1),
+                            index=panel.dates, columns=panel.symbols)
+
+    def _stage2_ok(self, panel) -> pd.DataFrame:
+        """★ **大盘处在 Weinstein「上涨阶段」（Stage 2）才做多** —— 治 TD-05-30。
+
+        原文两处指的是**同一件事**：
+
+        | 出处 | 原话 |
+        |---|---|
+        | §6.1 行 528 | 大环境研判点①：「**大盘在 30 周（150 日）均线之上**，最好在 50 日之上」|
+        | §2.3 行 164–168 | 「**筑底 / 筑顶** ⇒ **不主动开仓**（没方向，做多做空失败率都高）；**下跌** ⇒ **不做多**；上涨 ⇒ 重点在买入节奏」|
+
+        判据（**零魔法数字** —— 全是"在均线之上/之下""斜率向上/向下"的直接读法）：
+
+        | 阶段 | 条件 | 我们做什么 |
+        |---|---|---|
+        | **上涨 Stage 2** | `dist_150ma > 0` **且** `slope > 0` | **可做多** |
+        | **下跌 Stage 4** | `dist_150ma < 0` **且** `slope < 0` | **不做多** |
+        | **筑底/筑顶 Stage 1/3** | 其余（价格与均线交叉、均线走平）| **不主动开仓** |
+
+        ⚠️ 「**最好**在 50 日之上」是**加分项**（原文用"最好"）⇒ 只记 `spy_above_50ma`，**不作门槛**。
+        """
+        if self.market_state is None:
+            raise ValueError(
+                "stage2_gate=True 但没注入市况 —— 先 `attach_market_state(...)`，"
+                "或显式 `stage2_gate=False`（承 P1：不静默兜底）")
+        st = self.market_state.reindex(panel.dates)
+        ok = ((st["spy_dist_150ma"] > 0.0) & (st["spy_150ma_slope"] > 0.0)
+              ).fillna(False).to_numpy(dtype=bool)
         return pd.DataFrame(np.repeat(ok[:, None], len(panel.symbols), axis=1),
                             index=panel.dates, columns=panel.symbols)
 
@@ -645,6 +683,9 @@ class TugboatBreakout:
         #   出处 = `vcp-signals` v3 的 A/B（那是唯一被证明能翻正的一层）。
         if bool(p["bench_gate"]):
             cond = cond & self._rs_vs_spy(panel, factors)
+        # ★ **大盘不在 Stage 2 就不做多**（§6.1 行 528 + §2.3 行 164–168；治 TD-05-30）
+        if bool(p["stage2_gate"]):
+            cond = cond & self._stage2_ok(panel)
 
         close = panel.field("close")
         stop = self._stop_series(panel)

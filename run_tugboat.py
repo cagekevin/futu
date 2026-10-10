@@ -196,6 +196,21 @@ def _market_state(panel, spy_panel) -> pd.DataFrame:
     #      实测截面排位 **53.2%**（门槛 95%）⇒ 那条在本池上没有分辨力。
     spy_ret260 = spy_close / spy_close.shift(260) - 1.0
 
+    # ── ★ **大盘的 Weinstein 四阶段**（§2.3 行 164–168 + §6.1 行 528）──
+    #   原文两处指的是同一件事：
+    #   · §6.1 行 528「大环境研判点①：**大盘在 30 周（150 日）均线之上**，最好在 50 日之上」
+    #   · §2.3 行 164–168「**筑底/筑顶 ⇒ 不主动开仓**（没方向，做多做空失败率都高）；
+    #     **下跌 ⇒ 不做多**；上涨 ⇒ 重点在买入节奏」
+    #   ⇒ 判据（**零魔法数字**，全是"在均线之上/之下""斜率向上/向下"的直接读法）：
+    #     · 上涨（Stage 2）= `dist_150ma > 0` **且** `slope > 0` ⇒ 可做多
+    #     · 下跌（Stage 4）= `dist_150ma < 0` **且** `slope < 0` ⇒ **不做多**
+    #     · 筑底/筑顶（Stage 1/3）= 其余 ⇒ **不主动开仓**
+    #   ⚠️ 「最好在 50 日之上」是**加分项**（原文用"最好"）⇒ 只记进 `spy_above_50ma`，不作门槛。
+    spy_dist_150ma = spy_close / spy_close.rolling(150).mean() - 1.0
+    spy_150ma_slope = (spy_close.rolling(150).mean()
+                       / spy_close.rolling(150).mean().shift(20) - 1.0)
+    spy_above_50ma = (spy_close > spy_close.rolling(50).mean()).astype(float)
+
     # ★ **整条后移一天**：开盘前能看到的只有截至昨天的状态
     return pd.DataFrame({
         "breadth": breadth.reindex(panel.dates),
@@ -204,6 +219,9 @@ def _market_state(panel, spy_panel) -> pd.DataFrame:
         "spy_above_20ma": above20.reindex(panel.dates),
         "vol_ratio": vol_ratio.reindex(panel.dates),
         "spy_ret260": spy_ret260.reindex(panel.dates),
+        "spy_dist_150ma": spy_dist_150ma.reindex(panel.dates),
+        "spy_150ma_slope": spy_150ma_slope.reindex(panel.dates),
+        "spy_above_50ma": spy_above_50ma.reindex(panel.dates),
     }).shift(1)
 
 

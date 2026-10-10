@@ -41,7 +41,7 @@ def test_near_mask_is_single_source() -> bool:
     判据：把其中一份改坏（只改一份）⇒ 本条必须红。
     """
     panel, factors = _make()
-    impl = TugboatBreakout(market_gate=False, bench_gate=False)._impl_masks(panel, factors)
+    impl = TugboatBreakout(market_gate=False, bench_gate=False, stage2_gate=False)._impl_masks(panel, factors)
     a = impl["near_support"].to_numpy()
     b = impl["near_ma"].to_numpy()
     # ⚠️ `equal_nan=True`：两边的 warm-up 期都是 NaN，而 `NaN != NaN`
@@ -64,7 +64,7 @@ def test_form_boundaries_are_params() -> bool:
     # ⚠️ `market_gate=False`：本文件测的是**形态分界**，市况门槛是另一件事
     #    （它要求注入市况；夹具里没有 ⇒ 显式关掉，而不是让它去 raise）。
     base = TugboatBreakout(ruleset="rsi_tight",
-                           market_gate=False, bench_gate=False).candidates(panel, factors)
+                           market_gate=False, bench_gate=False, stage2_gate=False).candidates(panel, factors)
     assert not base.empty, "夹具失效：这份面板在 rsi_tight 下没有候选（先修夹具）"
     day, sym = base.iloc[0]["day"], base.iloc[0]["symbol"]
 
@@ -76,7 +76,7 @@ def test_form_boundaries_are_params() -> bool:
 
     def forms(**over: float) -> list[str]:
         s = TugboatBreakout(ruleset="rsi_tight", market_gate=False,
-                            bench_gate=False, **over)
+                            bench_gate=False, stage2_gate=False, **over)
         return sorted(s.candidates(panel, factors)["form"])
 
     default_forms = forms()                                    # 0.96 ≥ 0.95 ⇒ 高位
@@ -98,7 +98,7 @@ def test_ma_converge_is_or_not_and() -> bool:
     判据：把实现改回 `&` ⇒ 本条**必红**。
     """
     panel, factors = _make()
-    s = TugboatBreakout(market_gate=False, bench_gate=False)
+    s = TugboatBreakout(market_gate=False, bench_gate=False, stage2_gate=False)
     mask = s._impl_masks(panel, factors)["ma_converge"].fillna(False).to_numpy(dtype=bool)
 
     close = panel.field("close")
@@ -149,11 +149,11 @@ def test_base_takes_the_indicator_filters() -> bool:
     panel, factors = _make()
 
     def mask(key: str, **kw):
-        return (TugboatBreakout(market_gate=False, **kw)._impl_masks(panel, factors)[key]
+        return (TugboatBreakout(market_gate=False, bench_gate=False, stage2_gate=False, **kw)._impl_masks(panel, factors)[key]
                 .fillna(False).to_numpy(dtype=bool))
 
     missing_decl = sorted(want - declared)
-    missing_impl = sorted(want - set(TugboatBreakout(market_gate=False, bench_gate=False)._impl_masks(panel, factors)))
+    missing_impl = sorted(want - set(TugboatBreakout(market_gate=False, bench_gate=False, stage2_gate=False)._impl_masks(panel, factors)))
     # ★ **行为面**：参数必须**真的驱动掩码**。
     #   只断"键存在"是弱的 —— 把条件里的参数换成写死的常量，键照样在、条件却形同虚设。
     #   （不依赖夹具的代表性：只要求"两档参数 ⇒ 两种掩码"，不要求某一档必为全真/全假。）
@@ -192,13 +192,18 @@ def test_market_gate_blocks_when_momentum_is_bad() -> bool:
     s = TugboatBreakout(**kw)
     s.attach_market_state(pd.DataFrame(
         {"net4": -1.0, "spy_above_20ma": 0.0, "vol_ratio": 1.0,
-         "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0}, index=dates))
+         "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0}, index=dates))
     n_bad = len(s.candidates(panel, factors))
     s.attach_market_state(pd.DataFrame(
         {"net4": +1.0, "spy_above_20ma": 1.0, "vol_ratio": 1.0,
-         "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0}, index=dates))
+         "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0}, index=dates))
     n_good = len(s.candidates(panel, factors))
-    n_off = len(TugboatBreakout(market_gate=False, **kw).candidates(panel, factors))
+    n_off = len(TugboatBreakout(market_gate=False, stage2_gate=False,
+                                **kw).candidates(panel, factors))
     ok = raised and n_bad == 0 and n_good > 0 and n_off == n_good
     print(f"{'[PASS]' if ok else '[FAIL]'} 市况门槛真的在拦人"
           f"（未注入报错={raised}；动能差候选={n_bad}（应 0）；"
@@ -224,13 +229,17 @@ def test_stop_limit_widens_when_volatility_expands() -> bool:
     s = TugboatBreakout(ruleset="rsi_tight")
     s.attach_market_state(pd.DataFrame(
         {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 2.0,
-         "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0}, index=dates))
+         "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0}, index=dates))
     got_weak = float(s._stop_limit(panel).to_numpy()[0, 0])
     s.attach_market_state(pd.DataFrame(
         {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 0.5,
-         "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0}, index=dates))
+         "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0}, index=dates))
     got_ok = float(s._stop_limit(panel).to_numpy()[0, 0])
-    got_off = float(TugboatBreakout(ruleset="rsi_tight", market_gate=False, bench_gate=False)
+    got_off = float(TugboatBreakout(ruleset="rsi_tight", market_gate=False, bench_gate=False, stage2_gate=False)
                     ._stop_limit(panel).to_numpy()[0, 0])
     ok = (got_weak == weak and got_ok == base and got_off == base
           and weak > base)
@@ -256,7 +265,7 @@ def test_vcp_soft_conditions_are_optional() -> bool:
     ok_hard = hard == {"above_150ma", "final_range", "volume_decline", "breakout"}
     # ★ 行为面：默认掩码里**不含**这三条；`include_optional=True` 时**都在**
     panel, factors = _make()
-    s = TugboatBreakout(ruleset="vcp", market_gate=False, bench_gate=False)
+    s = TugboatBreakout(ruleset="vcp", market_gate=False, bench_gate=False, stage2_gate=False)
     labels = {r.key: r.label for r in VCP.rules}
     soft_labels = {labels[k] for k in soft}
     default_labels = {n for n, _ in s._masks(panel, factors)}
@@ -287,7 +296,9 @@ def test_stop_limit_tightens_in_washout_and_euphoria() -> bool:
 
     def lim(**over) -> float:
         row = {"net4": 0.0, "spy_above_20ma": 1.0, "vol_ratio": 1.0,
-               "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0}
+               "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0, "spy_dist_150ma": 0.05,
+         "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0}
         row.update(over)
         s.attach_market_state(pd.DataFrame(row, index=dates))
         return float(s._stop_limit(panel).to_numpy()[0, 0])
@@ -327,7 +338,8 @@ def test_bench_gate_filters_by_relative_strength() -> bool:
         s.attach_market_state(pd.DataFrame(
             {"net4": 1.0, "spy_above_20ma": 1.0, "vol_ratio": 1.0,
              "breadth": 0.5, "index_dist_200ma": 0.0,
-             "spy_ret260": spy_ret}, index=dates))
+             "spy_ret260": spy_ret, "spy_dist_150ma": 0.05,
+             "spy_150ma_slope": 0.01, "spy_above_50ma": 1.0}, index=dates))
         return bool(s._rs_vs_spy(panel, {"ret260": ret260}).to_numpy().all())
 
     # 个股 +50%：基准 +10% ⇒ 跑赢（应放行）；基准 +90% ⇒ 跑输（应拦下）
@@ -337,6 +349,40 @@ def test_bench_gate_filters_by_relative_strength() -> bool:
     print(f"{'[PASS]' if ok else '[FAIL]'} 跑赢基准才做（RS vs SPY）"
           f"（个股 +50% vs 基准 +10% ⇒ 放行={ok_pass}；"
           f"vs 基准 +90% ⇒ 拦下={ok_block}）")
+    return ok
+
+
+def test_stage2_gate_blocks_outside_uptrend() -> bool:
+    """★ **大盘不在 Weinstein 上涨阶段（Stage 2）就不做多** —— 治 TD-05-30。
+
+    原文两处指同一件事：
+    §6.1 行 528「大环境研判点①：**大盘在 30 周（150 日）均线之上**」；
+    §2.3 行 164–168「**筑底/筑顶 ⇒ 不主动开仓**；**下跌 ⇒ 不做多**」。
+
+    判据（**零魔法数字**）：Stage 2 = `dist_150ma > 0` **且** `slope > 0`。
+
+    判据：把 `_stage2_ok` 改成恒真 ⇒ 本条**必红**。
+    """
+    panel, factors = _make()
+    dates = list(panel.field("close").index)
+
+    def gate(dist: float, slope: float) -> bool:
+        s = TugboatBreakout(ruleset="rsi_tight")
+        s.attach_market_state(pd.DataFrame(
+            {"net4": 1.0, "spy_above_20ma": 1.0, "vol_ratio": 1.0,
+             "breadth": 0.5, "index_dist_200ma": 0.0, "spy_ret260": 0.0,
+             "spy_dist_150ma": dist, "spy_150ma_slope": slope,
+             "spy_above_50ma": 1.0}, index=dates))
+        return bool(s._stage2_ok(panel).to_numpy().all())
+
+    uptrend = gate(0.05, 0.01)      # Stage 2 ⇒ 放行
+    downtrend = gate(-0.05, -0.01)  # Stage 4 ⇒ 拦下
+    topping = gate(0.05, -0.01)     # Stage 3 筑顶（在均线上但斜率转下）⇒ 拦下
+    basing = gate(-0.05, 0.01)      # Stage 1 筑底（均线下但斜率转上）⇒ 拦下
+    ok = uptrend and not downtrend and not topping and not basing
+    print(f"{'[PASS]' if ok else '[FAIL]'} 大盘 Stage 2 才做多"
+          f"（上涨={uptrend}（应 True）；下跌={downtrend}／筑顶={topping}／筑底={basing}"
+          f"（都应 False））")
     return ok
 
 
